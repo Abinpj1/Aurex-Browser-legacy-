@@ -1,41 +1,63 @@
 <div align="center">
 <img src="docs/banner.png" alt="Aurex Browser - Fast. Private. Powerful." width="100%">
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/github/v/release/aman-nitb-cse/Aurex-Browser?color=7C4DFF&label=Release" alt="Release"></a>
-<img src="https://img.shields.io/badge/Android-7.0%2B-3DDC84?logo=android&logoColor=white" alt="Android">
-<img src="https://img.shields.io/badge/Kotlin-Jetpack%20Compose-7F52FF?logo=kotlin&logoColor=white" alt="Kotlin">
-<img src="https://img.shields.io/badge/License-GPL%20v3-blue" alt="License">
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/stargazers"><img src="https://badgen.net/github/stars/aman-nitb-cse/Aurex-Browser?color=yellow&icon=github" alt="Stars"></a>
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases"><img src="https://badgen.net/github/assets-dl/aman-nitb-cse/Aurex-Browser?color=green&label=Downloads" alt="Downloads"></a>
-<br><br>
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/badge/Download-Latest%20APK-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Download"></a>
-<a href="https://t.me/aurex_oss"><img src="https://img.shields.io/badge/Telegram-Join%20Community-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram"></a>
+<p>
+<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/github/v/release/aman-nitb-cse/Aurex-Browser?style=flat-square&color=0A84FF&labelColor=1C1C1E&label=Release" alt="Release"></a>
+<img src="https://img.shields.io/badge/Android-7.0%2B-30D158?style=flat-square&labelColor=1C1C1E&logo=android&logoColor=white" alt="Android 7.0+">
+<a href="https://github.com/aman-nitb-cse/Aurex-Browser/stargazers"><img src="https://badgen.net/github/stars/aman-nitb-cse/Aurex-Browser?color=FF9F0A&labelColor=1C1C1E&icon=github" alt="Stars"></a>
+<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases"><img src="https://badgen.net/github/assets-dl/aman-nitb-cse/Aurex-Browser?color=30D158&labelColor=1C1C1E&label=Downloads" alt="Downloads"></a>
+<img src="https://img.shields.io/badge/License-GPL%20v3-BF5AF2?style=flat-square&labelColor=1C1C1E" alt="GPL v3">
+</p>
+<p>
+<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/badge/Download-Latest%20APK-0A84FF?style=for-the-badge&logo=android&logoColor=white" alt="Download latest APK"></a>
+<a href="https://t.me/aurex_oss"><img src="https://img.shields.io/badge/Telegram-Community-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram"></a>
+</p>
+<b>A fast, private Android browser with a Liquid Glass interface.</b><br>
+Ad blocker · Popup guard · Built-in player · Multi-part video downloader<br>
+No account. No server.
  
 </div>
----
+<br>
+## 🪟 Liquid Glass, top to bottom
  
-## 👋 About
+<div align="center">
+<img src="docs/glass-features.svg" alt="Aurex features on Liquid Glass cards" width="100%">
+</div>
+Aurex's floating toolbar, cards and panels are built as layered glass: a translucent fill, a soft highlight on the top edge, a two-tone rim and a gentle glow at the bottom.
  
-**Aurex Browser** is a fast, privacy-focused Android browser written in Kotlin with Jetpack Compose. It combines an ad blocker, popup guard, built-in video player and universal downloader in one clean interface. No account, no server.
+- **Floating glass toolbar** you can fully rearrange
+- **Transparency slider**, from clear glass to tinted glass
+- **Light, Dark and Auto** themes, with a dark mode that also works on websites
+## ⚡ Multi-part downloads
  
-## ✨ Features
+<div align="center">
+<img src="docs/glass-downloader.svg" alt="Multi-part download card and floating glass toolbar" width="100%">
+</div>
+Big files are split into **4-48 parts** and fetched over **2-16 parallel connections**. The engine adds connections while each one still makes the download at least 10% faster, backs off when a server throttles it, and **resumes from the parts already saved**.
  
-- 🛡️ **Ad, tracker and popup blocking**: EasyList, EasyPrivacy, uBlock Origin and AdGuard rules, cosmetic filtering, YouTube ad skipping, and a smart popup and redirect guard
-- 🔒 **Privacy**: private tabs protected by your phone lock, adult-content filter, third-party cookie blocking, one-tap data clearing
-- 🎬 **Built-in player**: gestures, Picture-in-Picture, background playback, and smooth 2K/4K YouTube
-- ⬇️ **Downloader**: video and audio via yt-dlp and FFmpeg, quality choice, pause/resume/retry, plain file downloads
-- 🎨 **Appearance**: dark mode for any website, glass-style UI, desktop site, data saver, long screenshots
-- ⚙️ **Customisation**: configurable toolbar, menu and gestures, seven search engines, searchable settings
-- 🔄 **Updates**: updates itself from [GitHub Releases](https://github.com/aman-nitb-cse/Aurex-Browser/releases), with SHA-256 check
+- HLS (with AES-128), DASH and plain files, plus a universal downloader powered by yt-dlp and FFmpeg
+- Quality picker for video and audio, or *Always best quality*
+- Pause, resume, retry, multi-select, swipe to delete or share
+- Downloaded videos stay seekable, with no re-encoding
+## ✨ Also inside
+ 
+| | |
+|---|---|
+| 🛡️ **Blocking** | EasyList, uBlock Origin and AdGuard rules, cosmetic filtering, YouTube ad skipping, smart popup and redirect guard |
+| 🔒 **Privacy** | Private tabs locked with your phone's own lock, adult-content filter, third-party cookie blocking |
+| 🎬 **Media** | Picture-in-Picture, background playback, floating media button, media dock |
+| 🌐 **Browsing** | Reader mode, find in page, bookmarks, history, desktop site, data saver, long screenshots, seven search engines |
+| 🔄 **Updates** | Updates itself from GitHub Releases with a SHA-256 check |
+ 
 ## 📲 Install
  
-1. Download the `.apk` from the [latest release](https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest) (**Assets**)
-2. Open it on your phone and allow installation if asked
+1. Download the `.apk` from the [latest release](https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest)
+2. Open it and allow installation if asked
 3. Tap **Install**
-Requires Android 7.0 (API 24) or newer.
+Needs Android 7.0 or newer.
  
-## 🛠️ Build from source
+## 🛠️ Build
  
-Needs **JDK 17**, **Android SDK 35** and Android Studio (or Gradle 8.14+).
+Needs **JDK 17** and **Android SDK 35** (or just Android Studio).
  
 ```bash
 git clone https://github.com/aman-nitb-cse/Aurex-Browser.git
@@ -43,69 +65,30 @@ cd Aurex-Browser
 ./gradlew assembleDebug
 ```
  
-The APK is in `app/build/outputs/apk/debug/`.
- 
 <details>
-<summary>Release builds and publishing</summary>
-**Signing.** Keys are never stored in the repo.
- 
-1. Create a key: `keytool -genkeypair -v -keystore aurex.keystore -alias aurex -keyalg RSA -keysize 2048 -validity 10000`
-2. Create `keystore.properties` in the project root (git-ignored):
-```properties
-storeFile=aurex.keystore
-storePassword=YOUR_PASSWORD
-keyAlias=aurex
-keyPassword=YOUR_PASSWORD
-```
-3. Run `./gradlew assembleRelease`
-**Publishing.** Increase `versionCode` and `versionName` in `app/build.gradle.kts`, build the signed APK, then on GitHub go to **Releases → Draft a new release**, create tag `v` + `versionName` (e.g. `v1.0.1`), attach the `.apk` and publish.
- 
-</details>
-<details>
-<summary>🔐 Permissions</summary>
+<summary>Permissions</summary>
 | Permission | Why |
 |---|---|
 | Internet, network state | Browsing, filter updates, downloads |
-| Notifications | Download progress and media controls |
-| Foreground service, wake lock | Background playback and downloads |
-| Biometric | Phone-lock check for private tabs and adult filter |
+| Notifications, foreground service, wake lock | Download progress and background playback |
+| Biometric | Phone-lock check for private tabs and the adult filter |
 | Install packages | In-app updates |
 | Camera, microphone, location | Only when a website asks for them |
-| Vibrate | Haptic feedback |
  
 </details>
-## 🧱 Tech stack
- 
-Kotlin · Jetpack Compose · Material 3 · Android WebView · AndroidX Media3 · OkHttp · yt-dlp + FFmpeg (youtubedl-android) · Coroutines · Gradle (Kotlin DSL)
- 
 ## 🤝 Contributing
  
-1. Fork the repo and create a branch
-2. Make your change and check that `./gradlew assembleDebug` succeeds
-3. Open a pull request
-Found a bug? [Open an issue](https://github.com/aman-nitb-cse/Aurex-Browser/issues) (Settings → General → **Copy log** helps). Never commit keystores, passwords or `local.properties`.
+Fork, make your change, check that `./gradlew assembleDebug` builds, then open a pull request. Found a bug? [Open an issue](https://github.com/aman-nitb-cse/Aurex-Browser/issues) and paste the log from **Settings → General → Copy log**.
  
-## ⚖️ Responsible use
- 
-The downloader relies on yt-dlp. You are responsible for following copyright law and the terms of service of the sites you use it with.
- 
-## 🙏 Credits
- 
-Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), [youtubedl-android](https://github.com/JunkFood02/youtubedl-android), [FFmpeg](https://ffmpeg.org), [AndroidX Media3](https://github.com/androidx/media), [OkHttp](https://github.com/square/okhttp), [EasyList](https://easylist.to), [uBlock Origin filters](https://github.com/uBlockOrigin/uAssets), [AdGuard filters](https://github.com/AdguardTeam/AdguardFilters), [StevenBlack hosts](https://github.com/StevenBlack/hosts) and [Peter Lowe's list](https://pgl.yoyo.org/adservers/). Full list with licenses: **Settings → About → Open-source credits**.
+The downloader relies on yt-dlp. Please respect copyright law and the terms of the sites you use.
  
 ## 📄 License
  
-Free software under the **GNU GPL v3.0**. See [LICENSE](LICENSE).
- 
----
+GNU GPL v3.0. See [LICENSE](LICENSE). Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), [youtubedl-android](https://github.com/JunkFood02/youtubedl-android), [FFmpeg](https://ffmpeg.org), [AndroidX Media3](https://github.com/androidx/media), [OkHttp](https://github.com/square/okhttp) and community filter lists. Full credits are in **Settings → About**.
  
 <div align="center">
-Made with ❤️ by **AMAN**
- 
-<a href="https://t.me/aurex_oss"><img src="https://img.shields.io/badge/Telegram-@aurex__oss-26A5E4?logo=telegram&logoColor=white" alt="Telegram"></a>
-<a href="https://github.com/aman-nitb-cse"><img src="https://img.shields.io/badge/GitHub-aman--nitb--cse-181717?logo=github&logoColor=white" alt="GitHub"></a>
- 
-⭐ If you like Aurex, please star the repo!
+<br>
+Made with ❤️ by **AMAN** · ⭐ Star the repo if you like Aurex
  
 </div>
  
