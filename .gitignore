@@ -1,0 +1,26 @@
+# Build output / caches
+*.iml
+.gradle/
+.kotlin/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Machine-specific
+local.properties
+.idea/
+.DS_Store
+__MACOSX/
+Thumbs.db
+
+# SECRETS - never commit these
+keystore.properties
+*.keystore
+*.jks
+*.p12
+*.pem
+google-services.json
+
+# Keep the Gradle wrapper
+!gradle/wrapper/gradle-wrapper.jar
