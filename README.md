@@ -9,6 +9,7 @@
 ![Kotlin](https://img.shields.io/badge/Kotlin-Jetpack%20Compose-7F52FF?logo=kotlin&logoColor=white)
 ![License](https://img.shields.io/badge/License-GPL%20v3-blue)
 [![Stars](https://img.shields.io/github/stars/aman-nitb-cse/Aurex-Browser?style=flat&color=F5B301)](https://github.com/aman-nitb-cse/Aurex-Browser/stargazers)
+[![Downloads](https://img.shields.io/github/downloads/aman-nitb-cse/Aurex-Browser/total?color=3DDC84&label=Downloads)](https://github.com/aman-nitb-cse/Aurex-Browser/releases)
 
 [![Download](https://img.shields.io/badge/Download-Latest%20APK-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest)
 [![Telegram](https://img.shields.io/badge/Telegram-Join%20Community-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/aurex_oss)
