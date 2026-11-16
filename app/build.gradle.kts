@@ -30,8 +30,8 @@ android {
         applicationId = "com.aurex.browser"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
         // The bundled downloader engine (Python + yt-dlp + ffmpeg) is large per ABI.
         // These cover virtually every phone plus the emulator.
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
@@ -105,4 +105,6 @@ dependencies {
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    // App language: on-device translation of the menus and messages (language packs are downloaded once)
+    implementation("com.google.mlkit:translate:17.0.3")
 }

@@ -57,6 +57,16 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.min
 
+// Compiled once; building a Regex on every call is wasted work on hot paths.
+private val EXTINF_RE = Regex("""#EXTINF:([0-9.]+)""")
+private val ILLEGAL_FILENAME_RE = Regex("[\\\\/:*?\"<>|\\r\\n\\t]+")
+private val WS_RUN_RE = Regex("\\s+")
+private val SAFE_ID_NAME_RE = Regex("^[A-Za-z0-9_-]+$")
+private val HLS_BANDWIDTH_RE = Regex("""[:,]BANDWIDTH=(\d+)""")
+private val HLS_AVG_BANDWIDTH_RE = Regex("""AVERAGE-BANDWIDTH=(\d+)""")
+private val HLS_RESOLUTION_RE = Regex("""RESOLUTION=(\d+)x(\d+)""")
+private val HLS_ATTR_RE = Regex("""([A-Z0-9-]+)=("[^"]*"|[^,]*)""")
+
 enum class DlStatus { QUEUED, RUNNING, PAUSED, DONE, FAILED }
 enum class DlKind { FILE, HLS, YTDLP }
 
@@ -69,6 +79,8 @@ class DlItem(
     var mime: String?,
     var file: File
 ) {
+    /** Address of the embed player that loaded the link: sent as Referer in place of the page (hotlink protection). */
+    var frameReferer: String? = null
     /** Universal (yt-dlp) downloads: what to fetch and the unique marker in the output name. */
     var ytQuality: YtQuality = YtQuality.BEST
     /** Exact height picked in the quality sheet (0 = not picked). */
@@ -78,6 +90,8 @@ class DlItem(
     var qualityLabel by mutableStateOf("")
     /** Media links the browser saw on the page: tried one by one when the page itself is not understood. */
     var altUrls: List<String> = emptyList()
+    /** Embed-player address per media link in [altUrls]: sent as Referer for that link (hotlink protection). */
+    var altRefs: Map<String, String> = emptyMap()
     /** The native downloader already handed this link to the universal engine once. */
     var universalTried: Boolean = false
     /** Shown instead of the file name while the real name is still unknown. */
@@ -238,7 +252,8 @@ class DownloadManager(private val ctx: Context) {
         referer: String? = null,
         cookieOverride: String? = null,
         title: String? = null,
-        qualityLabel: String? = null
+        qualityLabel: String? = null,
+        frameReferer: String? = null
     ) {
         val agent = ua?.takeIf { it.isNotBlank() } ?: DEFAULT_UA
 
@@ -294,6 +309,7 @@ class DownloadManager(private val ctx: Context) {
             this.qualityLabel = qualityLabel?.takeIf { it.isNotBlank() }
                 ?: guessLabelFromUrl(url)
             pageTitle = cleanTitle(title).ifBlank { null }
+            this.frameReferer = frameReferer?.takeIf { it.startsWith("http", true) }
         }
         items.add(0, item)
         startService()
@@ -458,7 +474,7 @@ class DownloadManager(private val ctx: Context) {
                 if (!referer.isNullOrBlank()) header("Referer", referer)
             }.build()
         val text = http.newCall(req).execute().use { r -> if (r.isSuccessful) r.body?.string().orEmpty() else "" }
-        Regex("""#EXTINF:([0-9.]+)""").findAll(text).sumOf { it.groupValues[1].toDoubleOrNull() ?: 0.0 }
+        EXTINF_RE.findAll(text).sumOf { it.groupValues[1].toDoubleOrNull() ?: 0.0 }
     } catch (_: Exception) { 0.0 }
 
     /**
@@ -487,9 +503,9 @@ class DownloadManager(private val ctx: Context) {
             val out = ArrayList<HlsVariant>()
             lines.forEachIndexed { i, line ->
                 if (line.trim().startsWith("#EXT-X-STREAM-INF")) {
-                    val bw = Regex("""[:,]BANDWIDTH=(\d+)""").find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                    val avg = Regex("""AVERAGE-BANDWIDTH=(\d+)""").find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                    val res = Regex("""RESOLUTION=(\d+)x(\d+)""").find(line)
+                    val bw = HLS_BANDWIDTH_RE.find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                    val avg = HLS_AVG_BANDWIDTH_RE.find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                    val res = HLS_RESOLUTION_RE.find(line)
                     val w = res?.groupValues?.get(1)?.toIntOrNull() ?: 0
                     val h = res?.groupValues?.get(2)?.toIntOrNull() ?: 0
                     val next = lines.drop(i + 1).firstOrNull { it.isNotBlank() && !it.trim().startsWith("#") }
@@ -525,7 +541,8 @@ class DownloadManager(private val ctx: Context) {
         title: String? = null,
         cookieOverride: String? = null,
         altUrls: List<String> = emptyList(),
-        height: Int = 0
+        height: Int = 0,
+        altRefs: Map<String, String> = emptyMap()
     ): Boolean {
         // "Video download" is off: the engine must not be started (no memory, no background work).
         if (!VideoDl.enabled) return false
@@ -555,6 +572,7 @@ class DownloadManager(private val ctx: Context) {
             ytHeight = height
             ytTag = tag
             this.altUrls = altUrls
+            this.altRefs = altRefs
             qualityLabel = when {
                 quality == YtQuality.MP3 -> "MP3"
                 quality == YtQuality.M4A -> "M4A"
@@ -602,8 +620,8 @@ class DownloadManager(private val ctx: Context) {
 
     /** Page title made safe for a file name. */
     private fun cleanTitle(t: String?): String =
-        (t ?: "").replace(Regex("[\\\\/:*?\"<>|\\r\\n\\t]+"), " ")
-            .replace(Regex("\\s+"), " ").trim().trim('.').take(80)
+        (t ?: "").replace(ILLEGAL_FILENAME_RE, " ")
+            .replace(WS_RUN_RE, " ").trim().trim('.').take(80)
 
     private val TRAILING_EXT = KNOWN_EXT + setOf("av1", "vp9", "vp8", "h264", "h265", "hevc", "avc", "aac")
 
@@ -636,7 +654,7 @@ class DownloadManager(private val ctx: Context) {
         val generic = base in GENERIC_NAMES || base.startsWith("download_") || base.startsWith("stream_") ||
             // random-looking names (hashes, ids): the video title is a better name
             (base.length >= 16 && !base.contains(' ') && base.any { it.isDigit() } &&
-                Regex("^[A-Za-z0-9_-]+$").matches(base))
+                SAFE_ID_NAME_RE.matches(base))
         return if (generic) "$clean.$ext" else guessed
     }
 
@@ -682,6 +700,7 @@ class DownloadManager(private val ctx: Context) {
         job?.cancel()
         items.remove(d)
         wipeFiles(d)
+        if (d.status == DlStatus.DONE) MediaVisibility.onDeleted(ctx, d.file)
         persist()
         updateNotification()
         stopServiceIfIdle()
@@ -703,6 +722,7 @@ class DownloadManager(private val ctx: Context) {
     fun remove(d: DlItem) {
         if (d.status != DlStatus.RUNNING) {
             runCatching { if (d.status == DlStatus.DONE) d.file.delete() }
+            if (d.status == DlStatus.DONE) MediaVisibility.onDeleted(ctx, d.file)
             items.remove(d)
             persist()
             updateNotification()
@@ -756,7 +776,7 @@ class DownloadManager(private val ctx: Context) {
                     header("Cookie", it)
                     tag(CookieHome::class.java, CookieHome.of(url))
                 }
-                d.referer?.let { header("Referer", it) }
+                (d.frameReferer ?: d.referer)?.let { header("Referer", it) }
                 range?.let { header("Range", it) }
             }
             .build()
@@ -837,7 +857,8 @@ class DownloadManager(private val ctx: Context) {
                     items.remove(d)
                     startUniversal(
                         page, YtQuality.BEST, d.ua, true, d.pageTitle ?: d.displayName, d.cookie,
-                        altUrls = listOf(d.url)
+                        altUrls = listOf(d.url),
+                        altRefs = d.frameReferer?.takeIf { it.isNotBlank() }?.let { mapOf(d.url to it) } ?: emptyMap()
                     )
                 }
                 // Keep temporary HLS segments / completed range chunks on disk
@@ -978,7 +999,7 @@ class DownloadManager(private val ctx: Context) {
                 try {
                     val req = YtDlpEngine.buildRequest(
                         a.url, dir, d.ytTag, d.ytQuality, cookieFile, d.ua,
-                        if (a.backup) d.url else null, a.profile, d.ytHeight
+                        if (a.backup) (d.altRefs[a.url] ?: d.url) else null, a.profile, d.ytHeight
                     )
                     YtDlpEngine.execute(req, YtDlpEngine.processId(d.id), ::onLine)
                     // Exit code 0 is not enough: the file must really exist and be more than a stub.
@@ -1613,13 +1634,13 @@ class DownloadManager(private val ctx: Context) {
             var bestUrl: String? = null
             lines.forEachIndexed { i, line ->
                 if (line.trim().startsWith("#EXT-X-STREAM-INF")) {
-                    val bw = Regex("""[:,]BANDWIDTH=(\d+)""").find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                    val avg = Regex("""AVERAGE-BANDWIDTH=(\d+)""").find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                    val bw = HLS_BANDWIDTH_RE.find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                    val avg = HLS_AVG_BANDWIDTH_RE.find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
                     val next = lines.drop(i + 1).firstOrNull { it.isNotBlank() && !it.trim().startsWith("#") }
                     if (next != null && bw >= bestBw) {
                         bestBw = bw
                         bestUrl = resolve(playlistUrl, next.trim())
-                        Regex("""RESOLUTION=(\d+)x(\d+)""").find(line)?.let { m ->
+                        HLS_RESOLUTION_RE.find(line)?.let { m ->
                             val q = MediaTools.qualityLabel(
                                 m.groupValues[1].toIntOrNull() ?: 0, m.groupValues[2].toIntOrNull() ?: 0
                             )
@@ -1846,7 +1867,7 @@ class DownloadManager(private val ctx: Context) {
 
     private fun parseAttrs(input: String): Map<String, String> {
         val map = mutableMapOf<String, String>()
-        Regex("""([A-Z0-9-]+)=("[^"]*"|[^,]*)""").findAll(input).forEach { m ->
+        HLS_ATTR_RE.findAll(input).forEach { m ->
             val key = m.groupValues[1]
             val value = m.groupValues[2].removeSurrounding("\"").trim()
             map[key] = value
@@ -2055,9 +2076,9 @@ class DownloadService : Service() {
             if (Build.VERSION.SDK_INT < 26) return
             val nm = ctx.getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(
-                NotificationChannel(CHANNEL, "Downloads", NotificationManager.IMPORTANCE_LOW).apply {
+                NotificationChannel(CHANNEL, AppLang.translate("Downloads"), NotificationManager.IMPORTANCE_LOW).apply {
                     setShowBadge(false)
-                    description = "Download progress"
+                    description = AppLang.translate("Download progress")
                 }
             )
         }
@@ -2102,7 +2123,7 @@ class DownloadService : Service() {
 
         /** Time left in whole minutes only ("3 min left"); under a minute reads "1 min left". */
         private fun etaText(seconds: Long): String? =
-            if (seconds > 0) "${((seconds + 59L) / 60L).coerceAtLeast(1L)} min left" else null
+            if (seconds > 0) AppLang.translate("${((seconds + 59L) / 60L).coerceAtLeast(1L)} min left") else null
 
         /** "740.2 MB / ~1.48 GB" (received / total, "~" while the total is only a guess). */
         private fun sizeText(d: DlItem): String = buildString {
@@ -2149,8 +2170,8 @@ class DownloadService : Service() {
         /** First moment of a brand-new download: nothing to report yet. */
         fun buildStarting(ctx: Context): Notification =
             base(ctx)
-                .setContentTitle("Preparing download…")
-                .setContentText("Getting things ready")
+                .setContentTitle(AppLang.translate("Preparing download…"))
+                .setContentText(AppLang.translate("Getting things ready"))
                 .setProgress(0, 0, true)
                 .build()
 
@@ -2165,16 +2186,16 @@ class DownloadService : Service() {
 
         private fun buildRunning(ctx: Context, running: List<DlItem>): Notification {
             val pause = actionIntent(ctx, ACTION_PAUSE, 301)
-            val pauseBtn = NotifViews.Btn("Pause", pause)
+            val pauseBtn = NotifViews.Btn(AppLang.translate("Pause"), pause)
             val b = base(ctx)
             if (running.size == 1) {
                 val d = running.first()
                 val pct = percent(d)
                 val quality = MediaTools.playerText(d.qualityLabel)
-                val note = d.statusNote?.takeIf { it.isNotBlank() }
+                val note = d.statusNote?.takeIf { it.isNotBlank() }?.let { AppLang.translate(it) }
                 // Order matches the card in the app: Downloading · % · speed · quality
                 val line = note ?: buildString {
-                    append("Downloading").append(SEP).append(pct).append('%')
+                    append(AppLang.translate("Downloading")).append(SEP).append(pct).append('%')
                     if (d.speed > 0) append(SEP).append(formatSpeed(d.speed))
                     if (quality.isNotBlank()) append(SEP).append(quality)
                 }
@@ -2182,19 +2203,19 @@ class DownloadService : Service() {
                 withCards(
                     ctx, b, pageOf(d), d.name, line, sizeText(d), pct, unknown,
                     R.drawable.ic_pip_pause, pause, pauseBtn,
-                    NotifViews.Btn("Cancel", actionIntent(ctx, ACTION_CANCEL, 302))
+                    NotifViews.Btn(AppLang.translate("Cancel"), actionIntent(ctx, ACTION_CANCEL, 302))
                 ).setSubText(etaText(d.eta))
             } else {
                 val avg = (running.map { it.progress }.average() * 100).toInt().coerceIn(0, 100)
                 val speed = running.sumOf { it.speed }
                 val line = buildString {
-                    append("Downloading").append(SEP).append(avg).append('%')
+                    append(AppLang.translate("Downloading")).append(SEP).append(avg).append('%')
                     if (speed > 0) append(SEP).append(formatSpeed(speed))
                 }
                 val names = running.take(3).joinToString("\n") { "${percent(it)}%  ${it.name}" } +
-                    if (running.size > 3) "\n+${running.size - 3} more" else ""
+                    if (running.size > 3) "\n" + AppLang.translate("+${running.size - 3} more") else ""
                 withCards(
-                    ctx, b, pageOf(running.first()), "Downloading ${running.size} files", line, names,
+                    ctx, b, pageOf(running.first()), AppLang.translate("Downloading ${running.size} files"), line, names,
                     avg, false, R.drawable.ic_pip_pause, pause, pauseBtn, null
                 )
             }
@@ -2208,14 +2229,14 @@ class DownloadService : Service() {
                 val d = paused.first()
                 val pct = percent(d)
                 withCards(
-                    ctx, b, pageOf(d), d.name, "Paused" + SEP + "$pct%", sizeText(d), pct, false,
-                    R.drawable.ic_pip_play, resume, NotifViews.Btn("Resume", resume),
-                    NotifViews.Btn("Cancel", actionIntent(ctx, ACTION_CANCEL, 302))
+                    ctx, b, pageOf(d), d.name, AppLang.translate("Paused") + SEP + "$pct%", sizeText(d), pct, false,
+                    R.drawable.ic_pip_play, resume, NotifViews.Btn(AppLang.translate("Resume"), resume),
+                    NotifViews.Btn(AppLang.translate("Cancel"), actionIntent(ctx, ACTION_CANCEL, 302))
                 )
             } else {
                 withCards(
-                    ctx, b, pageOf(paused.first()), "${paused.size} downloads paused", "Tap Resume to continue", "",
-                    -1, false, R.drawable.ic_pip_play, resume, NotifViews.Btn("Resume all", resume), null
+                    ctx, b, pageOf(paused.first()), AppLang.translate("${paused.size} downloads paused"), AppLang.translate("Tap Resume to continue"), "",
+                    -1, false, R.drawable.ic_pip_play, resume, NotifViews.Btn(AppLang.translate("Resume all"), resume), null
                 )
             }
             return b.build()

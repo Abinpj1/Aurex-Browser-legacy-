@@ -1,0 +1,764 @@
+User-Agent
+Mozilla/5.0 AurexBrowser/2.0
+If-Modified-Since
+EEE, dd MMM yyyy HH:mm:ss 'GMT'
+Mozilla/5.0 AurexBrowser
+MM-dd HH:mm:ss.SSS
+Crash
+uncaught exception in thread 
+App
+start ·   · Android  ()
+Aurex/
+ (code ) · updated 
+Device
+Android
+ · API  · patch 
+ROM build
+ABIs
+ · 64-bit:  · 32-bit: 
+Page size
+ MB total ·  MB free
+Free storage
+Locale
+Video download
+Engine version
+Engine problem
+none recorded
+Native lib dir
+Engine executables
+Engine folder
+present ( KB)
+Package 
+ files · usr/lib has  entries
+yt-dlp folder
+TIMEOUT: no answer from the engine within 20 s
+skipped (video download is off)
+\n--- Engine test ---\n
+\n--- Events (newest last) ---\n
+Aurex log
+M, a, 0 1,0 ,0 a, 0 1,0 ,0z
+M, h a, 0 0 1 , v a, 0 0 1 , h a, 0 0 1 , v a, 0 0 1 ,z
+Download
+Refresh
+Shield
+Security
+Movie
+Search
+Delete
+Copy
+Pause
+Pip
+Ellipsis
+Close
+Bolt
+Share
+Speaker
+Add
+Gear
+LLL
+History
+Info
+Exclaim
+Desktop
+Moon
+Sleep
+Check
+Article
+Gauge
+Palette
+Globe
+House
+Repeat
+Lock
+Photo
+Quality4K
+Fullscreen
+Folder
+Caption
+Bookmark
+Incognito
+Cookie
+Screenshot
+Tabs
+Swipe
+Disc
+Crop
+Package
+Video
+Doc
+Sheet
+Slides
+Archive
+Code
+Book
+Referer
+Accept
+Accept-Encoding
+Range
+Content-Type
+Content-Range
+Content-Length
+Media Playback
+Shown while Aurex Browser is playing media in the background
+ - YouTube Music
+Aurex Browser
+Playing
+Paused
+Live
+Private tab
+New tab
+Website dialog
+Downloads
+Find in page
+Home
+Desktop site
+Dark mode
+Reader mode
+Long screenshot
+Settings
+Google
+Brave
+Bing
+Startpage
+Ecosia
+Yahoo
+Toolbar can hold only  icons. Remove one first.
+No recent downloads to delete
+Recent download & local file deleted
+Tab closed
+Dark websites are off · turn them on in Settings
+Dark mode off for 
+Dark mode on for 
+Dark websites always on
+Dark websites off
+Dark websites follow the app
+Tab limit reached · close a tab first
+Website language set · applies to pages you open next
+All tabs closed
+UTF-8
+Accept-Language
+Blocked
+Blocked by the adult-content filter · 
+Not verified
+Adult filter on
+Adult filter off
+Turn off the adult filter
+This site can't be allowed
+Allow 
+Allowed sites cleared
+Clear allowed sites
+Open private tabs
+Private tab lock on
+Private tab lock off
+Turn off the private tab lock
+Redirect opened in a new tab
+Desktop site on
+Mobile site on
+Reader mode applied
+Open a webpage first to capture a screenshot
+Long screenshot is off on Instagram / Facebook to keep your account safe
+Webpage
+Saved to Pictures/AurexBrowser
+Save failed
+Unable to share screenshot
+Share Screenshot
+Updating filter lists…
+Bookmark removed
+Bookmark saved
+History cleared
+Cookies & site data cleared · Instagram / Facebook login kept
+Cache cleared
+Browsing data cleared · Instagram / Facebook login kept
+Video download on
+Video download off ·  paused
+Video download off · engine stopped
+Settings reset
+Share link
+Link copied
+This link cannot be downloaded
+Download started
+Open the YouTube video page, then download
+Open the reel or story first, then tap download
+audio only
+Download started · best quality
+Download started · 
+Open a page with a video first
+Open a YouTube video first (not the home page), then download
+This download cannot be saved
+Download started · adaptive speed
+Adult content blocked
+Redirect blocked · 
+Blocked an ad redirect
+Blocked an app launch
+No app can open this link
+No app can open  links
+Page could not be loaded
+Secure connection failed
+Popup blocked
+Leave this page?
+Changes you made may not be saved.
+Alert
+Confirm
+Input
+Popups and redirects allowed on  · reload the page
+Popup guard is active on  again
+Blocked repeated page dialogs
+Invisible ad layer removed
+Private video
+Back
+Cancel
+Just now
+Cancel selection
+Deselect all
+Select all ()
+Blob links can't be downloaded directly. Open the video page and try again
+AVI 
+Blob video
+Connection
+Download failed
+Destination:
+No video was downloaded (the server returned only  bytes)
+Updating downloader…
+Trying another source…
+Trying another method…
+The download finished but no file was produced
+Server refused range ()
+Empty response
+Connection ended early
+The server refused this link ()
+Fast
+lookup failed : 
+fast path failed :  
+Server ignored byte ranges
+Server limits parallel connections
+web page
+only sent
+Content-Disposition
+HTTP 
+The server sent a web page instead of the file
+sign in to confirm
+video unavailable
+this video is private
+not found
+The link was refused by the server
+The server only sent  of  bytes
+No HLS variant found
+AES-128
+This stream is protected (DRM) and can't be downloaded
+No media segments found in playlist
+Segment  is missing
+Playlist HTTP 
+Empty playlist
+AES/CBC/PKCS5Padding
+Could not decrypt a stream segment
+Open 
+Share  files
+Share 
+Download progress
+ min left
+Preparing download…
+Getting things ready
+Downloading
++ more
+Downloading  files
+Resume
+ downloads paused
+Tap Resume to continue
+Resume all
+Tabs,  open
+Menu
+Auto 
+Auto
+Couldn't change quality here, kept the current one
+Picture-in-picture is not available here
+Download language
+Cancel download
+Try again
+Downloaded
+Waiting…
+Downloading · switches when ready
+Downloading language pack…
+Preparing · % · switches when ready
+Preparing · %
+Couldn't download · tap to retry
+English
+Not enough memory to capture this page
+Could not capture this page
+Capture failed
+Not enough memory to finish the screenshot
+The page came out empty, try again
+Media
+Video download is off
+Now playing ·  downloading
+ detected on this page
+Rescan page
+Pages are not scanned for videos and the downloader uses no memory. Turn it on to detect videos and save them.
+Turn on
+Nothing playing or downloading
+Play a video or open a page with media. Audio, HLS, DASH and video links are detected automatically.
+See all
+On this page
+NOW PLAYING
+Play
+Player
+Download this video
+Back 10 seconds
+Forward 10 seconds
+Downloading 
+All caught up
+Starting…
+Completed  ·  
+Paused  ·  %
+Failed
+Queued
+Completed
+Retry
+ HDR
+no video track
+no audio track
+merged file is empty
+not enough free space to show  in the Gallery
+no output stream
+Gallery copy of  failed: 
+Previous
+Next
+ open ·  normal ·  private
+Close all tabs
+Normal  
+Private  
+No normal tabs
+No private tabs
+Tap + to open a new normal tab.
+Tap + to open a new private tab.
+Close tab
+Aurex
+Private
+Start page
+Close all tabs?
+Every open tab will be closed and a fresh start page will open.
+Close all
+Done
+Bookmarks
+Pause all
+Clear history
+Clear finished
+Only finished downloads can be shared
+No bookmarks yet
+No matches
+Long-press a page or use the menu to save it.
+Try a different search.
+Remove bookmark
+History is empty
+Pages you visit will appear here. Private tabs never save history.
+Remove
+No downloads
+Fast parallel downloads with a built-in HLS downloader. Start from any link, video or audio.
+File not found
+Search 
+Clear history?
+All visited pages will be removed. Bookmarks and downloads stay.
+Clear
+Delete  ?
+They will be removed from the list and deleted from this device.
+Delete download?
+"" will be removed from the list and deleted from this device.
+ segments ·  done
+ parts ·  done
+ parallel workers
+ connections at the moment
+Parts
+Details
+Copy link
+Download video or audio
+Paste a link or use the open page · YouTube, Instagram, X, TikTok and 1000+ more
+Paste any video or page link
+Paste
+Couldn't tell which video is playing. Open the video page and try again.
+Audio only
+Next video
+Downloaded video
+No playable stream was found on this page.
+ can't be played on this phone, playing  instead
+ may stutter: this phone has no hardware decoder for it
+Mozilla/5.0
+This phone can't decode , switched to 
+Download manager unavailable
+Already downloaded
+Play the video first to enter Picture-in-Picture
+Fit
+Video 
+Track 
+The site refused this stream (it is protected or has expired).
+This link is not a playable video file.
+Network problem. Check the connection and retry.
+This phone can't decode this video (an unsupported codec, or too sharp). Play a lower quality, such as 4K or FHD.
+Sleep timer - paused
+Brightness %
+Volume %
+2x - release for normal
+Locked
+Off
+Sleep timer
+Unlocked
+Can't play this video
+Switch to portrait
+Switch to landscape
+filter list
+invisible overlay
+no tap
+8K Ultra HD
+Ultra HD
+Quad HD
+Full HD
+Standard
+Data saver
+Best quality
+Download quality
+Choose a resolution
+Checking qualities…
+largest first
+Always best quality
+Size unknown
+Close search
+Appearance
+Toolbar
+Gestures
+Privacy
+General
+Search engine
+About
+Open-source credits
+Language
+App language
+Website language
+Search settings
+Clear browsing data?
+History, cookies, cache and form data. Bookmarks, downloads and your Instagram / Facebook login stay (a fresh login on a "new device" can lock the account).
+Reset all settings?
+Every preference returns to its default. Browsing data is kept.
+Reset
+No settings found for ""
+Light
+Dark
+ threats blocked
+Adblock on
+Adblock off
+Video off
+Aurex · Built by  
+Auto · 
+App language on Auto follows your device language. Website language on Auto follows the app language. Pick a language to set either one on its own.
+Device language: 
+Your device language () isn't available yet, English is used
+Auto Device language
+Sites that offer several languages show this one. Reload a page to see it. A site's own language switch always wins. Download is optional: it saves the app's language pack (about 30 MB) for offline use.
+Auto App language
+Same as the app language: 
+Version 
+Updates
+Updates come from the GitHub releases of the project. Checking contacts api.github.com only.
+Check for updates
+Checking…
+Aurex is up to date
+Couldn't check for updates
+Check automatically
+Developer
+Open source
+Aurex is open source. Bug reports, ideas and pull requests are welcome.
+Source code
+Report an issue
+Telegram community
+Aurex stands on the shoulders of these open-source projects.
+Video & audio extraction engine
+Unlicense
+Runs yt-dlp inside Android (JunkFood02, yausername)
+GPL-3.0
+FFmpeg
+Merging, converting and HDR handling
+LGPL / GPL
+Python
+Runtime that yt-dlp runs on
+Chromium
+The web engine behind Android System WebView
+BSD-3-Clause
+AndroidX Media3 (ExoPlayer)
+Built-in video player
+Apache-2.0
+Jetpack Compose & AndroidX
+The whole interface, activities, WebKit
+Material Icons
+Part of the icon set
+Networking, list and thumbnail downloads
+Kotlin & Coroutines
+Language and async runtime
+EasyList & EasyPrivacy
+Ad and tracker filter rules
+GPL-3.0 / CC BY-SA
+uBlock Origin filters (uAssets)
+Filters, badware and unbreak lists
+AdGuard filters
+Base and Mobile Ads lists
+StevenBlack hosts
+Unified blocklist, also the adult-site list
+Peter Lowe's ad-server list
+Ad-server host list (pgl.yoyo.org)
+Free to use
+Engines
+Libraries
+Filter lists
+Downloaded at runtime and refreshed regularly. Thank you to every maintainer.
+Each project belongs to its authors and stays under its own license. Tap a row to open it.
+Theme
+Dark websites
+Always
+Clear to tinted glass.
+Transparency
+Text size
+Favorites
+Recent sites
+Haptic feedback
+Haptic strength
+Medium
+Strong
+Preview
+Drag a control onto the bar, or tap one to add it. The menu stays fixed.
+Open a tab to preview the toolbar.
+Every control is on the bar.
+Available · max  icons on the bar
+Behavior
+Auto-hide on scroll
+Never
+Finds videos on the pages you open and saves them with the built-in engine.
+Off: the video engine is not loaded, pages are not scanned for videos and no download buttons appear, so it uses no memory. Normal file downloads still work.
+Off · saves memory
+Parallel ranges and HLS are handled automatically.
+Skip the quality sheet
+Video engine
+Version
+Last checked
+Auto-update
+Every 6 hours in the background
+Problem
+Repair engine
+Repairing…
+Video engine repaired
+Couldn't repair · close and reopen Aurex, then try again
+Update now
+Video engine updated
+Video engine is up to date
+Finish or pause the running downloads first
+Couldn't update · check your connection
+Downloaded videos, music and images show up in your Gallery and music apps (a copy is kept in the AurexBrowser folder).
+Hidden from Gallery and music apps. They stay in the Downloads list here.
+Media visibility
+Visible in Gallery
+Hidden
+Files are saved in the app's Download folder.
+Updating…
+Not yet
+Blocking
+Adblock
+Ads, trackers and YouTube ads
+Popup & redirect blocker
+Logins and payments keep working
+Trust 
+Allow popups on this site
+Clear trusted sites
+Block 3rd-party cookies
+Some logins may break
+Private tabs
+Lock private tabs
+Ask for the phone lock
+Adult content
+ blocked · turning off asks for your phone lock
+Block adult content
+Adult sites, searches, leak and illegal adult sites, SafeSearch
+Update site list
+Updating the adult-site list
+Filters
+Lists update every 2 days.
+Threats blocked
+Popups & redirects
+Filter rules
+Data
+Clear cache
+Clear cookies & site data
+Clear browsing data
+Shortcuts on the toolbar buttons.
+Swipe the address bar
+Left or right switches tabs
+Swipe up on Tabs
+Closes the current tab
+Swipe up on Downloads
+Deletes the latest download
+Press and hold
+Press and hold a toolbar button.
+Hold Tabs for a new tab
+Opens a new tab with the keyboard ready to type
+Hold the menu for Settings
+The three-dot button opens Settings
+Downloads list
+Swipe a download in the Downloads list. Delete also removes the file, with no confirmation.
+Swipe right to delete
+Deletes the download and its file
+Swipe left to share
+Shares the finished file
+In menu
+Long-press a row to reorder.
+Nothing here yet.
+Hide
+Show all
+Reset to default
+Picture-in-picture starts when you leave the app during playback.
+Floating media button
+Play and picture-in-picture over a video
+Background playback
+Keep playing when you leave
+Auto picture-in-picture
+Autoplay
+Videos start without a tap
+Used from the address bar and start page.
+ search engine
+Browsing
+Block images to save data
+Support
+Copies device info, the state of the video engine and recent errors (no cookies, no page addresses beyond the site and path). Paste it into a bug report.
+Copy log
+Collecting…
+Log copied
+Couldn't copy the log
+Clear log
+Log cleared
+Reset all settings
+Getting ready…
+Scrolling for you · touch the page to take over
+Your turn · scroll down, then tap Done
+Filling in the gaps…
+Joining the pieces…
+%.1f screens captured
+Maximum length reached
+Auto-scroll
+I'll scroll
+Retake
+Saved
+Saving…
+Save
+Forward
+Reader
+Private tabs are locked
+Use your phone lock to continue
+Unlock
+Back to normal tabs
+Blocked by the adult
+Cancel editing
+Search or enter address
+Release to remove
+Download video
+Open in player
+Search or enter website
+Stop loading
+Reload
+No actions selected yet.
+Add bookmark
+Dark mode · on
+Dark mode · off
+Previous match
+Next match
+Close find
+Wikipedia
+Reddit
+Instagram
+Maps
+News
+Amazon
+Stack Overflow
+Liquid glass browser
+Where to next?
+Private by design. Fast by default.
+Search with 
+or type a URL
+ hosts ·  tab
+Shield on
+Recent
+Page blocked
+Can't open this page
+Check your connection and try again.
+Go back
+Allow this site
+Blocked by mistake? You can allow this site.
+No connection
+GitHub answered 
+This release has no APK
+Download failed ()
+Download failed (no data)
+Cancelled
+The file did not match its checksum. Try again.
+Couldn't save the update
+No connection. Check your network and try again.
+Up to date
+Couldn't check
+Allow Aurex to install updates in the screen that just opened, come back, and tap Install.
+Couldn't open the installer. Try again.
+Update required
+Update available
+Aurex  is out. Your version is  releases behind, so it needs an update before you continue.
+Aurex  is ready to install.
+Later
+Open release page
+Downloading %
+Install
+Update
+Video download is off · turn it on in Settings → Downloads
+no video id found for page 
+Max
+Engine
+init failed
+The downloader engine could not start on this device ()
+Busy · finish downloads first
+Updated
+bundled build
+Location
+update is not available
+update failed
+OK · yt-dlp 
+FAILED · 
+cannot link executable
+Engine files were reset. Close Aurex completely, open it again and retry.
+link error, repairing (try ): 
+repair did not finish
+download cancelled
+run failed []: 
+this video is not available
+private video
+has been removed
+members only
+premieres in
+live event will begin
+unsupported url
+unable to extract
+player response
+signature extraction
+http error 403
+please report this issue
+CANNOT LINK EXECUTABLE
+unknown reason
+Video engine can't start on this phone (: ). Settings → Video engine → Repair engine, then retry.
+ERROR:
+not a bot
+The site asked for a sign-in check. Sign in to it in the browser, then retry.
+log in
+Instagram needs a login for this post. Aurex never uses your Instagram account for downloads, so only public posts can be saved.
+Facebook needs a login for this video. Aurex never uses your Facebook account for downloads, so only public videos can be saved.
+login required
+rate-limit reached
+This media needs a login. Sign in to the site in the browser, then retry.
+The site refused the video stream (HTTP 403). Open Settings → Downloads → Update now, then retry.
+no video formats
+requested format is not available
+YouTube gave no playable formats for this video (
+Open a YouTube video (not the home page or a feed) and try again.
+no video could be found
+No downloadable video was found on this page.
+not installed
+Audio/video merging is unavailable on this device.
+unable to resolve host
+timed out

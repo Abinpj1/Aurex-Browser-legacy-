@@ -49,7 +49,6 @@ import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Icon
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -102,8 +101,12 @@ private val cGray = Color(0xFF8E8E93)
 
 private val PAGE_TITLES = listOf(
     "Appearance", "Toolbar", "Gestures", "Downloads", "Media",
-    "Privacy", "Menu", "General", "Search engine", "About", "Open-source credits"
+    "Privacy", "Menu", "General", "Search engine", "About", "Open-source credits",
+    "Language", "App language", "Website language"
 )
+
+/** Where the back arrow of a settings page leads. */
+private fun backOf(p: Int): Int = when (p) { 10 -> 9; 12, 13 -> 11; else -> -1 }
 
 private const val AUTHOR_NAME = "AMAN"
 private const val AUTHOR_URL = "https://github.com/aman-nitb-cse"
@@ -409,7 +412,7 @@ fun SettingsPage(s: BrowserState, onClose: () -> Unit) {
         s.settingsTab = if (p < 0) 0 else p
     }
     fun endSearch() { query = ""; searchState.expanded = false; fabKey++ }
-    BackHandler(enabled = page >= 0) { go(if (page == 10) 9 else -1) }
+    BackHandler(enabled = page >= 0) { go(backOf(page)) }
 
     Box(Modifier.fillMaxSize().closeSearchOnEmptyTap(searchState)) {
         Column(Modifier.fillMaxSize().imePadding()) {
@@ -443,7 +446,7 @@ fun SettingsPage(s: BrowserState, onClose: () -> Unit) {
                     SHeader(
                         title = if (p < 0) "Settings" else PAGE_TITLES[p],
                         root = p < 0,
-                        onBack = { if (p < 0) onClose() else go(if (p == 10) 9 else -1) }
+                        onBack = { if (p < 0) onClose() else go(backOf(p)) }
                     )
                     when (p) {
                         -1 -> SettingsRoot(s) { go(it) }
@@ -457,6 +460,9 @@ fun SettingsPage(s: BrowserState, onClose: () -> Unit) {
                         7 -> GeneralSettings(s, onReset = { confirmReset = true })
                         9 -> AboutSettings(s, onClose) { go(10) }
                         10 -> CreditsSettings(s, onClose)
+                        11 -> LanguageSettings(s) { go(it) }
+                        12 -> AppLanguageSettings()
+                        13 -> WebLanguageSettings(s)
                         else -> SearchSettings(s)
                     }
                 }
@@ -636,6 +642,7 @@ private fun SettingsRoot(s: BrowserState, open: (Int) -> Unit) {
         }
         SGroup {
             nav("Search engine", AppleIcons.Search, cIndigo, engineName) { open(8) }
+            nav("Language", AppleIcons.Language, cBlue, AppLang.nameOfUi()) { open(11) }
             nav("General", AppleIcons.Settings, cGray) { open(7) }
         }
         SGroup {
@@ -652,6 +659,76 @@ private fun SettingsRoot(s: BrowserState, open: (Int) -> Unit) {
     }
 }
 
+
+// ── Language ─────────────────────────────────────────────────────────────────
+
+/** "Auto · हिन्दी" while a setting is on Auto, else just the language. */
+private fun autoLabel(choice: String, name: String): String =
+    if (choice == AppLang.AUTO) "Auto · $name" else name
+
+@Composable
+private fun LanguageSettings(s: BrowserState, open: (Int) -> Unit) {
+    SettingsScroll {
+        SGroup(
+            footer = "App language on Auto follows your device language. Website language on Auto follows the app language. " +
+                "Pick a language to set either one on its own."
+        ) {
+            nav("App language", AppleIcons.Language, cBlue,
+                autoLabel(AppLang.uiChoice, AppLang.nameOfUi())) { open(12) }
+            nav("Website language", AppleIcons.Language, cTeal,
+                autoLabel(AppLang.web, AppLang.nameOfWeb())) { open(13) }
+        }
+    }
+}
+
+@Composable
+private fun AppLanguageSettings() {
+    val deviceSub = if (AppLang.deviceSupported()) "Device language: ${AppLang.deviceName()}"
+        else "Your device language (${AppLang.deviceName()}) isn't available yet, English is used"
+    SettingsScroll {
+        SGroup(
+            footer = "Tap a language to use it. One that is not on this phone yet downloads first (about 30 MB, once) and " +
+                "switches when it is ready. The download button only downloads. Afterwards it works offline. " +
+                "Web pages, file names and anything you type are never changed."
+        ) {
+            row(INSET, "Auto Device language") {
+                AppLangRow(AppLang.AUTO, "Auto", deviceSub)
+            }
+            Langs.ALL.forEach { l ->
+                row(INSET, l.english + " " + l.native) {
+                    AppLangRow(l.code, l.native, if (l.native == l.english) null else l.english)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WebLanguageSettings(s: BrowserState) {
+    // Tapping the language that is already chosen does nothing (no second toast).
+    fun pick(code: String) { if (AppLang.web != code) { AppLang.updateWeb(code); s.applyWebLanguage() } }
+    SettingsScroll {
+        SGroup(
+            footer = "Sites that offer several languages show this one. Reload a page to see it. A site's own language " +
+                "switch always wins. Download is optional: it saves the app's language pack (about 30 MB) for offline use."
+        ) {
+            row(INSET, "Auto App language") {
+                WebLangRow(
+                    AppLang.AUTO, "Auto", "Same as the app language: ${AppLang.nameOfWebAuto()}",
+                    AppLang.web == AppLang.AUTO
+                ) { pick(AppLang.AUTO) }
+            }
+            Langs.ALL.forEach { l ->
+                row(INSET, l.english + " " + l.native) {
+                    WebLangRow(
+                        l.code, l.native, if (l.native == l.english) null else l.english,
+                        AppLang.web == l.code
+                    ) { pick(l.code) }
+                }
+            }
+        }
+    }
+}
 
 // ── About ────────────────────────────────────────────────────────────────────
 
@@ -1150,7 +1227,7 @@ private fun DownloadSettings(s: BrowserState) {
             }
         }
         SGroup(
-            footer = if (mediaVisible) "Downloaded videos, music and images show up in your Gallery and music apps."
+            footer = if (mediaVisible) "Downloaded videos, music and images show up in your Gallery and music apps (a copy is kept in the AurexBrowser folder)."
             else "Hidden from Gallery and music apps. They stay in the Downloads list here."
         ) {
             sw("Media visibility", mediaVisible, if (mediaVisible) "Visible in Gallery" else "Hidden") {

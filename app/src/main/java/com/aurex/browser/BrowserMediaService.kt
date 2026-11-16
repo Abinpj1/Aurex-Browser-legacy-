@@ -22,6 +22,9 @@ import android.os.Looper
 import android.os.PowerManager
 import java.util.concurrent.atomic.AtomicBoolean
 
+// Compiled once; building a Regex on every call is wasted work on hot paths.
+private val TAB_COUNT_PREFIX_RE = Regex("^\\(\\d+\\)\\s*")
+
 /**
  * BrowserMediaService – a foreground service that keeps media playing when the
  * screen is off or the app is backgrounded, especially on MIUI / HyperOS devices
@@ -298,10 +301,10 @@ class BrowserMediaService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(
                 CHANNEL_ID,
-                "Media Playback",
+                AppLang.translate("Media Playback"),
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Shown while Aurex Browser is playing media in the background"
+                description = AppLang.translate("Shown while Aurex Browser is playing media in the background")
                 setShowBadge(false)
                 setSound(null, null)
                 enableVibration(false)
@@ -318,7 +321,7 @@ class BrowserMediaService : Service() {
         for (suffix in listOf(" - YouTube Music", " - YouTube", " | YouTube")) {
             if (t.endsWith(suffix, ignoreCase = true)) t = t.dropLast(suffix.length).trim()
         }
-        return t.replace(Regex("^\\(\\d+\\)\\s*"), "")
+        return t.replace(TAB_COUNT_PREFIX_RE, "")
     }
 
     /** The thumbnail arrived from the network: redraw the notification. */
@@ -394,6 +397,7 @@ class BrowserMediaService : Service() {
      * both carry all three buttons.
      */
     private fun buildNotification(): Notification {
+        ensureNotificationChannel()     // re-applies the channel name / description in the current app language
         val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         // Tap on the card: the page where the video plays (or the player showing the downloaded video).
         val open = if (MediaNotif.local != null) {
@@ -430,12 +434,12 @@ class BrowserMediaService : Service() {
         val playing = s?.playing ?: isPlaying
         val heading = mediaTitle.ifBlank { "Aurex Browser" }
         val site = mediaHost.ifBlank { "Aurex Browser" }
-        val sub = "$site · " + if (playing) "Playing" else "Paused"
+        val sub = "$site · " + AppLang.translate(if (playing) "Playing" else "Paused")
         val left: String
         val right: String
         when {
             s == null -> { left = "0:00"; right = "" }
-            s.live -> { left = ""; right = "LIVE" }
+            s.live -> { left = ""; right = AppLang.translate("Live").uppercase() }
             else -> {
                 left = MediaNotif.fmt(s.posMs)
                 right = if (s.durMs > 0) "-" + MediaNotif.fmt(s.durMs - s.posMs) else ""

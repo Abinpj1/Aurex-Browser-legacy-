@@ -65,7 +65,6 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Icon
-import androidx.compose.material3.Text
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -1192,7 +1191,7 @@ fun launchPlayer(
             runCatching { android.net.Uri.parse(url).host.orEmpty().endsWith("googlevideo.com") }.getOrDefault(false)
         if (cdn && YtDlpEngine.isYoutubeUrl(page) && !YtDlpEngine.isItemUrl(page)) {
             android.widget.Toast.makeText(
-                ctx, "Couldn't tell which video is playing. Open the video page and try again.",
+                ctx, AppLang.translate("Couldn't tell which video is playing. Open the video page and try again."),
                 android.widget.Toast.LENGTH_SHORT
             ).show()
             return@resolve
@@ -1211,7 +1210,7 @@ fun launchPlayer(
             .putExtra("url", url)
             .putExtra("audioUrl", audioUrl)
             .putExtra("title", title.ifBlank { tab?.title ?: hostOf(url) })
-            .putExtra("referer", pageUrl)
+            .putExtra("referer", tab?.mediaRef?.get(url) ?: pageUrl)   // the embed player's address when the link came from one
             .putExtra("pageUrl", pageUrl)
             .putExtra("ua", tab?.web?.settings?.userAgentString)
             .putExtra("cookie", siteCookie(url))

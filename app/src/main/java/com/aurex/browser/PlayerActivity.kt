@@ -48,7 +48,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -134,6 +133,11 @@ class PlayerActivity : ComponentActivity() {
     private var resolvedUa: String? = null
     private var triedResolve = false
     private var canResolve = false
+    /**
+     * Any other web page (no site extractor): when the link the browser sniffed will not play (hotlink 403, odd
+     * container), the engine gets ONE try at the page itself. Never for decoder or network-drop errors.
+     */
+    private var engineFallback = false
     private var wantHeight = 0          // quality picked in the in-app player (0 = automatic choice)
     private var netRetries = 0          // automatic retries after a network drop (reset once playing)
     private var reResolves = 0          // fresh lookups after an expired / refused stream link (reset once playing)
@@ -376,8 +380,13 @@ class PlayerActivity : ComponentActivity() {
         val host = uri.host.orEmpty()
         wantHeight = intent.getIntExtra("height", 0)
         val cdn = host.endsWith("googlevideo.com") || host.contains("youtube") || url.startsWith("blob:") || wantHeight > 0
+        // A blob: / MSE player (ok.ru, many embed sites) has no link a player can open: the page itself is handed to
+        // the engine, whose generic extractor finds the real stream (the same way "Save page" does).
         canResolve = !isLocal && YtDlpEngine.canTry(pageUrl) &&
-            (YtDlpEngine.isItemUrl(pageUrl) || (wantHeight > 0 && YtDlpEngine.isQualitySite(pageUrl)))
+            (YtDlpEngine.isItemUrl(pageUrl) || (wantHeight > 0 && YtDlpEngine.isQualitySite(pageUrl)) ||
+                url.startsWith("blob:", true))
+        engineFallback = !isLocal && !canResolve && VideoDl.enabled && YtDlpEngine.canTry(pageUrl) &&
+            !isHandsOffHost(pageUrl)
         posKey = "pos2_" + resumeId(url, pageUrl, canResolve, isLocal, title).hashCode()
         // The old key was the same for every video that came through a blob: / generic link, so a new video
         // started where the previous one stopped. Those entries are wrong by design: drop them once.
@@ -507,7 +516,7 @@ class PlayerActivity : ComponentActivity() {
                 if (cardUp) MediaNotif.poke()
             }
             override fun onPlayerError(error: PlaybackException) {
-                if (!(canResolve && !triedResolve)) fireFirstFrame()   // nothing more to wait for: let the caller go
+                if (!((canResolve || engineFallbackFor(error.errorCode)) && !triedResolve)) fireFirstFrame()   // nothing more to wait for: let the caller go
                 // The indexed source could not be read for any reason: play the file the plain way instead of failing.
                 if (indexedActive && error.errorCode != PlaybackException.ERROR_CODE_DECODER_INIT_FAILED &&
                     error.errorCode != PlaybackException.ERROR_CODE_DECODING_FAILED &&
@@ -519,6 +528,7 @@ class PlayerActivity : ComponentActivity() {
                 }
                 // The first failure on a resolvable page silently switches to the resolved stream.
                 if (canResolve && !triedResolve) { startResolve(); return }
+                if (engineFallbackFor(error.errorCode)) { startResolve(); return }
                 when (error.errorCode) {
                     // Live / sliding-window stream fell behind: jump back to the live edge.
                     PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW -> {
@@ -689,6 +699,17 @@ class PlayerActivity : ComponentActivity() {
         begin(src, startMs)
     }
 
+    private fun engineFallbackFor(code: Int): Boolean = engineFallback && !triedResolve && when (code) {
+        PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+        PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
+        PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+        PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+        PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED,
+        PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED,
+        PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED -> true
+        else -> false
+    }
+
     private fun startResolve(startMs: Long = player.currentPosition) {
         val page = pageUrl ?: return
         triedResolve = true
@@ -759,10 +780,11 @@ class PlayerActivity : ComponentActivity() {
                 nt in 1 until cTier && (nt < 2160 || hwDecodes(n, hardwareOnly = false))
             }
             if (lower != null) {
+                val wasQ = MediaTools.playerText(MediaTools.labelForHeight(c.height))
+                val nowQ = MediaTools.playerText(MediaTools.labelForHeight(list[lower].height))
                 Toast.makeText(
                     this,
-                    MediaTools.playerText(MediaTools.labelForHeight(c.height)) + " can't be played on this phone, playing " +
-                        MediaTools.playerText(MediaTools.labelForHeight(list[lower].height)) + " instead",
+                    AppLang.translate("$wasQ can't be played on this phone, playing $nowQ instead"),
                     Toast.LENGTH_LONG
                 ).show()
                 selectChoice(lower, startMs)
@@ -775,9 +797,10 @@ class PlayerActivity : ComponentActivity() {
         choiceIndex.intValue = index
         // 4K / 8K picked by hand on a phone without a hardware decoder for it: say so instead of a silent stutter.
         if (cTier >= 2160 && !hwDecodes(c)) {
+            val qLabel = MediaTools.playerText(MediaTools.labelForHeight(c.height))
             Toast.makeText(
                 this,
-                MediaTools.playerText(MediaTools.labelForHeight(c.height)) + " may stutter: this phone has no hardware decoder for it",
+                AppLang.translate("$qLabel may stutter: this phone has no hardware decoder for it"),
                 Toast.LENGTH_LONG
             ).show()
         }
@@ -811,10 +834,11 @@ class PlayerActivity : ComponentActivity() {
         val nowTier = DeviceCaps.tier(now)
         val next = (cur + 1 until list.size).firstOrNull { DeviceCaps.tier(list[it]) in 1 until nowTier } ?: return
         decoderStepDowns++
+        val failedQ = MediaTools.playerText(MediaTools.labelForHeight(now.height))
+        val nextQ = MediaTools.playerText(MediaTools.labelForHeight(list[next].height))
         Toast.makeText(
             this,
-            "This phone can't decode " + MediaTools.playerText(MediaTools.labelForHeight(now.height)) +
-                ", switched to " + MediaTools.playerText(MediaTools.labelForHeight(list[next].height)),
+            AppLang.translate("This phone can't decode $failedQ, switched to $nextQ"),
             Toast.LENGTH_LONG
         ).show()
         selectChoice(next, player.currentPosition)
@@ -830,16 +854,16 @@ class PlayerActivity : ComponentActivity() {
         val app = applicationContext as? AurexApp
         val manager = app?.downloads
         if (manager == null) {
-            Toast.makeText(this, "Download manager unavailable", Toast.LENGTH_SHORT).show(); return
+            Toast.makeText(this, AppLang.translate("Download manager unavailable"), Toast.LENGTH_SHORT).show(); return
         }
         if (isLocal) {
-            Toast.makeText(this, "Already downloaded", Toast.LENGTH_SHORT).show(); return
+            Toast.makeText(this, AppLang.translate("Already downloaded"), Toast.LENGTH_SHORT).show(); return
         }
         val page = pageUrl
         val name = resolvedTitle.value.ifBlank { introTitle }.ifBlank { null }
         if (canResolve && page != null) {
             if (!VideoDl.enabled) {
-                Toast.makeText(this, VideoDl.OFF_HINT, Toast.LENGTH_LONG).show(); return
+                Toast.makeText(this, AppLang.translate(VideoDl.OFF_HINT), Toast.LENGTH_LONG).show(); return
             }
             // the quality that is playing right now is the quality that gets saved
             val h = choices.value.getOrNull(choiceIndex.intValue)?.height ?: 0
@@ -847,7 +871,7 @@ class PlayerActivity : ComponentActivity() {
         } else {
             manager.start(playUrlState.value, userAgent, null, kindMime(playUrlState.value), referer, title = name)
         }
-        Toast.makeText(this, "Download started", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, AppLang.translate("Download started"), Toast.LENGTH_SHORT).show()
     }
 
     // -- Picture in picture ----------------------------------------------------------------------
@@ -936,7 +960,7 @@ class PlayerActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT < 26) return
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) return
         if (!wantsPlay()) {
-            Toast.makeText(this, "Play the video first to enter Picture-in-Picture", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, AppLang.translate("Play the video first to enter Picture-in-Picture"), Toast.LENGTH_SHORT).show()
             return
         }
         pipRequested = runCatching { enterPictureInPictureMode(buildPipParams()) }.getOrDefault(false)

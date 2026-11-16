@@ -606,6 +606,8 @@ class AurexWebView(context: Context) : WebView(context) {
     }
 
     private fun enqueue(c: Candidate) {
+        // Nobody listens: do not probe links (a probe request can use up a one-time / IP-bound video link).
+        if (onStreamDetected == null) return
         if (isAdUrl(c.url)) return
         if (c.kind == AurexStreamKind.BLOB && isAdUrl(c.pageUrl)) return
         if (seenKeys.size > MAX_SEEN) seenKeys.clear()

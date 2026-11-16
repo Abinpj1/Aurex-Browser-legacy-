@@ -46,6 +46,9 @@ import java.net.URLEncoder
 import java.util.Locale
 import kotlin.math.abs
 
+// Compiled once; building a Regex on every call is wasted work on hot paths.
+private val IPV4_HOST_RE = Regex("""^(\d{1,3}\.){3}\d{1,3}(:\d+)?(/.*)?$""")
+
 // ── Models ───────────────────────────────────────────────────────────────────
 
 class Tab(val id: Int, val incognito: Boolean) {
@@ -64,6 +67,10 @@ class Tab(val id: Int, val incognito: Boolean) {
 
     /** Media discovered through the network layer. */
     val media = mutableStateListOf<String>()
+    /** Links a <video> element really loaded, in ANY frame (embed players too): trusted as media even with no file extension. */
+    val videoSrcs = HashSet<String>()
+    /** Address of the frame that requested a link (its Referer). Hotlink-protected hosts only answer with that one. */
+    val mediaRef = HashMap<String, String>()
 
     /** Set when the page reports that a video/audio element actually started playing. */
     var videoActive by mutableStateOf(false)
@@ -71,6 +78,11 @@ class Tab(val id: Int, val incognito: Boolean) {
     var videoPlaying by mutableStateOf(false)
     /** The same video exists but is paused (PiP stays open and shows a play button). */
     var videoPaused by mutableStateOf(false)
+    /**
+     * A video is on this page. [videoActive] is only set by the script of the TOP frame; a player inside an <iframe>
+     * (most streaming / blog sites) reports through [videoPlaying] / [videoPaused] instead, so all three count.
+     */
+    val hasVideo: Boolean get() = videoActive || videoPlaying || videoPaused
     /**
      * Epoch-ms when the current video FIRST became stably playing (not an ad thumbnail flip).
      * 0 means not playing. Used by auto-PiP to require ≥3 s of genuine play before entering
@@ -509,8 +521,42 @@ private const val HANDS_OFF_FRAME_JS = """(function(){
  return false;
 })()"""
 
+/**
+ * Runs in EVERY frame (document-start script). A <video> reports the link it really loaded (currentSrc / src / <source>)
+ * with the address of its own frame. Embed players (iframes on other hosts) were invisible before: the page script that
+ * lists media ran in the top frame only, and a link with no file extension never passed the address test.
+ */
+private const val SRC_JS = """(function(){
+if(window.__aurexSrc)return;window.__aurexSrc=1;
+var seen={};
+function abs(u){try{return new URL(u,document.baseURI).href;}catch(e){return String(u);}}
+function frameUrl(){var h=location.href||'';return h.indexOf('http')===0?h:(document.referrer||'');}
+function send(u){
+ try{
+  if(!u)return;u=abs(u);
+  if(u.indexOf('http')!==0||seen[u])return;
+  seen[u]=1;
+  var M=window.AurexMedia;
+  if(M&&M.src)M.src(u,frameUrl());
+ }catch(e){}
+}
+function scan(v){
+ try{
+  send(v.currentSrc);send(v.getAttribute('src'));
+  var s=v.getElementsByTagName('source');
+  for(var i=0;i<s.length;i++)send(s[i].src||s[i].getAttribute('src'));
+ }catch(e){}
+}
+['loadedmetadata','loadeddata','playing'].forEach(function(t){
+ document.addEventListener(t,function(e){var v=e.target;if(v&&v.tagName==='VIDEO')scan(v);},true);
+});
+function scanAll(){try{var vs=document.getElementsByTagName('video');for(var i=0;i<vs.length;i++)scan(vs[i]);}catch(e){}}
+setTimeout(scanAll,1500);setTimeout(scanAll,5000);
+})();"""
+
 private fun earlyScript(h264: Boolean, adScripts: String): String {
     val body = DarkEngine.JS + "\n;" + EARLY_TOUCH_JS + (if (h264) EARLY_H264_JS else "") + "\n;" + PIP_JS +
+        "\n;" + SRC_JS +
         (if (adScripts.isEmpty()) "" else "\n;" + adScripts)
     // Installed for every origin, but nothing of it may run on Instagram (nor in a frame Instagram created).
     return "if(!" + HANDS_OFF_FRAME_JS + "){\n" + body + "\n}"
@@ -1510,6 +1556,17 @@ class BrowserState(private val act: Activity) {
         blocker.onEngineReady = { tabs.forEach { t -> runCatching { installEarlyScript(t) } } }
     }
 
+    /** What websites are told changed (website language, or the app language it follows): tabs get the new page script. */
+    private val webLangHook: () -> Unit = {
+        act.runOnUiThread { tabs.forEach { t -> runCatching { installEarlyScript(t) } } }
+    }
+
+    // Declared after webLangHook on purpose (a property read before its initializer would be null).
+    init { AppLang.setWebListener(webLangHook) }
+
+    /** Called when the activity goes away, so a later one is not talked to through this (dead) state. */
+    fun release() { AppLang.clearWebListener(webLangHook) }
+
     // Privacy
     var adblock by mutableStateOf(prefs.getBoolean("adblock", true))
     var popupBlock by mutableStateOf(prefs.getBoolean("popup", true))
@@ -2171,10 +2228,15 @@ class BrowserState(private val act: Activity) {
             earlyHandles.remove(tab.id)?.remove()
             earlyHandles[tab.id] = WebViewCompat.addDocumentStartJavaScript(
                 w,
-                earlyScript(smoothVideo, adEarlyScripts()),
+                earlyScript(smoothVideo, adEarlyScripts() + AppLang.webScript()),
                 setOf("*")
             )
         }
+    }
+
+    /** The person picked a website language (the page scripts are renewed by AppLang's listener): say when it applies. */
+    fun applyWebLanguage() {
+        notify("Website language set · applies to pages you open next")
     }
 
     /** Document-start scripts for ad / popup protection (empty when both are off). */
@@ -2236,7 +2298,7 @@ class BrowserState(private val act: Activity) {
         if (t.isEmpty()) return ""
         val engineUrl = ENGINES[engine.coerceIn(0, ENGINES.lastIndex)].url
         val looksLocal = t.startsWith("localhost") ||
-            Regex("""^(\d{1,3}\.){3}\d{1,3}(:\d+)?(/.*)?$""").matches(t)
+            IPV4_HOST_RE.matches(t)
         var url = when {
             t.startsWith("http://") || t.startsWith("https://") -> t
             t.startsWith("about:") || t.startsWith("file:") || t.startsWith("content:") -> t
@@ -2263,7 +2325,11 @@ class BrowserState(private val act: Activity) {
             pushHistory(tab, url)
             // DNT is only attached to this one top-level request (never to the page's own XHR / fetch calls), which
             // makes a signed-in Instagram session look odd; Instagram gets a plain, header-for-header normal load.
-            tab.web?.loadUrl(url, if (dnt && !isHandsOffHost(url)) mapOf("DNT" to "1") else emptyMap())
+            val hdr = HashMap<String, String>()
+            if (dnt && !isHandsOffHost(url)) hdr["DNT"] = "1"
+            // website language: the chosen language is asked for on this top-level request too
+            if (!isHandsOffHost(url)) AppLang.webHeader()?.let { hdr["Accept-Language"] = it }
+            tab.web?.loadUrl(url, hdr)
             barVisible = true
         }
     }
@@ -2756,7 +2822,7 @@ class BrowserState(private val act: Activity) {
             YtDlpEngine.release()
             tabs.forEach { t ->
                 (t.web as? AurexWebView)?.sniffEnabled = false
-                t.media.clear()
+                t.media.clear(); t.videoSrcs.clear(); t.mediaRef.clear()
             }
             if (!quiet) {
                 notify(
@@ -2835,13 +2901,15 @@ class BrowserState(private val act: Activity) {
             val cookie = if (tab?.incognito == true) null
             else siteCookie(url)
 
+            // The embed player's own address: video hosts with hotlink protection only answer a request that names it.
+            val frameRef = tab?.mediaRef?.get(url)
             // Sites without a quality choice: start the video that is playing right now.
             val direct = {
-                downloads.start(url, ua, null, mime, ref, title = name)
+                downloads.start(url, ua, null, mime, ref, title = name, frameReferer = frameRef)
                 notify("Download started")
             }
             val hlsOrDirect = {
-                if (isHlsLink) askHlsQuality(url, mime, ua, ref, cookie, name, direct) else direct()
+                if (isHlsLink) askHlsQuality(url, mime, ua, frameRef ?: ref, cookie, name, direct) else direct()
             }
             when {
                 YtDlpEngine.isItemUrl(page) && !isHlsLink ->
@@ -2869,6 +2937,8 @@ class BrowserState(private val act: Activity) {
             } else {
                 val direct = tab?.let { playableMedia(it) }
                 if (direct != null) download(direct)
+                // No link to hand over (blob / MSE player, protected embed): the engine looks at the page itself.
+                else if (page.startsWith("http", true) && !isHandsOffHost(page)) askEngineQuality(tab, page, title, null)
                 else notify("Open the reel or story first, then tap download")
             }
         }
@@ -3034,7 +3104,7 @@ class BrowserState(private val act: Activity) {
         val tab = tabs.getOrNull(current)
         val live = runCatching { tab?.web?.url }.getOrNull()
         val samePage = tab != null && (tab.url == pageUrl || live == pageUrl)
-        if (samePage && (YtDlpEngine.isYoutubeUrl(pageUrl) || YtDlpEngine.isInstagramUrl(pageUrl))) {
+        if (samePage && (YtDlpEngine.isYoutubeUrl(pageUrl) || YtDlpEngine.isInstagramUrl(pageUrl) || YtDlpEngine.isOkUrl(pageUrl))) {
             // Ask the page for the real video id + title (see VideoPage).
             VideoPage.resolve(tab) { page, t -> startUniversalFor(tab, page, quality, title ?: t) }
         } else {
@@ -3066,7 +3136,8 @@ class BrowserState(private val act: Activity) {
             useCookies = tab?.incognito != true,
             title = title?.takeIf { it.isNotBlank() },
             altUrls = backup,
-            height = height
+            height = height,
+            altRefs = backup.mapNotNull { u -> tab?.mediaRef?.get(u)?.let { r -> u to r } }.toMap()
         )
         notify("Download started" + if (height > 0) " · " + MediaTools.labelForHeight(height) else "")
     }
@@ -3078,7 +3149,7 @@ class BrowserState(private val act: Activity) {
         // produce junk files. Backup links are for sites WITHOUT an extractor.
         if (YtDlpEngine.isItemUrl(tab.url)) return emptyList()
         return (listOfNotNull(tab.activeMedia) + tab.media.toList())
-            .filter { it.startsWith("http", true) && isMediaUrl(it) && mediaScore(it) > 0 }
+            .filter { it.startsWith("http", true) && (isMediaUrl(it) || it in tab.videoSrcs) && mediaScore(it) > 0 }
             .filter { YtDlpEngine.isBackupSource(tab.url, it) }
             .distinct()
             .sortedByDescending { mediaScore(it) }
@@ -3091,10 +3162,10 @@ class BrowserState(private val act: Activity) {
      */
     fun playableMedia(tab: Tab): String? {
         val active = tab.activeMedia
-            ?.takeIf { it.isNotBlank() && !it.startsWith("blob:") && !it.startsWith("data:") && isMediaUrl(it) }
+            ?.takeIf { it.isNotBlank() && !it.startsWith("blob:") && !it.startsWith("data:") && (isMediaUrl(it) || it in tab.videoSrcs) }
         val discovered = tab.media.asSequence()
-            .filter { !it.startsWith("blob:") && !it.startsWith("data:") && isMediaUrl(it) }
-            .maxByOrNull { mediaScore(it) }
+            .filter { !it.startsWith("blob:") && !it.startsWith("data:") && (isMediaUrl(it) || it in tab.videoSrcs) }
+            .maxByOrNull { mediaScore(it) + if (it in tab.videoSrcs) 15 else 0 }
         return when {
             active != null && (discovered == null || mediaScore(active) >= mediaScore(discovered)) -> active
             discovered != null && mediaScore(discovered) > 0 -> discovered
@@ -3351,8 +3422,12 @@ class BrowserState(private val act: Activity) {
                     countBlocked()
                     return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                 }
-                if (mediaDetect && !request.isForMainFrame && isMediaUrl(url)) {
-                    addMedia(tab, url)
+                if (mediaDetect && !request.isForMainFrame) {
+                    // The Referer of the request is the FRAME that asked (the embed player), which is what the
+                    // video host expects when the link is played or saved later.
+                    val frameRef = request.requestHeaders?.get("Referer") ?: request.requestHeaders?.get("referer")
+                    if (isMediaUrl(url)) addMedia(tab, url, frameRef)
+                    else if (looksLikeMediaFetch(request)) addMedia(tab, url, frameRef, confirmed = true)
                 }
                 return null
             }
@@ -3488,7 +3563,7 @@ class BrowserState(private val act: Activity) {
                 tab.activeMedia = null
                 tab.canBack = view.canGoBack()
                 tab.canForward = view.canGoForward()
-                tab.media.clear()
+                tab.media.clear(); tab.videoSrcs.clear(); tab.mediaRef.clear()
                 tab.findCurrent = 0; tab.findTotal = 0
                 barVisible = true
 
@@ -3898,11 +3973,35 @@ class BrowserState(private val act: Activity) {
         return false
     }
 
-    private fun addMedia(tab: Tab, url: String) {
-        if (url.length > 2048 || tab.media.size >= 40) return
+    private fun addMedia(tab: Tab, url: String, ref: String? = null, confirmed: Boolean = false) {
+        if (url.length > 2048) return
         act.runOnUiThread {
-            if (mediaDetect && url !in tab.media && tab.media.size < 40) tab.media.add(url)
+            if (!mediaDetect) return@runOnUiThread
+            if (confirmed) tab.videoSrcs.add(url)
+            if (!ref.isNullOrBlank() && ref.startsWith("http", true) && ref != tab.mediaRef[url]) tab.mediaRef[url] = ref
+            if (url !in tab.media && tab.media.size < 40) tab.media.add(url)
         }
+    }
+
+    private val STATIC_EXT = setOf(
+        "js", "mjs", "css", "json", "html", "htm", "png", "jpg", "jpeg", "gif", "webp", "avif", "svg", "ico",
+        "woff", "woff2", "ttf", "otf", "eot", "map", "txt", "xml", "pdf", "zip", "apk", "rar", "7z", "wasm"
+    )
+
+    /**
+     * A link with no file extension and no mime hint that the page loads like a video: the browser asks media
+     * elements for it in ranges ("Range: bytes=0-"). Sites that serve their video from ".../get?token=..." were
+     * never found before because only the address was looked at.
+     */
+    private fun looksLikeMediaFetch(request: WebResourceRequest): Boolean {
+        if (!request.method.equals("GET", true)) return false
+        val h = request.requestHeaders ?: return false
+        val range = h["Range"] ?: h["range"] ?: return false
+        if (!range.startsWith("bytes=", true)) return false
+        val accept = (h["Accept"] ?: h["accept"]).orEmpty()
+        if (accept.startsWith("image/", true) || accept.startsWith("text/", true)) return false
+        val ext = request.url.lastPathSegment?.substringAfterLast('.', "")?.lowercase().orEmpty()
+        return ext !in STATIC_EXT
     }
 
     private fun recordHistory(url: String, title: String) {
@@ -3993,6 +4092,13 @@ class BrowserState(private val act: Activity) {
         fun found(url: String) {
             if (url.isBlank() || url.startsWith("blob:") || url.startsWith("data:")) return
             addMedia(tab, url)
+        }
+
+        /** A <video> in any frame (SRC_JS) loaded this link: media, whatever its address looks like. [frame] = that frame's page. */
+        @JavascriptInterface
+        fun src(url: String?, frame: String?) {
+            if (url.isNullOrBlank() || !url.startsWith("http", true)) return
+            addMedia(tab, url, frame, confirmed = true)
         }
 
         @JavascriptInterface

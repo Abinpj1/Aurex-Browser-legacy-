@@ -11,6 +11,11 @@ import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
 import java.net.URI
 
+// Compiled once; building a Regex on every call is wasted work on hot paths.
+private val META_FB_RE = Regex("""^https?://([a-z0-9-]+\.)*(facebook\.com|fb\.watch|fb\.me)/""", RegexOption.IGNORE_CASE)
+private val INSTAGRAM_HOST_RE = Regex("""^https?://([a-z0-9-]+\.)*(instagram\.com|instagr\.am)/""", RegexOption.IGNORE_CASE)
+private val YOUTUBE_HOST_RE = Regex("""^https?://([a-z0-9-]+\.)*(youtube\.com|youtu\.be)/""", RegexOption.IGNORE_CASE)
+
 /** What the user can ask the universal downloader for. */
 enum class YtQuality(val label: String, val audio: Boolean, val ext: String) {
     BEST("Max", false, "mp4"),
@@ -844,7 +849,7 @@ object YtDlpEngine {
     private fun lookupJson(
         ctx: Context, pageUrl: String, cookieHeader: String?, ytSkip: String?, ytClients: String? = null
     ): org.json.JSONObject {
-        val req = YoutubeDLRequest(pageUrl)
+        val req = YoutubeDLRequest(enginePage(pageUrl))
         req.addOption("-J")
         req.addOption("--no-playlist")
         req.addOption("--no-warnings")
@@ -1040,7 +1045,7 @@ object YtDlpEngine {
     ): YoutubeDLRequest {
         val hdr = MediaTools.isHdr(height)
         val height = MediaTools.plainHeight(height)
-        val r = YoutubeDLRequest(url)
+        val r = YoutubeDLRequest(enginePage(url))
         r.addOption("--no-playlist")
         r.addOption("--no-mtime")
         r.addOption("--ignore-config")
@@ -1159,8 +1164,36 @@ object YtDlpEngine {
         Regex("""^https?://([a-z0-9-]+\.)*vimeo\.com/\d+""", RegexOption.IGNORE_CASE),
         Regex("""^https?://([a-z0-9-]+\.)*reddit\.com/r/[^/]+/comments/""", RegexOption.IGNORE_CASE),
         Regex("""^https?://([a-z0-9-]+\.)*dailymotion\.com/video/""", RegexOption.IGNORE_CASE),
-        Regex("""^https?://([a-z0-9-]+\.)*twitch\.tv/(videos/|[^/]+/clip/)""", RegexOption.IGNORE_CASE)
+        Regex("""^https?://([a-z0-9-]+\.)*twitch\.tv/(videos/|[^/]+/clip/)""", RegexOption.IGNORE_CASE),
+        // ok.ru (Odnoklassniki): its player is an MSE / blob stream and the CDN links are signed, so the page is the source
+        Regex("""^https?://([a-z0-9-]+\.)*(ok\.ru|odnoklassniki\.ru)/(video|videoembed|live|web-api/video/moviePlayer)/-?\d+""", RegexOption.IGNORE_CASE),
+        // ok.ru opens a clicked video as a LAYER on the feed: the address stays /dk?st.cmd=movieLayer&...&st.mvId=<id>
+        Regex("""^https?://([a-z0-9-]+\.)*(ok\.ru|odnoklassniki\.ru)/[^#]*[?&](st\.)?mvId=-?\d+""", RegexOption.IGNORE_CASE)
     )
+
+    private val OK_HOST = Regex("""^https?://([a-z0-9-]+\.)*(ok\.ru|odnoklassniki\.ru)(/|$|\?)""", RegexOption.IGNORE_CASE)
+    private val OK_ID_QUERY = Regex("""[?&](?:st\.)?mvId=(-?\d+)""", RegexOption.IGNORE_CASE)
+    private val OK_ID_PATH = Regex("""/(?:video|videoembed|web-api/video/moviePlayer)/(-?\d+)""", RegexOption.IGNORE_CASE)
+
+    fun isOkUrl(url: String?): Boolean = !url.isNullOrBlank() && OK_HOST.containsMatchIn(url)
+
+    /** An ok.ru address that names ONE video (video page, embed, live, or the layer that opens over the feed). */
+    fun isOkVideoPage(url: String?): Boolean = isOkUrl(url) && isItemUrl(url)
+
+    /**
+     * https://ok.ru/video/<id> for an ok.ru address that names ONE video: the plain page, the embed player, the
+     * player API and - the common case - the video layer that opens over the feed (id in st.mvId). Else null.
+     * (/live/ addresses are left alone: the engine takes them as they are.)
+     */
+    fun okVideoUrl(url: String?): String? {
+        if (!isOkUrl(url)) return null
+        val u = url!!
+        val id = OK_ID_QUERY.find(u)?.groupValues?.get(1) ?: OK_ID_PATH.find(u)?.groupValues?.get(1) ?: return null
+        return "https://ok.ru/video/$id"
+    }
+
+    /** The address handed to yt-dlp: an ok.ru video layer becomes the plain video page its extractor understands. */
+    fun enginePage(url: String): String = okVideoUrl(url) ?: url
 
     /** A page for ONE video/post on a site where raw stream links are separate, throttled or expiring. */
     fun isItemUrl(url: String?): Boolean =
@@ -1179,14 +1212,14 @@ object YtDlpEngine {
     /** Instagram or Facebook: the Meta sites share one account, so both get the same quiet, signed-out treatment. */
     fun isMetaUrl(url: String?): Boolean =
         isInstagramUrl(url) || (!url.isNullOrBlank() &&
-            Regex("""^https?://([a-z0-9-]+\.)*(facebook\.com|fb\.watch|fb\.me)/""", RegexOption.IGNORE_CASE).containsMatchIn(url))
+            META_FB_RE.containsMatchIn(url))
 
     fun isInstagramUrl(url: String?): Boolean =
-        !url.isNullOrBlank() && Regex("""^https?://([a-z0-9-]+\.)*(instagram\.com|instagr\.am)/""", RegexOption.IGNORE_CASE)
+        !url.isNullOrBlank() && INSTAGRAM_HOST_RE
             .containsMatchIn(url)
 
     fun isYoutubeUrl(url: String?): Boolean =
-        !url.isNullOrBlank() && Regex("""^https?://([a-z0-9-]+\.)*(youtube\.com|youtu\.be)/""", RegexOption.IGNORE_CASE)
+        !url.isNullOrBlank() && YOUTUBE_HOST_RE
             .containsMatchIn(url)
 
     /** Signed / chunked / expiring CDN links: yt-dlp's generic extractor can only save junk from them. */
@@ -1205,10 +1238,18 @@ object YtDlpEngine {
         if (candidate.isNullOrBlank() || !canTry(candidate)) return false
         if (isItemUrl(pageUrl)) return false
         val host = runCatching { URI(candidate).host }.getOrNull()?.lowercase() ?: return false
-        if (SIGNED_CDN_HOSTS.any { host == it || host.endsWith(".$it") }) return false
-        if (candidate.contains("/videoplayback", true)) return false
+        // Blogger / Picasa videos on a NON-YouTube page are googlevideo links too, but they are whole files (video +
+        // audio in one: itag 18 / 22 ...), not the separate halves YouTube serves - those save fine.
+        val wholeFile = host.endsWith("googlevideo.com") && !isYoutubeUrl(pageUrl) &&
+            MUXED_ITAG.containsMatchIn(candidate)
+        if (!wholeFile) {
+            if (SIGNED_CDN_HOSTS.any { host == it || host.endsWith(".$it") }) return false
+            if (candidate.contains("/videoplayback", true)) return false
+        }
         return true
     }
+
+    private val MUXED_ITAG = Regex("""[?&]itag=(18|22|37|38|43|44|45|46|59|78)(&|$)""")
 
     /** Errors that no retry (other client, no cookies, other engine build) can fix. */
     fun isTerminalError(message: String?): Boolean {

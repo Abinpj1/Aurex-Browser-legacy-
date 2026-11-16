@@ -68,7 +68,6 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material3.Icon
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -1513,8 +1512,11 @@ internal fun ToolbarActionButton(
  * itself says it (pure string test, nothing is read from the page).
  */
 private fun tabShowsVideo(tab: Tab): Boolean {
-    if (tab.videoActive) return true
+    if (tab.hasVideo) return true
     val u = tab.url
+    // ok.ru plays through a blob / MSE stream that only reports "playing" after the user starts it, and it opens a clicked
+    // video as a layer over the feed. The address already names the video, so the buttons do not wait for the script.
+    if (YtDlpEngine.isOkVideoPage(u)) return true
     // Meta pages run none of our scripts, so only the address can tell: an Instagram reel / post / story, or a
     // Facebook video page the engine knows. The download then uses the address alone (signed out).
     return isHandsOffHost(u) && (VideoPage.instagramPermalink(u) != null || YtDlpEngine.isItemUrl(u))
@@ -1535,8 +1537,9 @@ private fun MediaFab(s: BrowserState, tab: Tab) {
     val allowPlay = s.mediaFab && !handsOff
     // Blob / MSE streams have no direct link; the page itself can be handed to the engine when it is
     // a video page it knows (YouTube watch page, Instagram reel / story, ...).
+    // Any page that plays a video but shows no link (blob / MSE, embed player) can still hand the page to the engine.
     val blobDl = url == null && allowDl &&
-        (YtDlpEngine.isInstagramUrl(tab.url) || YtDlpEngine.isItemUrl(tab.url))
+        (YtDlpEngine.isInstagramUrl(tab.url) || YtDlpEngine.isItemUrl(tab.url) || tab.hasVideo)
     val showDl = allowDl && (url != null || blobDl)
     if (!showDl && !allowPlay) return        // nothing to offer: no empty glass capsule
     Row(

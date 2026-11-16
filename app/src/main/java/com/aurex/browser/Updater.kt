@@ -22,7 +22,6 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -48,6 +47,9 @@ import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+
+// Compiled once; building a Regex on every call is wasted work on hot paths.
+private val VERSION_DIGITS_RE = Regex("\\d+")
 
 /**
  * In-app updates from the project's GitHub Releases (no account, no server of ours).
@@ -97,7 +99,7 @@ object Updater {
     // ── Versions ─────────────────────────────────────────────────────────────
 
     fun parse(v: String): List<Int> =
-        Regex("\\d+").findAll(v.trim().removePrefix("v").removePrefix("V").substringBefore('-')).map { it.value.toIntOrNull() ?: 0 }.toList()
+        VERSION_DIGITS_RE.findAll(v.trim().removePrefix("v").removePrefix("V").substringBefore('-')).map { it.value.toIntOrNull() ?: 0 }.toList()
 
     fun cmp(a: List<Int>, b: List<Int>): Int {
         for (i in 0 until maxOf(a.size, b.size)) {
@@ -244,7 +246,7 @@ object Updater {
                         val total = r.body?.contentLength()?.takeIf { it > 0 } ?: info.size
                         var got = 0L
                         var lastPct = -1
-                        r.body!!.byteStream().use { input ->
+                        (r.body ?: throw IllegalStateException("Download failed (no data)")).byteStream().use { input ->
                             part.outputStream().use { o ->
                                 val buf = ByteArray(64 * 1024)
                                 while (true) {

@@ -230,12 +230,15 @@ class MainActivity : ComponentActivity() {
                 MainScreen(state)
                 // Update dialog: optional when one release behind, blocking from two releases behind.
                 UpdatePrompt(state.update)
+                // Language change veil + start-up language setup page (LangUi.kt)
+                LangOverlayHost()
             }
         }
     }
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(pipReceiver) }
+        if (::state.isInitialized) state.release()
         super.onDestroy()
     }
 

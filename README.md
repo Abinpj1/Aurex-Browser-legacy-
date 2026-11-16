@@ -1,200 +1,145 @@
-<a id="top"></a>
-
 <div align="center">
 
-<img src="docs/hero.svg" alt="Aurex Browser: Fast. Private. Powerful." width="100%">
-
-<br>
-<br>
-
-<p>
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/badge/Download-Latest%20APK-0A84FF?style=for-the-badge&logo=android&logoColor=white" alt="Download latest APK"></a>
-<a href="https://t.me/aurex_oss"><img src="https://img.shields.io/badge/Telegram-Community-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram"></a>
-</p>
+<img src="docs/banner.png" alt="Aurex Browser - Fast. Private. Powerful." width="100%">
 
 <br>
 
-<p>
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/github/v/release/aman-nitb-cse/Aurex-Browser?style=flat-square&color=0A84FF&labelColor=1C1C1E&label=Release" alt="Release"></a>&nbsp;&nbsp;
-<img src="https://img.shields.io/badge/Android-7.0%2B-30D158?style=flat-square&labelColor=1C1C1E&logo=android&logoColor=white" alt="Android 7.0+">&nbsp;&nbsp;
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/stargazers"><img src="https://badgen.net/github/stars/aman-nitb-cse/Aurex-Browser?color=FF9F0A&labelColor=1C1C1E&icon=github" alt="Stars"></a>&nbsp;&nbsp;
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases"><img src="https://badgen.net/github/assets-dl/aman-nitb-cse/Aurex-Browser?color=30D158&labelColor=1C1C1E&label=Downloads" alt="Downloads"></a>&nbsp;&nbsp;
-<img src="https://img.shields.io/badge/License-GPL%20v3-BF5AF2?style=flat-square&labelColor=1C1C1E" alt="GPL v3">
-</p>
+[![Release](https://img.shields.io/github/v/release/aman-nitb-cse/Aurex-Browser?color=7C4DFF&label=Release)](https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest)
+![Android](https://img.shields.io/badge/Android-7.0%2B-3DDC84?logo=android&logoColor=white)
+![Kotlin](https://img.shields.io/badge/Kotlin-Jetpack%20Compose-7F52FF?logo=kotlin&logoColor=white)
+![License](https://img.shields.io/badge/License-GPL%20v3-blue)
+[![Stars](https://img.shields.io/github/stars/aman-nitb-cse/Aurex-Browser?style=flat&color=F5B301)](https://github.com/aman-nitb-cse/Aurex-Browser/stargazers)
+[![Downloads](https://img.shields.io/github/downloads/aman-nitb-cse/Aurex-Browser/total?color=3DDC84&label=Downloads)](https://github.com/aman-nitb-cse/Aurex-Browser/releases)
 
-<br>
+[![Download](https://img.shields.io/badge/Download-Latest%20APK-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest)
+[![Telegram](https://img.shields.io/badge/Telegram-Join%20Community-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/aurex_oss)
 
-<p>
-<a href="#screens"><img src="https://img.shields.io/badge/Screens-2C2C2E?style=flat-square" alt="Screens"></a>&nbsp;&nbsp;
-<a href="#glass"><img src="https://img.shields.io/badge/Liquid%20Glass-2C2C2E?style=flat-square" alt="Liquid Glass"></a>&nbsp;&nbsp;
-<a href="#shield"><img src="https://img.shields.io/badge/Shield-2C2C2E?style=flat-square" alt="Shield"></a>&nbsp;&nbsp;
-<a href="#downloads"><img src="https://img.shields.io/badge/Downloads-2C2C2E?style=flat-square" alt="Downloads"></a>&nbsp;&nbsp;
-<a href="#player"><img src="https://img.shields.io/badge/Player-2C2C2E?style=flat-square" alt="Player"></a>&nbsp;&nbsp;
-<a href="#privacy"><img src="https://img.shields.io/badge/Privacy-2C2C2E?style=flat-square" alt="Privacy"></a>&nbsp;&nbsp;
-<a href="#install"><img src="https://img.shields.io/badge/Install-2C2C2E?style=flat-square" alt="Install"></a>
-</p>
-
-<br>
-<br>
-
-<img src="docs/stats.svg" alt="4 to 48 download parts, 2 to 16 parallel connections, 7 search engines, 12 haptic events, 0 accounts" width="100%">
+[Features](#-features) · [Install](#-install) · [Build](#-build-from-source) · [Permissions](#-permissions-explained) · [Contributing](#-contributing) · [License](#-license)
 
 </div>
 
-<br>
+---
 
-<a id="screens"></a>
+## 👋 About
 
-## 📱 See it
+**Aurex Browser** is a fast, privacy-focused web browser for Android, written in Kotlin with Jetpack Compose. It brings an ad blocker, a smart popup guard, a built-in media player and a universal video downloader into one clean, glass-style interface, with no account and no server of its own.
+
+<!--
+SCREENSHOTS (uncomment after adding your images to docs/screenshots/)
+
+## 📸 Screenshots
 
 <div align="center">
 <table>
-<tr>
-<td align="center" valign="top"><img src="docs/screen-home.svg" alt="Home screen" width="215"><br><b>Home</b><br><sub>Search, Shield counter,<br>favourites, recent sites</sub></td>
-<td align="center" valign="top"><img src="docs/screen-downloads.svg" alt="Download manager" width="215"><br><b>Downloads</b><br><sub>Live parts map, speed,<br>time left, swipe actions</sub></td>
-<td align="center" valign="top"><img src="docs/screen-settings.svg" alt="Settings" width="215"><br><b>Settings</b><br><sub>Searchable, ten<br>grouped sections</sub></td>
-<td align="center" valign="top"><img src="docs/screen-appearance.svg" alt="Appearance settings" width="215"><br><b>Appearance</b><br><sub>Theme, dark websites,<br>transparency, haptics</sub></td>
-</tr>
+  <tr>
+    <td><img src="docs/screenshots/home.png" width="230" alt="Home"></td>
+    <td><img src="docs/screenshots/player.png" width="230" alt="Video player"></td>
+    <td><img src="docs/screenshots/downloads.png" width="230" alt="Downloads"></td>
+  </tr>
+  <tr>
+    <td align="center">Browsing</td>
+    <td align="center">Built-in player</td>
+    <td align="center">Downloads</td>
+  </tr>
 </table>
 </div>
+-->
 
-<br>
+## ✨ Features
 
-## ✨ What's inside
+### 🛡️ Ad, tracker and popup blocking
 
-<div align="center">
-<img src="docs/features.svg" alt="Shield, private tabs, dark websites, built-in player, universal downloader and customisation" width="100%">
-</div>
+| Feature | What it does |
+|---|---|
+| **Multi-source ad blocker** | Uses real Adblock-Plus-style rules from EasyList, EasyPrivacy, uBlock Origin (including its badware and unbreak lists) and AdGuard Base and Mobile Ads. Rules are cached on your phone and refreshed every 2 days. |
+| **Fast filter engine** | Rules are token-indexed (like uBlock and Adblock Plus), so a request only checks the few rules that could match it. |
+| **Host blocklists** | Bundled hosts plus the StevenBlack and Peter Lowe ad-server lists, refreshed weekly. |
+| **Cosmetic filtering** | Hides the empty boxes and banners that ads leave behind. |
+| **Tracker rules** | URL pattern rules for common trackers and analytics. |
+| **YouTube ad skipping** | Network and page rules that skip and hide pre-roll and mid-roll ads. |
+| **Smart popup and redirect guard** | Judges *behaviour*, not only a list: did you tap the link, is the target another site, did this tab already visit it (login or payment round-trips are allowed), does the address look like an ad (click-id parameters, abused domain endings, raw IP addresses, random names). Pages that try `window.open()` are checked before the popup appears. |
+| **Trusted sites** | Mark a site as trusted so the popup guard leaves it alone. |
+| **Third-party cookie blocking** | Optional switch to stop cross-site cookies. |
+| **Live counters** | See threats blocked, popups and redirects stopped, and how many filter rules are active. |
 
-<br>
+### 🔒 Privacy and safety
 
-<a id="glass"></a>
+| Feature | What it does |
+|---|---|
+| **Private tabs with a lock** | Opening a private tab asks for your phone's own lock (fingerprint, face, PIN, pattern or password). Aurex stores no password of its own, so there is nothing to forget. On by default. |
+| **Adult-content filter** | Five layers, cheapest first: a domain list (bundled plus a large downloadable list, refreshed weekly), domain-name checks that catch mirrors and adult endings, address and search words (matched word by word, so "essex" is never blocked), forced SafeSearch on Google, Bing, DuckDuckGo and Yahoo, and an on-page scan. It is context-aware, so help pages, news and art history are not blocked by mistake. Switching it off requires your phone lock. |
+| **Clear data** | One-tap clearing of cache, cookies and site data, or all browsing data. |
+| **Privacy-safe log** | A small private event log for bug reports. It never stores cookies or URL query strings. |
 
-## 🪟 Liquid Glass
+### 🎬 Built-in video player
 
-<div align="center">
-<img src="docs/design-language.svg" alt="Aurex liquid-glass design language: radii, transparency slider, themes, palette and haptics" width="100%">
-</div>
+- **Full player screen** with gestures, seek bar, playback speed, screen lock and aspect-ratio control
+- **Picture-in-Picture**, with optional automatic PiP when you leave the app
+- **Background playback**, a floating media button and a media notification with controls
+- **One shared timeline** between the video on a web page and the built-in player: open the player and it starts exactly where the page was, close it and the page video continues from the player's position
+- **Smooth high-resolution YouTube playback.** Aurex requests YouTube video in chunks (the way yt-dlp does) so 2K and 4K do not stall on fast connections
+- **Honest quality list.** Qualities above 1080p (2K, 4K, 8K) are offered only when your phone's hardware decoder can really play them
+- **Seekable downloads.** Downloaded HLS videos get a seek index built in memory, so seeking works instantly without re-encoding or changing the file
 
-<br>
-<br>
+### 🧩 Media dock
 
-The floating toolbar, cards and panels are layered glass: a translucent fill, a soft highlight on the top edge, a two-tone rim and a gentle glow at the bottom. The toolbar is yours to rearrange, and the transparency slider decides how much of the page shows through.
+One panel for everything media on the current page:
 
-<br>
+- **Now playing** card with artwork, live scrubber, transport buttons and speed
+- **Save page** card for the universal downloader
+- **Downloads** with an overall progress ring and live rows (pause, resume, retry)
+- **On this page**: detected streams, each with Play and Download
 
-<a id="shield"></a>
+### ⬇️ Downloader
 
-## 🛡️ Shield
+| Feature | What it does |
+|---|---|
+| **Universal video and audio downloader** | Powered by yt-dlp and FFmpeg, bundled inside the app. |
+| **Quality choice** | Pick a quality for each download, or turn on *Always best quality*. |
+| **Download manager** | Pause, resume and retry, pause all, clear finished. |
+| **Regular files** | APK, PDF, ZIP and other plain file downloads work too. |
+| **Swipe actions** | Swipe a download right to delete or left to share (both can be turned off). |
+| **Range select** | Press and hold a download, then drag to select many at once. The list scrolls by itself near the edges. |
+| **Media visibility** | Choose whether finished videos, music and images appear in your Gallery, Music and Files apps. |
+| **Engine control** | A master switch for video downloading (when off, nothing of the video engine runs in the background), automatic engine updates, one-tap update and *Repair engine*. |
 
-<div align="center">
-<img src="docs/shield-pipeline.svg" alt="How Shield blocks ads, trackers and popups: filter rules, host lists, popup guard and cosmetic hiding" width="100%">
-</div>
+### 🎨 Appearance and reading
 
-<br>
-<br>
+- 🌙 **Dark websites engine** (Dark Reader style) that works on any site, even when your phone is in light mode. Colours keep their hue, photos and videos stay natural, pages that are already dark are detected and left alone, and infinite-scroll pages are handled live
+- 💎 **Glass-style interface** with light and dark themes and an adjustable transparency slider
+- 🔤 **Text size** control
+- 🖥️ **Desktop site** mode and 📉 **data saver**
+- 📸 **Long screenshots** of a whole web page. Auto-scroll captures the page screen by screen and waits for lazy images to load. Touch the page to take over manually. Sticky bars are hidden so they do not repeat down the picture
 
-- Rules come from **EasyList, EasyPrivacy, uBlock Origin and AdGuard**, host lists from **StevenBlack and Peter Lowe** (refreshed weekly)
-- **YouTube ad skipping** on top of the filters
-- The **home screen counter** shows how many threats Shield has blocked
+### ⚙️ Customisation
 
-<br>
+- 🧰 **Toolbar** and **menu**: choose which controls are shown
+- 👋 **Gestures**: swipe the address bar, swipe up on Tabs or Downloads, hold Tabs for a new tab, hold the menu for Settings
+- ⬆️ **Auto-hide** toolbar on scroll
+- ⭐ **Favorites** and **recent sites**
+- 📳 **Haptic feedback** (can be turned off)
+- 🔎 **Seven search engines**: Google, DuckDuckGo, Brave, Bing, Startpage, Ecosia, Yahoo
+- 🔍 **Searchable settings**, grouped into Appearance, Toolbar, Menu, Gestures, Privacy, Downloads, Media, Search engine, General and About
 
-<a id="downloads"></a>
+### 🔄 Updates
 
-## ⚡ Downloads
+Aurex updates itself from this repository's [GitHub Releases](https://github.com/aman-nitb-cse/Aurex-Browser/releases). There is no account and no update server.
 
-<div align="center">
-<img src="docs/parts-map.svg" alt="Animated parts map: a file split into parts that turn blue while downloading and green when done" width="100%">
-</div>
-
-<br>
-<br>
-
-Big files are split into **4-48 parts** and fetched over **2-16 parallel connections**, and the engine **resumes from the parts already saved**.
-
-- **HLS** (with AES-128), **DASH** and plain files, plus a **universal downloader** powered by yt-dlp and FFmpeg
-- **Pause, resume, retry**, multi-select, swipe to delete or share, copy link
-- **Downloaded videos stay seekable**, with no re-encoding
-- **Floating download button** over a playing video for a quick save
-
-<br>
-
-<div align="center">
-<img src="docs/quality-sheet.svg" alt="Compact download quality card in the bottom-right corner" width="100%">
-</div>
-
-<br>
-<br>
-
-The quality picker is a compact card in the bottom-right corner, not a full-screen sheet. Turn on **Always best quality** and it is skipped entirely.
-
-<br>
-
-<a id="player"></a>
-
-## 🎬 Player
-
-<div align="center">
-<img src="docs/screen-player.svg" alt="Built-in video player with aspect, lock, speed and quality controls" width="72%">
-</div>
-
-<br>
-<br>
-
-- **Gestures**: swipe to seek or change brightness and volume, double-tap, long-press and pinch
-- **Speed** from 0.25x to 3x, aspect ratio, screen lock and a quality switch
-- **Picture-in-Picture** and **background playback**
-- **2K / 4K** offered only if your phone can decode it
-- **Floating media button** and **media dock** to reach the player from any page
-
-<br>
-
-<a id="privacy"></a>
-
-## 🔒 Privacy
-
-<div align="center">
-<table>
-<tr>
-<td width="33%" valign="top"><b>Private tabs</b><br><sub>Open only behind your phone's own lock: fingerprint, face, PIN or pattern.</sub></td>
-<td width="33%" valign="top"><b>Adult-content filter</b><br><sub>Turning it off needs the same phone-lock check.</sub></td>
-<td width="33%" valign="top"><b>Third-party cookies</b><br><sub>Blocked, so sites cannot follow you around.</sub></td>
-</tr>
-</table>
-</div>
-
-<br>
-
-## 🌐 Browsing
-
-Reader mode, find in page, bookmarks, history, desktop site, data saver and long screenshots. **7 gestures** you switch on one by one, **seven search engines**, and the toolbar and menu items are yours to pick. Aurex **updates itself** from GitHub Releases with a SHA-256 check.
-
-<br>
-
-## 🧱 Built with
-
-<div align="center">
-<img src="docs/tech-marquee.svg" alt="Kotlin, Jetpack Compose, Material 3, AndroidX Media3, ExoPlayer, OkHttp, yt-dlp, FFmpeg, youtubedl-android, Android WebView" width="100%">
-</div>
-
-<br>
-
-<a id="install"></a>
+- Checks automatically (optional) or on demand
+- One release behind: a polite dialog where **Later** works. Two or more behind: the update can no longer be postponed
+- The APK is checked against GitHub's SHA-256 when one is published, then handed to Android's installer, which only accepts an update signed with the same key as the installed app
 
 ## 📲 Install
 
-1. Download the `.apk` from the [latest release](https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest)
-2. Open it and allow installation if asked
+1. Open the [latest release](https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest) and download the `.apk` file from **Assets**
+2. Open it on your phone. If asked, allow installation from your browser or file manager
 3. Tap **Install**
 
-Needs Android 7.0 or newer.
+**Requires** Android 7.0 (API 24) or newer.
 
-<br>
+## 🛠️ Build from source
 
-## 🛠️ Build
-
-Needs **JDK 17** and **Android SDK 35** (or just Android Studio).
+You need **JDK 17**, **Android SDK Platform 35** and a recent **Android Studio** (or Gradle 8.14+).
 
 ```bash
 git clone https://github.com/aman-nitb-cse/Aurex-Browser.git
@@ -202,40 +147,117 @@ cd Aurex-Browser
 ./gradlew assembleDebug
 ```
 
-<details>
-<summary><b>Permissions</b>: what Aurex asks for and why</summary>
+The APK is written to `app/build/outputs/apk/debug/`. The easiest way is to open the folder in Android Studio and press **Run**.
 
-<br>
+> If `gradle/wrapper/gradle-wrapper.jar` is missing, run `gradle wrapper --gradle-version 8.14.6` once, or just use Android Studio.
+
+Without extra setup, builds are signed with Android's default **debug key**.
+
+### Signing your own release builds
+
+Signing keys are **never** stored in this repository.
+
+1. Create a key: `keytool -genkeypair -v -keystore aurex.keystore -alias aurex -keyalg RSA -keysize 2048 -validity 10000`
+2. Create `keystore.properties` in the project root (it is git-ignored):
+
+   ```properties
+   storeFile=aurex.keystore
+   storePassword=YOUR_PASSWORD
+   keyAlias=aurex
+   keyPassword=YOUR_PASSWORD
+   ```
+3. Run `./gradlew assembleRelease`. The APK is in `app/build/outputs/apk/release/`
+
+An APK signed with a different key cannot update an app installed with another key.
+
+### Publishing a release (maintainers)
+
+1. Increase `versionCode` and update `versionName` in `app/build.gradle.kts`
+2. Build the signed APK
+3. On GitHub: **Releases → Draft a new release**, create the tag `v` + `versionName` (for example `v1.0.1`), attach the `.apk` and publish
+
+## 🔐 Permissions explained
+
+<details>
+<summary>Why Aurex asks for each permission</summary>
 
 | Permission | Why |
 |---|---|
-| Internet, network state | Browsing, filter updates, downloads |
-| Notifications, foreground service, wake lock | Download progress and background playback |
+| Internet, network state | Browsing, filter list updates, downloads |
+| Notifications | Download progress and media controls |
+| Foreground service (media playback, data sync) | Keeps playback and downloads running in the background |
+| Wake lock | Keeps a download or video going while the screen is off |
 | Biometric | Phone-lock check for private tabs and the adult filter |
-| Install packages | In-app updates |
-| Camera, microphone, location | Only when a website asks for them |
+| Install packages | Installs updates downloaded by the in-app updater |
+| Camera, microphone, location | Used only when a website you visit asks for them (for example video calls or maps) |
+| Vibrate | Haptic feedback |
 
 </details>
 
-<br>
+## 🧱 Tech stack
+
+| | |
+|---|---|
+| Language and UI | Kotlin, Jetpack Compose, Material 3 |
+| Web engine | Android System WebView (Chromium) |
+| Media | AndroidX Media3 (ExoPlayer, HLS, DASH, MediaSession) |
+| Networking | OkHttp |
+| Downloader | yt-dlp and FFmpeg through youtubedl-android |
+| Async | Kotlin Coroutines |
+| Build | Gradle (Kotlin DSL), Android Gradle Plugin 8.5.2, Kotlin 2.0 |
+
+<details>
+<summary>Project layout</summary>
+
+All code lives in `app/src/main/java/com/aurex/browser/`:
+
+| File | Purpose |
+|---|---|
+| `AdBlocker.kt`, `FilterEngine.kt` | Ad and tracker blocking, filter list engine |
+| `PopupGuard.kt`, `CookieGuard.kt` | Popup and redirect judgement, third-party cookie handling |
+| `AdultFilter.kt`, `DeviceAuth.kt` | Adult-content filter and phone-lock authentication |
+| `DarkEngine.kt` | Dark mode for websites |
+| `LongShot.kt` | Long screenshots |
+| `Downloader.kt`, `YtDlpEngine.kt`, `VideoDl.kt` | Download manager and video engine |
+| `PlayerActivity.kt`, `WebVideoPlayer.kt`, `PlayerSync.kt`, `PipSupport.kt` | Built-in player, page-to-player sync, Picture-in-Picture |
+| `MediaDock.kt`, `BrowserMediaService.kt`, `MediaNotif.kt` | Media dock and notifications |
+| `BrowserState.kt`, `AurexWebView.kt`, `MainActivity.kt` | Core browser state and WebView |
+| `SettingsPage.kt`, `Ui.kt`, `Theme.kt`, `Components.kt` | Interface |
+| `Updater.kt` | In-app updates from GitHub Releases |
+
+</details>
 
 ## 🤝 Contributing
 
-Fork, make your change, check that `./gradlew assembleDebug` builds, then open a pull request. Found a bug? [Open an issue](https://github.com/aman-nitb-cse/Aurex-Browser/issues) and paste the log from **Settings → General → Copy log**.
+Contributions are welcome.
 
-The downloader relies on yt-dlp. Please respect copyright law and the terms of the sites you use.
+1. Fork the repo and create a branch: `git checkout -b my-feature`
+2. Make your change and confirm `./gradlew assembleDebug` succeeds
+3. Open a pull request that explains what changed and why
 
-<br>
+Found a bug? [Open an issue](https://github.com/aman-nitb-cse/Aurex-Browser/issues). Settings → General → **Copy log** gives you useful details to paste into it. Please never commit keystores, passwords or `local.properties`.
+
+## ⚖️ Responsible use
+
+The downloader relies on yt-dlp. You are responsible for respecting copyright law and the terms of service of the sites you use it with.
+
+## 🙏 Credits
+
+Aurex is built on the work of many open-source projects: [yt-dlp](https://github.com/yt-dlp/yt-dlp), [youtubedl-android](https://github.com/JunkFood02/youtubedl-android), [FFmpeg](https://ffmpeg.org), [AndroidX Media3](https://github.com/androidx/media), [Jetpack Compose](https://developer.android.com/jetpack), [OkHttp](https://github.com/square/okhttp), [Kotlin Coroutines](https://github.com/Kotlin/kotlinx.coroutines), [EasyList](https://easylist.to), [uBlock Origin filters](https://github.com/uBlockOrigin/uAssets), [AdGuard filters](https://github.com/AdguardTeam/AdguardFilters), [StevenBlack hosts](https://github.com/StevenBlack/hosts) and [Peter Lowe's ad-server list](https://pgl.yoyo.org/adservers/). Filter lists are downloaded at runtime from their authors. The full list with licenses is in the app under **Settings → About → Open-source credits**.
 
 ## 📄 License
 
-GNU GPL v3.0. See [LICENSE](LICENSE). Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), [youtubedl-android](https://github.com/JunkFood02/youtubedl-android), [FFmpeg](https://ffmpeg.org), [AndroidX Media3](https://github.com/androidx/media), [OkHttp](https://github.com/square/okhttp) and community filter lists. Full credits are in **Settings → About**.
+Aurex Browser is free software, licensed under the **GNU General Public License v3.0**. See [LICENSE](LICENSE).
+
+---
 
 <div align="center">
-<br>
 
-Made with ❤️ by **AMAN** · ⭐ Star the repo if you like Aurex
+Made with ❤️ by **AMAN**
 
-<a href="#top">↑ Back to top</a>
+[![Telegram](https://img.shields.io/badge/Telegram-@aurex__oss-26A5E4?logo=telegram&logoColor=white)](https://t.me/aurex_oss)
+[![GitHub](https://img.shields.io/badge/GitHub-aman--nitb--cse-181717?logo=github&logoColor=white)](https://github.com/aman-nitb-cse)
+
+⭐ If you like Aurex, please star the repo and share it with friends.
 
 </div>

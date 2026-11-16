@@ -3,6 +3,12 @@ package com.aurex.browser
 import org.json.JSONObject
 import org.json.JSONTokener
 
+// Compiled once; building a Regex on every call is wasted work on hot paths.
+private val TAB_COUNT_PREFIX_RE = Regex("^\\(\\d+\\)\\s*")
+private val YT_TITLE_TAIL_RE = Regex("\\s*[-|–—]\\s*(YouTube|YouTube Music)\\s*$", RegexOption.IGNORE_CASE)
+private val ILLEGAL_FILENAME_RE = Regex("[\\\\/:*?\"<>|\\r\\n\\t]+")
+private val WS_RUN_RE = Regex("\\s+")
+
 /**
  * Finds out WHICH video a tab is showing right now.
  *
@@ -45,6 +51,61 @@ object VideoPage {
 """
 
 
+    /**
+     * ok.ru: a clicked video opens as a layer over the feed, so the address names no video, and its player is a
+     * blob / MSE stream with no link to sniff. The page's own metadata still carries the video's address.
+     */
+    private const val OK_INFO_JS = """
+(function(){
+  function idIn(s){
+    if(!s)return '';
+    s=String(s);
+    var m=s.match(/\/(?:video|videoembed|live)\/(-?\d{6,})/)||s.match(/[?&](?:st\.)?mvId=(-?\d+)/)||
+          s.match(/"?(?:movieId|mvId|movie_id)"?\s*[:=]\s*"?(-?\d{6,})/);
+    return m?m[1]:'';
+  }
+  /* A feed post / status page names no video in its address: walk up from the video that is playing (or the biggest one
+     on screen) and take the id from the first card that holds exactly one video link / player. Several different ids
+     in one container means "cannot tell which", and nothing is guessed. */
+  function near(){
+    var vs=document.getElementsByTagName('video'),el=null,best=-1;
+    for(var i=0;i<vs.length;i++){
+      var b=vs[i].getBoundingClientRect();
+      var a=Math.max(0,Math.min(b.right,innerWidth)-Math.max(b.left,0))*Math.max(0,Math.min(b.bottom,innerHeight)-Math.max(b.top,0));
+      if(!vs[i].paused)a+=1e9;
+      if(a>best){best=a;el=vs[i];}
+    }
+    var n=el;
+    for(var d=0;n&&d<16;d++,n=n.parentElement){
+      var at=n.attributes;
+      for(var k=0;at&&k<at.length;k++){var r=idIn(at[k].value);if(r)return r;}
+      var ids={},cnt=0,
+          nodes=n.querySelectorAll?n.querySelectorAll('a[href*="/video/"],a[href*="mvId="],[data-options*="movieId"]'):[];
+      for(var j=0;j<nodes.length&&j<40;j++){
+        var r2=idIn(nodes[j].getAttribute('href'))||idIn(nodes[j].getAttribute('data-options'));
+        if(r2&&!ids[r2]){ids[r2]=1;cnt++;}
+      }
+      if(cnt===1){for(var key in ids)return key;}
+      if(cnt>1)return '';
+    }
+    return '';
+  }
+  try{
+    var c=document.querySelector('link[rel=canonical]'),
+        o=document.querySelector('meta[property="og:url"]'),
+        v=document.querySelector('meta[property="og:video"],meta[property="og:video:url"]'),
+        f=document.querySelector('iframe[src*="/videoembed/"]'),
+        t=document.querySelector('meta[property="og:title"]'),
+        nr='';
+    try{nr=near();}catch(e){}
+    return JSON.stringify({
+      canonical:c?c.href:'', ogUrl:o?o.content:'', ogVideo:v?v.content:'', player:f?f.src:'', near:nr,
+      title:(t&&t.content)||document.title||''
+    });
+  }catch(e){return JSON.stringify({});}
+})()
+"""
+
     private val IG_ITEM = Regex(
         """^https?://(?:[a-z0-9-]+\.)*instagram\.com/(?:[\w.]+/)?(reel|reels|p|tv)/([\w-]+)""", RegexOption.IGNORE_CASE
     )
@@ -81,9 +142,9 @@ object VideoPage {
     /** Page title made fit for a file name: no " - YouTube" tail, no "(3) " notification count. */
     fun clean(title: String?): String {
         var t = (title ?: "").trim()
-        t = t.replace(Regex("^\\(\\d+\\)\\s*"), "")
-        t = t.replace(Regex("\\s*[-|–—]\\s*(YouTube|YouTube Music)\\s*$", RegexOption.IGNORE_CASE), "")
-        t = t.replace(Regex("[\\\\/:*?\"<>|\\r\\n\\t]+"), " ").replace(Regex("\\s+"), " ").trim().trim('.')
+        t = t.replace(TAB_COUNT_PREFIX_RE, "")
+        t = t.replace(YT_TITLE_TAIL_RE, "")
+        t = t.replace(ILLEGAL_FILENAME_RE, " ").replace(WS_RUN_RE, " ").trim().trim('.')
         if (t.equals("YouTube", true) || t.equals("New tab", true) || t.equals("Private tab", true)) return ""
         return t.take(100)
     }
@@ -98,6 +159,31 @@ object VideoPage {
             ?: tab?.url.orEmpty()
         val fallbackTitle = clean(tab?.title)
         val ig = YtDlpEngine.isInstagramUrl(live)
+        // ok.ru: the video id comes from the address (video layer: st.mvId) or, failing that, from the page's metadata.
+        if (YtDlpEngine.isOkUrl(live)) {
+            YtDlpEngine.okVideoUrl(live)?.let { done(it, fallbackTitle); return }
+            if (web == null) { done(live, fallbackTitle); return }
+            var okAnswered = false
+            fun finishOk(url: String, title: String) {
+                if (okAnswered) return
+                okAnswered = true
+                done(url, title)
+            }
+            runCatching {
+                web.evaluateJavascript(OK_INFO_JS) { raw ->
+                    val parsed = runCatching {
+                        JSONObject(JSONTokener(raw).nextValue() as? String ?: "")
+                    }.getOrNull()
+                    val t = clean(parsed?.optString("title")).ifBlank { fallbackTitle }
+                    val found = listOf("canonical", "ogUrl", "ogVideo", "player")
+                        .firstNotNullOfOrNull { k -> YtDlpEngine.okVideoUrl(parsed?.optString(k)) }
+                        ?: parsed?.optString("near")?.takeIf { it.isNotBlank() }?.let { "https://ok.ru/video/$it" }
+                    if (found == null) AppLog.warn("OkRu", "no video id found for page ${AppLog.url(live)}")
+                    finishOk(found ?: live, t)
+                }
+            }.onFailure { finishOk(live, fallbackTitle) }
+            return
+        }
         if (web == null || (!ig && !YtDlpEngine.isYoutubeUrl(live))) {
             done(live, fallbackTitle)
             return

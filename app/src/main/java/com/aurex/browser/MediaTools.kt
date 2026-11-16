@@ -21,6 +21,11 @@ import java.nio.ByteBuffer
 import kotlin.math.max
 import kotlin.math.min
 
+// Compiled once; building a Regex on every call is wasted work on hot paths.
+private val QUAD_HD_RE = Regex("(?<![0-9A-Za-z])Quad HD(?![0-9A-Za-z])", RegexOption.IGNORE_CASE)
+private val FHD_RE = Regex("(?<![0-9A-Za-z])FHD(?![0-9A-Za-z])")
+private val HD_RE = Regex("(?<![0-9A-Za-z])HD(?![0-9A-Za-z])")
+
 /** Width / height / rotation of a local media file. */
 class LocalMediaInfo(val width: Int, val height: Int, val durationMs: Long)
 
@@ -93,9 +98,9 @@ object MediaTools {
             val h = m.groupValues[1].toIntOrNull() ?: return@replace m.value
             heightText(h)
         }
-        t = t.replace(Regex("(?<![0-9A-Za-z])Quad HD(?![0-9A-Za-z])", RegexOption.IGNORE_CASE), "2K")
-        t = t.replace(Regex("(?<![0-9A-Za-z])FHD(?![0-9A-Za-z])"), "1080p")
-        t = t.replace(Regex("(?<![0-9A-Za-z])HD(?![0-9A-Za-z])"), "720p")
+        t = t.replace(QUAD_HD_RE, "2K")
+        t = t.replace(FHD_RE, "1080p")
+        t = t.replace(HD_RE, "720p")
         return t
     }
 
