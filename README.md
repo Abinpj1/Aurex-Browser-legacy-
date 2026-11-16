@@ -1,5 +1,5 @@
 <a id="top"></a>
- 
+
 <div align="center">
 <img src="docs/hero.svg" alt="Aurex Browser: Fast. Private. Powerful." width="100%">
 <br>
@@ -30,11 +30,13 @@
 <br>
 <img src="docs/stats.svg" alt="4 to 48 download parts, 2 to 16 parallel connections, 7 search engines, 12 haptic events, 0 accounts" width="100%">
 </div>
+
 <br>
+
 <a id="screens"></a>
- 
+
 ## 📱 See it
- 
+
 <div align="center">
 <table>
 <tr>
@@ -45,81 +47,100 @@
 </tr>
 </table>
 </div>
+
 <br>
+
 ## ✨ What's inside
- 
+
 <div align="center">
 <img src="docs/features.svg" alt="Shield, private tabs, dark websites, built-in player, universal downloader and customisation" width="100%">
 </div>
+
 <br>
+
 <a id="glass"></a>
- 
+
 ## 🪟 Liquid Glass
- 
+
 <div align="center">
 <img src="docs/design-language.svg" alt="Aurex liquid-glass design language: radii, transparency slider, themes, palette and haptics" width="100%">
 </div>
+
 <br>
-<br>
+
 The floating toolbar, cards and panels are layered glass: a translucent fill, a soft highlight on the top edge, a two-tone rim and a gentle glow at the bottom. The toolbar is yours to rearrange, and the transparency slider decides how much of the page shows through.
- 
+
 <br>
+
 <a id="shield"></a>
- 
+
 ## 🛡️ Shield
- 
+
 <div align="center">
 <img src="docs/shield-pipeline.svg" alt="How Shield blocks ads, trackers and popups: filter rules, host lists, popup guard and cosmetic hiding" width="100%">
 </div>
+
 <br>
-<br>
+
 - Rules come from **EasyList, EasyPrivacy, uBlock Origin and AdGuard**, host lists from **StevenBlack and Peter Lowe** (refreshed weekly)
 - **YouTube ad skipping** on top of the filters
 - The **home screen counter** shows how many threats Shield has blocked
+
 <br>
+
 <a id="downloads"></a>
- 
+
 ## ⚡ Downloads
- 
+
 <div align="center">
 <img src="docs/parts-map.svg" alt="Animated parts map: a file split into parts that turn blue while downloading and green when done" width="100%">
 </div>
+
 <br>
-<br>
+
 Big files are split into **4-48 parts** and fetched over **2-16 parallel connections**, and the engine **resumes from the parts already saved**.
- 
+
 - **HLS** (with AES-128), **DASH** and plain files, plus a **universal downloader** powered by yt-dlp and FFmpeg
 - **Pause, resume, retry**, multi-select, swipe to delete or share, copy link
 - **Downloaded videos stay seekable**, with no re-encoding
 - **Floating download button** over a playing video for a quick save
+
 <br>
+
 <div align="center">
 <img src="docs/quality-sheet.svg" alt="Compact download quality card in the bottom-right corner" width="100%">
 </div>
+
 <br>
-<br>
+
 The quality picker is a compact card in the bottom-right corner, not a full-screen sheet. Turn on **Always best quality** and it is skipped entirely.
- 
+
 <br>
+
 <a id="player"></a>
- 
+
 ## 🎬 Player
- 
+
 <div align="center">
 <img src="docs/screen-player.svg" alt="Built-in video player with aspect, lock, speed and quality controls" width="72%">
 </div>
+
 <br>
+
+| Feature | Details |
+|---|---|
+| **Gestures** | Swipe to seek or change brightness and volume, double-tap, long-press and pinch |
+| **Speed & controls** | Speed from 0.25x to 3x, aspect ratio, screen lock and a quality switch |
+| **Picture-in-Picture** | Picture-in-Picture and background playback |
+| **2K / 4K** | Offered only if your phone can decode it |
+| **Quick access** | Floating media button and media dock to reach the player from any page |
+
 <br>
-- **Gestures**: swipe to seek or change brightness and volume, double-tap, long-press and pinch
-- **Speed** from 0.25x to 3x, aspect ratio, screen lock and a quality switch
-- **Picture-in-Picture** and **background playback**
-- **2K / 4K** offered only if your phone can decode it
-- **Floating media button** and **media dock** to reach the player from any page
-<br>
+
 <a id="privacy"></a>
- 
+
 ## 🔒 Privacy
- 
+
 <div align="center">
 <table>
 <tr>
@@ -129,41 +150,48 @@ The quality picker is a compact card in the bottom-right corner, not a full-scre
 </tr>
 </table>
 </div>
+
 <br>
+
 ## 🌐 Browsing
- 
+
 Reader mode, find in page, bookmarks, history, desktop site, data saver and long screenshots. **7 gestures** you switch on one by one, **seven search engines**, and the toolbar and menu items are yours to pick. Aurex **updates itself** from GitHub Releases with a SHA-256 check.
- 
+
 <br>
+
 ## 🧱 Built with
- 
+
 <div align="center">
 <img src="docs/tech-marquee.svg" alt="Kotlin, Jetpack Compose, Material 3, AndroidX Media3, ExoPlayer, OkHttp, yt-dlp, FFmpeg, youtubedl-android, Android WebView" width="100%">
 </div>
+
 <br>
+
 <a id="install"></a>
- 
+
 ## 📲 Install
- 
+
 1. Download the `.apk` from the [latest release](https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest)
 2. Open it and allow installation if asked
 3. Tap **Install**
+
 Needs Android 7.0 or newer.
- 
+
 <br>
+
 ## 🛠️ Build
- 
+
 Needs **JDK 17** and **Android SDK 35** (or just Android Studio).
- 
+
 ```bash
 git clone https://github.com/aman-nitb-cse/Aurex-Browser.git
 cd Aurex-Browser
 ./gradlew assembleDebug
 ```
- 
+
 <details>
 <summary><b>Permissions</b>: what Aurex asks for and why</summary>
-<br>
+
 | Permission | Why |
 |---|---|
 | Internet, network state | Browsing, filter updates, downloads |
@@ -171,25 +199,27 @@ cd Aurex-Browser
 | Biometric | Phone-lock check for private tabs and the adult filter |
 | Install packages | In-app updates |
 | Camera, microphone, location | Only when a website asks for them |
- 
+
 </details>
+
 <br>
+
 ## 🤝 Contributing
- 
+
 Fork, make your change, check that `./gradlew assembleDebug` builds, then open a pull request. Found a bug? [Open an issue](https://github.com/aman-nitb-cse/Aurex-Browser/issues) and paste the log from **Settings → General → Copy log**.
- 
+
 The downloader relies on yt-dlp. Please respect copyright law and the terms of the sites you use.
- 
+
 <br>
+
 ## 📄 License
- 
+
 GNU GPL v3.0. See [LICENSE](LICENSE). Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), [youtubedl-android](https://github.com/JunkFood02/youtubedl-android), [FFmpeg](https://ffmpeg.org), [AndroidX Media3](https://github.com/androidx/media), [OkHttp](https://github.com/square/okhttp) and community filter lists. Full credits are in **Settings → About**.
- 
+
 <div align="center">
 <br>
 Made with ❤️ by **AMAN** · ⭐ Star the repo if you like Aurex
- 
+
 <a href="#top">↑ Back to top</a>
- 
+
 </div>
- 
