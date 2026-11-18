@@ -28,9 +28,9 @@ class AurexApp : Application() {
         PerfTier.init(this)
         VideoDl.load(this)
         downloads = DownloadManager(this)
-        // Keep the Download folder in line with the "Media visibility" setting (default: visible).
+        // Keep the Download folder in line with the "Files visibility" setting (default: visible).
         MediaVisibility.sync(this)
-        MediaVisibility.catchUpAsync(this)   // finishes a Gallery copy that was cut short (Android 10+)
+        MediaVisibility.catchUpAsync(this)   // saves files in Downloads (once for old ones) and finishes a copy that was cut short (Android 10+)
         // Unpacks the universal downloader engine and keeps it current, off the main thread.
         // Skipped completely while "Video download" is off, so it costs no memory or data.
         if (VideoDl.enabled) YtDlpEngine.warmUpAsync(this)

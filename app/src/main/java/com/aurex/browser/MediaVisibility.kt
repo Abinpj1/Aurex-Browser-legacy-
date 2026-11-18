@@ -16,16 +16,18 @@ import java.io.IOException
 import java.util.concurrent.Executors
 
 /**
- * "Media visibility" for downloads.
+ * "Files visibility" for downloads.
  *
- *  - ON (default): finished videos, music and images are visible to the phone's Gallery, Music and Files apps.
- *  - OFF: they are hidden there. They stay in Aurex's own Downloads list.
+ *  - ON (default): every finished download (PDF, APK, ZIP, videos, music, images, ...) is also saved in the phone's
+ *    public Downloads folder (Downloads / AurexBrowser), so File Manager, Gallery and music apps can see it.
+ *  - OFF: those copies are removed. The files stay private, in Aurex's own Downloads list only.
  *
  * Why a copy: Aurex keeps its downloads in its app-specific folder (Android/data/<package>/files/Download).
- * From Android 11 on, other apps - the Gallery included - cannot see that folder, and the media index never lists
- * it, whatever MediaScannerConnection or a missing ".nomedia" marker says. The only supported way into the Gallery
- * is the MediaStore, so on Android 10+ a finished file is also written to Movies / Music / Pictures / AurexBrowser.
- * Deleting a download in Aurex deletes its Gallery copy, and switching visibility OFF removes all Gallery copies.
+ * From Android 11 on, other apps - the File Manager included - cannot open that folder, and the media index never
+ * lists it. The only supported way into the public Downloads folder is the MediaStore, so on Android 10+ a finished
+ * file is also written to Downloads / AurexBrowser. Deleting a download in Aurex deletes its public copy, and
+ * switching visibility OFF removes all public copies.
+ * (Older versions put media in Movies / Music / Pictures / AurexBrowser: those copies are cleaned up too.)
  * On Android 9 and older the old behaviour is kept (".nomedia" marker + media scan of the app folder).
  *
  * The choice is kept in the same preferences file as the rest of the browser settings, so the app-wide download
@@ -34,6 +36,8 @@ import java.util.concurrent.Executors
 object MediaVisibility {
     private const val KEY = "mediaVisible"
     private const val FOLDER = "AurexBrowser"
+    private const val FULL_EXPORT_KEY = "filesExportAllDone"
+    private val DOWNLOADS_PATH = Environment.DIRECTORY_DOWNLOADS + "/" + FOLDER + "/"
     private const val COPY_BUFFER = 256 * 1024
     private const val FREE_SPACE_MARGIN = 256L * 1024 * 1024
     private const val CATCH_UP_WINDOW_MS = 2L * 24 * 60 * 60 * 1000
@@ -78,7 +82,7 @@ object MediaVisibility {
         }
     }
 
-    /** Called when a download has finished: when visible, hand the file to the Gallery straight away. */
+    /** Called when a download has finished: when visible, save it in the public Downloads folder straight away. */
     fun onFinished(ctx: Context, file: File) {
         runCatching {
             val app = ctx.applicationContext
@@ -91,7 +95,7 @@ object MediaVisibility {
         }
     }
 
-    /** Called after a finished download was deleted in Aurex: its Gallery copy goes too. */
+    /** Called after a finished download was deleted in Aurex: its public copy goes too. */
     fun onDeleted(ctx: Context, file: File) {
         if (Build.VERSION.SDK_INT < 29) return
         val app = ctx.applicationContext
@@ -100,15 +104,21 @@ object MediaVisibility {
 
     /**
      * Start-up safety net: a copy that was cut short (the phone killed the app mid-copy) is finished here.
-     * Only files from the last two days are looked at, so an update never starts copying a whole old library.
+     * Normally only files from the last two days are looked at. The first start after this feature was added looks at
+     * every finished download once, so PDFs, APKs and other files downloaded earlier show up in Downloads as well.
      */
     fun catchUpAsync(ctx: Context) {
         if (Build.VERSION.SDK_INT < 29) return
         val app = ctx.applicationContext
         if (!isOn(app)) return
         worker.execute {
-            val since = System.currentTimeMillis() - CATCH_UP_WINDOW_MS
-            finishedFiles().filter { it.lastModified() >= since }.forEach { runCatching { publish(app, it) } }
+            val firstFullRun = !prefs(app).getBoolean(FULL_EXPORT_KEY, false)
+            val since = if (firstFullRun) 0L else System.currentTimeMillis() - CATCH_UP_WINDOW_MS
+            val files = finishedFiles()
+            // The download list may not be loaded yet this early: do not burn the one-time run on an empty list.
+            if (files.isEmpty() && firstFullRun) return@execute
+            files.filter { it.lastModified() >= since }.forEach { runCatching { publish(app, it) } }
+            if (firstFullRun) prefs(app).edit().putBoolean(FULL_EXPORT_KEY, true).apply()
         }
     }
 
@@ -120,7 +130,7 @@ object MediaVisibility {
             .map { it.file }
             .filter { it.isFile && !isPartial(it) }
 
-    /** Switch flipped: show every finished download in the Gallery, or take every Gallery copy away. */
+    /** Switch flipped: save every finished download in Downloads, or take every public copy away. */
     private fun applyToFinished(ctx: Context) {
         if (Build.VERSION.SDK_INT < 29) return
         if (isOn(ctx)) finishedFiles().forEach { runCatching { publish(ctx, it) } } else unpublishAll(ctx)
@@ -152,7 +162,13 @@ object MediaVisibility {
         }
     }
 
-    private fun targetFor(file: File): Target? {
+    /** Every kind of file goes to the public Downloads folder (Android 10+). */
+    @RequiresApi(29)
+    private fun targetFor(file: File): Target =
+        Target(MediaStore.Downloads.EXTERNAL_CONTENT_URI, DOWNLOADS_PATH, mimeOf(file) ?: "application/octet-stream")
+
+    /** Where older versions of Aurex put media (Movies / Music / Pictures). Only used to clean those copies up. */
+    private fun legacyTargetFor(file: File): Target? {
         val mime = mimeOf(file) ?: return null
         return when {
             mime.startsWith("video/") -> Target(
@@ -168,7 +184,14 @@ object MediaVisibility {
         }
     }
 
-    /** The Gallery copy of [name] (its row and size) when Aurex already put one there. Rows of other apps are never seen. */
+    /** Removes the copy an older Aurex version made in Movies / Music / Pictures, so the file is not listed twice. */
+    @RequiresApi(29)
+    private fun removeLegacyCopy(ctx: Context, file: File) {
+        val t = legacyTargetFor(file) ?: return
+        findCopy(ctx, t, file.name)?.let { (uri, _) -> runCatching { ctx.contentResolver.delete(uri, null, null) } }
+    }
+
+    /** The public copy of [name] (its row and size) when Aurex already put one in [t]. Rows of other apps are never seen. */
     @RequiresApi(29)
     private fun findCopy(ctx: Context, t: Target, name: String): Pair<Uri, Long>? {
         ctx.contentResolver.query(
@@ -183,52 +206,60 @@ object MediaVisibility {
         return null
     }
 
-    /** Puts a finished file into the Gallery. Android 9 and older: asks the media scan instead. */
+    /** Puts a finished file into the public Downloads folder. Android 9 and older: asks the media scan instead. */
     private fun publish(ctx: Context, file: File) {
         if (!file.isFile || file.length() <= 0L || isPartial(file)) return
         if (Build.VERSION.SDK_INT < 29) {
             MediaScannerConnection.scanFile(ctx, arrayOf(file.path), null, null)
             return
         }
-        val t = targetFor(file) ?: return
+        val t = targetFor(file)
         val resolver = ctx.contentResolver
         val size = file.length()
         findCopy(ctx, t, file.name)?.let { (uri, copySize) ->
-            if (copySize == size) return          // already there
+            if (copySize == size) {                // already there
+                runCatching { removeLegacyCopy(ctx, file) }
+                return
+            }
             runCatching { resolver.delete(uri, null, null) }   // an older or cut-short copy: replace it
         }
         val free = runCatching { StatFs((ctx.getExternalFilesDir(null) ?: file).path).availableBytes }.getOrDefault(Long.MAX_VALUE)
         if (free < size + FREE_SPACE_MARGIN) {
-            AppLog.warn("MediaVisibility", "not enough free space to show ${file.name} in the Gallery")
+            AppLog.warn("MediaVisibility", "not enough free space to save ${file.name} in Downloads")
             return
         }
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
             put(MediaStore.MediaColumns.MIME_TYPE, t.mime)
             put(MediaStore.MediaColumns.RELATIVE_PATH, t.relativePath)
-            put(MediaStore.MediaColumns.IS_PENDING, 1)      // hidden from the Gallery until the copy is complete
+            put(MediaStore.MediaColumns.IS_PENDING, 1)      // hidden from other apps until the copy is complete
         }
         val uri = resolver.insert(t.collection, values) ?: return
         try {
             val out = resolver.openOutputStream(uri, "w") ?: throw IOException("no output stream")
             out.use { o -> file.inputStream().use { it.copyTo(o, COPY_BUFFER) } }
             resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            runCatching { removeLegacyCopy(ctx, file) }
         } catch (e: Throwable) {
             runCatching { resolver.delete(uri, null, null) }
-            AppLog.warn("MediaVisibility", "Gallery copy of ${file.name} failed: ${e.message}")
+            AppLog.warn("MediaVisibility", "Downloads copy of ${file.name} failed: ${e.message}")
         }
     }
 
     @RequiresApi(29)
     private fun unpublish(ctx: Context, file: File) {
-        val t = targetFor(file) ?: return
-        findCopy(ctx, t, file.name)?.let { (uri, _) -> runCatching { ctx.contentResolver.delete(uri, null, null) } }
+        findCopy(ctx, targetFor(file), file.name)?.let { (uri, _) ->
+            runCatching { ctx.contentResolver.delete(uri, null, null) }
+        }
+        runCatching { removeLegacyCopy(ctx, file) }
     }
 
     /** Removes every copy Aurex made (only Aurex's own rows can be touched, other apps' files are never affected). */
     @RequiresApi(29)
     private fun unpublishAll(ctx: Context) {
         val folders = listOf(
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI to Environment.DIRECTORY_DOWNLOADS,
+            // Copies made by older versions of Aurex:
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI to Environment.DIRECTORY_MOVIES,
             MediaStore.Audio.Media.EXTERNAL_CONTENT_URI to Environment.DIRECTORY_MUSIC,
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI to Environment.DIRECTORY_PICTURES

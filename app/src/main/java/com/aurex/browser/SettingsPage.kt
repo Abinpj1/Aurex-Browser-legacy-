@@ -1227,10 +1227,10 @@ private fun DownloadSettings(s: BrowserState) {
             }
         }
         SGroup(
-            footer = if (mediaVisible) "Downloaded videos, music and images show up in your Gallery and music apps (a copy is kept in the AurexBrowser folder)."
-            else "Hidden from Gallery and music apps. They stay in the Downloads list here."
+            footer = if (mediaVisible) "All downloaded files (PDF, APK, videos, music, images and more) are saved in your phone's Downloads folder, so File Manager and Gallery can show them (a copy is kept in Downloads/AurexBrowser)."
+            else "Hidden from File Manager and Gallery. Files stay private in the Downloads list here."
         ) {
-            sw("Media visibility", mediaVisible, if (mediaVisible) "Visible in Gallery" else "Hidden") {
+            sw("Files visibility", mediaVisible, if (mediaVisible) "Visible in Downloads" else "Hidden") {
                 mediaVisible = it; MediaVisibility.set(ctx, it)
             }
         }

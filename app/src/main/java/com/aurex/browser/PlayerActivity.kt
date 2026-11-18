@@ -21,6 +21,7 @@ import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
@@ -108,6 +109,11 @@ class PlayerActivity : ComponentActivity() {
     private lateinit var player: ExoPlayer
     private lateinit var meter: androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
     private var mediaSession: MediaSession? = null
+    /** Compose follows a player swap (seamless quality switch) through this. */
+    private val playerRef = mutableStateOf<ExoPlayer?>(null)
+    private lateinit var playerListener: Player.Listener
+    private var hiResLoad = false
+    private var hiResBytes = 0
     private var autoPip = true
     private var pipRequested = false
     private val pipModeState = mutableStateOf(false)
@@ -139,7 +145,38 @@ class PlayerActivity : ComponentActivity() {
      */
     private var engineFallback = false
     private var wantHeight = 0          // quality picked in the in-app player (0 = automatic choice)
+    /**
+     * True from the exact moment a quality is picked by hand until the new stream shows its first picture.
+     * The screen keeps the last frame, dims it a little and shows the buffering spinner AT ONCE (no 700 ms wait).
+     */
+    private val qualitySwitching = mutableStateOf(false)
+    private val switchBackstop = Runnable { qualitySwitching.value = false }
+    /** The new quality has drawn its first picture (it is drawn while still pre-rolling, before playback is READY). */
+    private var switchFrameSeen = false
+    /** Raises the buffer screen. Called FIRST in a hand-picked switch, before any lookup can cost a frame. */
+    private fun beginSwitching() {
+        switchFrameSeen = false
+        qualitySwitching.value = true
+        handler.removeCallbacks(switchBackstop)
+        handler.postDelayed(switchBackstop, 25_000L)
+    }
+    private fun endSwitching() {
+        handler.removeCallbacks(switchBackstop)
+        if (qualitySwitching.value) qualitySwitching.value = false
+    }
     private var netRetries = 0          // automatic retries after a network drop (reset once playing)
+    /** The automatic retries ran out while the phone was offline: playback resumes by itself the moment a network is back. */
+    private var waitingForNet = false
+    /** The page lookup (not the stream) failed, e.g. because the phone was offline: it is repeated when a network is back. */
+    private var resolveFailed = false
+    private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    /** A quality was picked by hand: the automatic step-down on a slow connection must never override that choice. */
+    private var userPickedQuality = false
+    private var stallStepDowns = 0
+    private var lastReadyAt = 0L        // last moment the stream was READY (0 = never): a stall only counts after real playback
+    private var lastSeekAt = 0L
+    private var stallAt1 = 0L           // start of the two most recent stalls
+    private var stallAt2 = 0L
     private var reResolves = 0          // fresh lookups after an expired / refused stream link (reset once playing)
     private var isLocal = false
     /** True until the orientation was matched to the video (portrait video -> portrait screen, landscape -> landscape). */
@@ -210,27 +247,66 @@ class PlayerActivity : ComponentActivity() {
         handler.postDelayed({ if (handoff in 1..2) finishHandoff() }, if (hi) 20_000L else 9_000L)
     }
 
-    /** Player has data: read where the page is NOW and pre-buffer slightly ahead of it. */
+    // ---- Smooth quality hand-over --------------------------------------------------------------------------------
+    // The page keeps playing at its CURRENT quality (sound never stops) while the new stream loads silently, parked a
+    // little ahead of the page ("lead"). The switch happens only when (a) the page has reached the parked point and
+    // (b) enough of the new stream is already buffered beyond it. Then the player simply starts: no seek, no stall.
+    private var handoffParked = 0L
+    private val handoffPoll = Runnable { handoffTick() }
+
+    private fun handoffIsHiRes(): Boolean {
+        val h = choices.value.getOrNull(choiceIndex.intValue)?.height ?: 0
+        return MediaTools.plainHeight(wantHeight) >= 1440 || h >= 1440
+    }
+
+    /** How far ahead of the page the new stream starts: about as long as it needs to load (4K / 8K take longer). */
+    private fun handoffLeadMs(): Long =
+        if (handoff != 1) 0L else if (MediaTools.plainHeight(wantHeight) >= 1440) 2_000L else 1_000L
+
+    /** Data that must already be buffered beyond the switch point, so nothing can stall right after the switch. */
+    private fun handoffAheadMs(): Long = if (handoffIsHiRes()) 2_000L else 1_200L
+
+    /** Player has data: from here the switch waits only for the page to arrive and for the buffer. */
     private fun onHandoffReady() {
         if (handoff != 1) return
+        handler.removeCallbacks(handoffPoll)
+        handoffTick()
+    }
+
+    private fun handoffTick() {
+        if (handoff != 1) return
+        if (player.playbackState != Player.STATE_READY) { handler.postDelayed(handoffPoll, 150L); return }
         PlayerSync.peek { info ->
             if (handoff != 1) return@peek
             if (info == null || info.ms < 0) { finishHandoff(); return@peek }
-            handoff = 2
-            player.seekTo(info.ms + 1_500L)   // within the next ~1.5 s of data: instant once buffered
-            handler.postDelayed({ if (handoff == 2 && player.playbackState == Player.STATE_READY) finishHandoff() }, 80L)
+            val page = info.ms
+            val parked = handoffParked
+            val buffered = player.bufferedPosition
+            val ahead = handoffAheadMs()
+            val ready = when {
+                page < parked - 60L -> false                          // page has not reached the parked point: keep playing it
+                page <= parked + 250L -> buffered >= parked + ahead   // aligned: switch with no seek at all
+                else -> buffered >= page + ahead + 800L               // page ran past: only when the buffer covers that spot
+            }
+            if (ready) finishHandoff() else handler.postDelayed(handoffPoll, 100L)
         }
     }
 
     /** Pause the page at its exact position and start here at the same spot: no gap, no overlap. */
     private fun finishHandoff() {
         if (handoff == 3 || handoff == 0) return
+        handler.removeCallbacks(handoffPoll)
         handoff = 3
         handoffClean = player.playbackState == Player.STATE_READY
         PlayerSync.take { info ->
             if (info != null && info.ms >= 0) {
                 val target = info.ms + 60L
-                if (kotlin.math.abs(player.currentPosition - target) > 200L) player.seekTo(target)
+                if (kotlin.math.abs(player.currentPosition - target) > 200L) {
+                    // EXACT, not "nearest keyframe": in 4K / 8K the nearest keyframe is seconds away (the old jump)
+                    player.setSeekParameters(androidx.media3.exoplayer.SeekParameters.EXACT)
+                    player.seekTo(target)
+                    player.setSeekParameters(androidx.media3.exoplayer.SeekParameters.CLOSEST_SYNC)
+                }
             }
             player.playWhenReady = true
             player.play()
@@ -350,10 +426,17 @@ class PlayerActivity : ComponentActivity() {
 
         val url = intent.getStringExtra("url")
         if (url.isNullOrBlank()) { finish(); return }
-        // Quality switched from the in-page / inline player of a landscape video: open landscape, not portrait.
-        if (intent.getBooleanExtra("landscape", false)) requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        // Quality switched from the in-page / inline player: open in the SAME orientation the screen has right now
+        // (landscape stays landscape, portrait stays portrait) and do not re-match it to the video's shape afterwards.
+        val keepOrient = intent.getBooleanExtra("keepOrient", false)
+        if (keepOrient) {
+            orientFor(portrait = !intent.getBooleanExtra("landscape", false))
+            needOrient = false
+        } else if (intent.getBooleanExtra("landscape", false)) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
         isLocal = intent.getBooleanExtra("local", false) || url.startsWith("file:", true)
-        if (isLocal) peekLocalOrientation(url)
+        if (isLocal && !keepOrient) peekLocalOrientation(url)
         firstUrl = url
         syncBack = intent.getBooleanExtra("sync", false)
         syncSeek = !intent.getBooleanExtra("syncLive", false)
@@ -364,6 +447,8 @@ class PlayerActivity : ComponentActivity() {
         val title = intent.getStringExtra("title").orEmpty()
         introTitle = title
         playUrlState.value = url
+        // The page video's own length (sent with a quality switch): the progress bar knows it from the first frame.
+        intent.getLongExtra("durMs", 0L).takeIf { it > 0L }?.let { knownDurationMs.longValue = it }
 
         val uri = Uri.parse(url)
         val origin = if (!uri.scheme.isNullOrBlank() && !uri.host.isNullOrBlank())
@@ -405,59 +490,17 @@ class PlayerActivity : ComponentActivity() {
         // Any resolvable page (YouTube & co) can be switched to 1440p / 4K / 8K at any moment - from the quality
         // panel, or by the automatic pick - and the load control cannot be changed after the player exists. So all of
         // them start with the short, byte-capped buffer; the long 60 s buffer stays for plain / local streams.
-        val hiRes = canResolve || MediaTools.plainHeight(wantHeight) >= 1440
+        hiResLoad = canResolve || MediaTools.plainHeight(wantHeight) >= 1440
         // The byte cap follows the phone's real heap (largeHeap is on): a big-RAM phone keeps ~50 s of 4K ahead,
         // a small one stays safe. More buffered seconds = a longer network dip is absorbed without any visible stall.
         val heapMb = runCatching {
             (getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).largeMemoryClass
         }.getOrDefault(256)
-        val hiResBytes = (heapMb * 0.40).toInt().coerceIn(96, 220) * 1024 * 1024
-        val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
-            .apply {
-                if (hiRes) {
-                    // start after 1 s of data, but after a stall wait for 3 s so it does not stall again at once
-                    setBufferDurationsMs(18_000, 50_000, 1_000, 3_000)
-                    setBackBuffer(5_000, false)
-                    setTargetBufferBytes(hiResBytes)
-                    setPrioritizeTimeOverSizeThresholds(false)
-                } else {
-                    setBufferDurationsMs(20_000, 60_000, 800, 1_800)
-                    setBackBuffer(20_000, true)        // short rewinds / replays come from memory, not the network
-                    setTargetBufferBytes(144 * 1024 * 1024)
-                    setPrioritizeTimeOverSizeThresholds(true)
-                }
-            }
-            .build()
-        // A device decoder that fails to start (VP9 / AV1 on weak chips) falls back to the next one
-        // instead of ending in a playback error.
-        // Asynchronous codec queueing: the decoder is fed from its own thread, so a busy UI thread no longer drops 2K / 4K frames.
-        val renderers = androidx.media3.exoplayer.DefaultRenderersFactory(this)
-            .setEnableDecoderFallback(true)
-            .forceEnableMediaCodecAsynchronousQueueing()
-        // One bandwidth meter for the whole player.
+        hiResBytes = (heapMb * 0.40).toInt().coerceIn(96, 220) * 1024 * 1024
+        // One bandwidth meter for the whole player (and for the standby player of a quality switch).
         meter = androidx.media3.exoplayer.upstream.DefaultBandwidthMeter.Builder(this).build()
-        // HLS / DASH: climb after ~7 s of spare buffer, drop only when really needed, use 75 % of the measured speed.
-        val trackSelector = androidx.media3.exoplayer.trackselection.DefaultTrackSelector(
-            this, androidx.media3.exoplayer.trackselection.AdaptiveTrackSelection.Factory(7_000, 25_000, 25_000, 0.75f)
-        )
-        player = ExoPlayer.Builder(this, renderers).setLoadControl(loadControl)
-            .setBandwidthMeter(meter).setTrackSelector(trackSelector).build().apply {
-            // Snappy scrubbing on streams: seeks land on the nearest keyframe instead of decoding up to the exact frame.
-            setSeekParameters(androidx.media3.exoplayer.SeekParameters.CLOSEST_SYNC)
-            // Adaptive streams never pick a picture bigger than the screen (saves data and decoder load).
-            trackSelectionParameters = trackSelectionParameters.buildUpon()
-                .setViewportSizeToPhysicalDisplaySize(this@PlayerActivity, true)
-                .build()
-            setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
-                    .setUsage(C.USAGE_MEDIA)
-                    .build(),
-                true
-            )
-            setHandleAudioBecomingNoisy(true)
-            setWakeMode(C.WAKE_MODE_NETWORK)
-        }
+        player = newExo()
+        playerRef.value = player
         // A downloaded video gets the app's own card (BrowserMediaService); a second system session would show twice.
         if (!isLocal) mediaSession = MediaSession.Builder(this, player).build()
 
@@ -475,9 +518,9 @@ class PlayerActivity : ComponentActivity() {
             registerReceiver(pipReceiver, filter)
         }
 
-        player.addListener(object : Player.Listener {
+        playerListener = object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (isPlaying) { netRetries = 0; reResolves = 0 }   // a working stream clears the retry budget
+                if (isPlaying) { netRetries = 0; reResolves = 0; endSwitching() }   // a working stream clears the retry budget
                 refreshPip()
                 localCard(isPlaying)
             }
@@ -488,17 +531,28 @@ class PlayerActivity : ComponentActivity() {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 refreshPip()
                 if (cardUp) MediaNotif.poke()
+                if (playbackState == Player.STATE_READY) lastReadyAt = SystemClock.elapsedRealtime()
+                else if (playbackState == Player.STATE_BUFFERING && lastReadyAt > 0L) onPossibleStall()
                 if (playbackState == Player.STATE_READY && exactStart) {
                     // the exact start is done: scrubbing is snappy (nearest keyframe) again
                     exactStart = false
                     player.setSeekParameters(androidx.media3.exoplayer.SeekParameters.CLOSEST_SYNC)
                 }
+                if (playbackState == Player.STATE_READY && audioOnly) endSwitching()   // no picture to wait for
+                if (playbackState == Player.STATE_READY && switchFrameSeen) endSwitching()   // picture is up AND data is there
                 if (playbackState == Player.STATE_READY) {
                     if (handoff == 1) onHandoffReady()
                     else if (handoff == 2) finishHandoff()
                 }
             }
-            override fun onRenderedFirstFrame() { fireFirstFrame() }
+            override fun onRenderedFirstFrame() {
+                // The first picture is drawn while the stream is still pre-rolling. Hiding the buffer screen right here
+                // left a frozen picture with NO spinner until the next stall showed one (700 ms later) = the 'jitter'.
+                // So: hide it only when playback can really go on (READY); if READY comes later, that callback hides it.
+                switchFrameSeen = true
+                if (player.playbackState == Player.STATE_READY) endSwitching()
+                fireFirstFrame()
+            }
             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
                 refreshPip()
                 // Match the screen to the video once per video: portrait video -> portrait player, landscape -> landscape.
@@ -510,12 +564,20 @@ class PlayerActivity : ComponentActivity() {
                     orientFor(h > w)
                 }
             }
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int
+            ) {
+                if (reason == Player.DISCONTINUITY_REASON_SEEK || reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT)
+                    lastSeekAt = SystemClock.elapsedRealtime()
+            }
             override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
                 // next / previous video of a list: decide the orientation again for the new video
                 if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO || reason == Player.MEDIA_ITEM_TRANSITION_REASON_SEEK) needOrient = true
                 if (cardUp) MediaNotif.poke()
             }
             override fun onPlayerError(error: PlaybackException) {
+                lastReadyAt = 0L                      // buffering after an error / retry is not a "stall" for the step-down logic
+                endSwitching()
                 if (!((canResolve || engineFallbackFor(error.errorCode)) && !triedResolve)) fireFirstFrame()   // nothing more to wait for: let the caller go
                 // The indexed source could not be read for any reason: play the file the plain way instead of failing.
                 if (indexedActive && error.errorCode != PlaybackException.ERROR_CODE_DECODER_INIT_FAILED &&
@@ -556,11 +618,21 @@ class PlayerActivity : ComponentActivity() {
                             window.decorView.postDelayed({
                                 if (!isFinishing && !isDestroyed) { player.prepare(); player.playWhenReady = true }
                             }, 1_200L * netRetries)
+                        } else {
+                            // Out of quick retries (a long tunnel, wifi -> mobile hand-over): wait for the network callback.
+                            waitingForNet = true
                         }
                     else -> Unit
                 }
             }
-        })
+        }
+        player.addListener(playerListener)
+        watchNetwork()
+        // A quality picked in the in-app player: the page was paused on the exact frame (see launchPlayer), this player shows
+        // that picture dimmed with the spinner from its very first frame, and continues from the same second.
+        // (Before, the screen sat on a frozen picture with no spinner, a play button and a stuck time while the page's
+        // sound kept running underneath.)
+        if (intent.getBooleanExtra("qualitySwitch", false) && !isLocal) beginSwitching()
 
         setContent {
             AurexTheme(
@@ -571,7 +643,7 @@ class PlayerActivity : ComponentActivity() {
                 mode = ThemeModes.DARK
             ) {
                 PlayerScreen(
-                    player = player,
+                    player = playerRef.value ?: player,
                     title = resolvedTitle.value.ifBlank { title.ifBlank { hostOf(url) } },
                     pageUrl = pageUrl,
                     playUrl = playUrlState.value,
@@ -583,7 +655,8 @@ class PlayerActivity : ComponentActivity() {
                     isLocal = isLocal,
                     choices = choices.value,
                     choiceIndex = choiceIndex.intValue,
-                    onChoice = { selectChoice(it, player.currentPosition) },
+                    onChoice = { userPickedQuality = true; selectChoice(it, player.currentPosition, instant = true) },
+                    switching = qualitySwitching.value,
                     onRetry = { retry() },
                     onClose = { finish() },
                     onPip = { enterPip() },
@@ -593,7 +666,7 @@ class PlayerActivity : ComponentActivity() {
         }
 
         // An explicit start position (extra "startMs") wins over the saved resume position.
-        val resume = if (intent.hasExtra("startMs")) intent.getLongExtra("startMs", 0L)
+        val resume = if (intent.hasExtra("startMs")) intent.getLongExtra("startMs", 0L) + handoffLeadMs()
         else prefs.getLong(posKey, 0L)
         val localFile = if (isLocal) FragFix.localFile(url) else null
         if (localFile != null) {
@@ -661,6 +734,7 @@ class PlayerActivity : ComponentActivity() {
             player.setSeekParameters(androidx.media3.exoplayer.SeekParameters.EXACT)
         }
         player.setMediaSource(src, startMs.coerceAtLeast(0L))
+        if (handoff == 1) handoffParked = startMs.coerceAtLeast(0L)
         player.prepare()
         // During a hand-over the page is still playing: load silently, play only when aligned.
         player.playWhenReady = handoff != 1 && handoff != 2
@@ -715,6 +789,7 @@ class PlayerActivity : ComponentActivity() {
         triedResolve = true
         resolving.value = true
         resolveError.value = null
+        resolveFailed = false
         val cookies = siteCookie(page)
         // Already looked up (prefetch / quality sheet / earlier open)? Then playback starts right now,
         // without a thread hop and without the "resolving" spinner.
@@ -730,12 +805,15 @@ class PlayerActivity : ComponentActivity() {
                 resolving.value = false
                 result.onSuccess { r ->
                     if (r.choices.isEmpty()) {
+                        endSwitching()
                         resolveError.value = "No playable stream was found on this page."
                         if (handoff == 1 || handoff == 2) finishHandoff()
                     } else {
                         applyResolved(r, startMs)
                     }
                 }.onFailure {
+                    endSwitching()
+                    resolveFailed = true
                     resolveError.value = YtDlpEngine.friendlyError(it.message)
                     if (handoff == 1 || handoff == 2) finishHandoff()
                 }
@@ -755,6 +833,11 @@ class PlayerActivity : ComponentActivity() {
         resolvedUa = r.userAgent
         if (r.durationSec > 0) knownDurationMs.longValue = (r.durationSec * 1000).toLong()
         choices.value = r.choices
+        // The 4K / 8K decoder answers are looked up once per stream (MediaCodecList is slow the first time). Do it here,
+        // off the main thread, so tapping 4K later costs nothing.
+        r.choices.filter { DeviceCaps.tier(it) >= 2160 }.takeIf { it.isNotEmpty() }?.let { warm ->
+            Thread { warm.forEach { runCatching { hwDecodes(it); hwDecodes(it, hardwareOnly = false) } } }.start()
+        }
         // A quality picked in the in-app player wins: that height, else the best one below it.
         // (an HDR pick carries a marker on top of the height: compare the plain height, or it would match "everything")
         val want = MediaTools.plainHeight(wantHeight)
@@ -768,9 +851,12 @@ class PlayerActivity : ComponentActivity() {
         selectChoice(r.choices.indexOfFirst { it.height > 0 && hwDecodes(it) }.takeIf { it >= 0 } ?: 0, startMs)
     }
 
-    private fun selectChoice(index: Int, startMs: Long) {
+    private fun selectChoice(index: Int, startMs: Long, instant: Boolean = false) {
         val list = choices.value
         val c = list.getOrNull(index) ?: return
+        // A hand-picked quality: the buffer screen goes up in the same frame as the tap - before the decoder checks
+        // and the source building below (they used to run first, so the screen reacted a few frames late).
+        if (instant && player.mediaItemCount > 0 && !isLocal) beginSwitching()
         // 8K (and some 4K codecs) has no decoder at all on many phones: that would end in DECODER_INIT_FAILED.
         // Take the next sharper quality the phone can decode instead, and say so.
         val cTier = DeviceCaps.tier(c)
@@ -787,13 +873,17 @@ class PlayerActivity : ComponentActivity() {
                     AppLang.translate("$wasQ can't be played on this phone, playing $nowQ instead"),
                     Toast.LENGTH_LONG
                 ).show()
-                selectChoice(lower, startMs)
+                selectChoice(lower, startMs, instant)
                 return
             }
         }
         // Changing quality of a video that is already loaded must not start a paused video.
         val hadMedia = player.mediaItemCount > 0
         val wasPlayWhenReady = player.playWhenReady
+        // Playing right now: the old quality keeps playing (picture and sound) while a standby player loads the new one
+        // in the background; the two change hands at one exact instant. Nothing stops, nothing is re-buffered.
+        // A quality picked by hand is applied at that very instant (no standby wait, no parked lead): [instant].
+        val hot = !instant && canHotSwitch()
         choiceIndex.intValue = index
         // 4K / 8K picked by hand on a phone without a hardware decoder for it: say so instead of a silent stutter.
         if (cTier >= 2160 && !hwDecodes(c)) {
@@ -804,6 +894,14 @@ class PlayerActivity : ComponentActivity() {
                 Toast.LENGTH_LONG
             ).show()
         }
+        if (hot) { standbyTries = 0; if (startHotSwitch(index, c)) return }
+        else cancelStandby()
+        // (buffer screen is already up, see above) the new stream starts at the exact second of the tap
+        applyChoice(c, startMs, hadMedia, wasPlayWhenReady)
+    }
+
+    /** The stream for one quality, with the headers its CDN wants. */
+    private fun choiceSource(c: YtDlpEngine.StreamChoice): MediaSource {
         val page = Uri.parse(pageUrl ?: firstUrl)
         val h = LinkedHashMap<String, String>()
         h["User-Agent"] = resolvedUa ?: userAgent ?: "Mozilla/5.0"
@@ -819,9 +917,308 @@ class PlayerActivity : ComponentActivity() {
             }
             return m
         }
+        return source(c.video, c.audio, withSite(c.vHeaders), withSite(c.aHeaders), c.hls)
+    }
+
+    /** The plain switch: the current player is given the new stream (a short load, same second). */
+    private fun applyChoice(c: YtDlpEngine.StreamChoice, startMs: Long, hadMedia: Boolean, wasPlayWhenReady: Boolean) {
         playUrlState.value = c.video
-        begin(source(c.video, c.audio, withSite(c.vHeaders), withSite(c.aHeaders), c.hls), startMs)
+        begin(choiceSource(c), startMs)
         if (hadMedia && handoff != 1 && handoff != 2) player.playWhenReady = wasPlayWhenReady
+    }
+
+    // ---- Seamless in-player quality switch ----------------------------------------------------------------------------
+    // 1. the picked quality is loaded by a STANDBY player (muted, no screen) a moment ahead of where the video is now;
+    //    its decoder is already warm and the first picture is decoded, because it renders into a hidden surface;
+    // 2. the visible player keeps playing the old quality the whole time: no pause, no spinner, no black frame;
+    // 3. when the video arrives at the parked spot and the standby has enough data ahead, picture + sound change hands
+    //    in one step (screen, audio focus, media session, Compose all follow). The old player is then released.
+    // Anything that goes wrong (decoder, network, a long seek, 14 s without result) falls back to the plain switch.
+    private var standby: ExoPlayer? = null
+    private var standbyChoice: YtDlpEngine.StreamChoice? = null
+    private var standbyIndex = -1
+    private var standbyParked = 0L
+    private var standbyStartedAt = 0L
+    private var standbyTries = 0
+    private var standbyTex: android.graphics.SurfaceTexture? = null
+    private var standbySurface: android.view.Surface? = null
+    private val standbyPoll = Runnable { standbyTick() }
+
+    private fun canHotSwitch(): Boolean =
+        !isLocal && !audioOnly && (handoff == 0 || handoff == 3) && !resolving.value &&
+            player.mediaItemCount > 0 && player.playbackState == Player.STATE_READY && player.playWhenReady
+
+    private fun isHi(c: YtDlpEngine.StreamChoice) = MediaTools.plainHeight(c.height) >= 1440
+
+    /** How far ahead of the picture the standby starts: about as long as a (4K) stream needs to get going. */
+    private fun hotLeadMs(c: YtDlpEngine.StreamChoice): Long = if (isHi(c)) 2_500L else 1_800L
+
+    /** Data the standby must already hold beyond the switch point, so nothing can run dry right after it. */
+    private fun hotAheadMs(c: YtDlpEngine.StreamChoice): Long = if (isHi(c)) 2_000L else 1_200L
+
+    private fun startHotSwitch(index: Int, c: YtDlpEngine.StreamChoice): Boolean {
+        cancelStandby()
+        val dur = player.duration
+        val park = player.currentPosition.coerceAtLeast(0L) + hotLeadMs(c)
+        if (dur != C.TIME_UNSET && dur > 0L && park > dur - 2_000L) return false   // last seconds: the plain switch is fine
+        return runCatching {
+            val sb = newExo(handleAudioFocus = false)
+            sb.volume = 0f
+            sb.playbackParameters = player.playbackParameters
+            sb.trackSelectionParameters = player.trackSelectionParameters.buildUpon().clearOverrides().build()
+            // A hidden surface: the decoder starts and decodes the first picture now, not at the moment of the switch.
+            runCatching {
+                val tex = android.graphics.SurfaceTexture(0)
+                standbyTex = tex
+                standbySurface = android.view.Surface(tex)
+                sb.setVideoSurface(standbySurface)
+            }
+            sb.addListener(object : Player.Listener {
+                override fun onPlayerError(error: PlaybackException) { if (standby === sb) standbyFailed() }
+            })
+            sb.setSeekParameters(androidx.media3.exoplayer.SeekParameters.EXACT)
+            sb.setMediaSource(choiceSource(c), park)
+            sb.playWhenReady = false
+            sb.prepare()
+            standby = sb; standbyChoice = c; standbyIndex = index; standbyParked = park
+            standbyStartedAt = SystemClock.uptimeMillis()
+            handler.postDelayed(standbyPoll, 50L)
+            true
+        }.getOrElse { cancelStandby(); false }
+    }
+
+    private fun standbyTick() {
+        val sb = standby ?: return
+        val c = standbyChoice ?: return
+        if (isFinishing || isDestroyed) { cancelStandby(); return }
+        // Too slow, or nothing left to line up with (paused / ended): the plain switch takes over.
+        if (SystemClock.uptimeMillis() - standbyStartedAt > 14_000L ||
+            !player.playWhenReady || player.playbackState == Player.STATE_ENDED) { standbyFailed(); return }
+        val now = player.currentPosition
+        val parked = standbyParked
+        // The viewer seeked far away: line up again from the new spot (a few times at most).
+        if (now > parked + 3_000L || now < parked - hotLeadMs(c) - 4_000L) {
+            if (standbyTries++ < 3 && startHotSwitch(standbyIndex, c)) return
+            standbyFailed(); return
+        }
+        if (sb.playbackState != Player.STATE_READY) { handler.postDelayed(standbyPoll, 40L); return }
+        val buffered = sb.bufferedPosition
+        val ahead = hotAheadMs(c)
+        when {
+            // the video has not reached the parked spot yet: wake up right before it
+            now < parked - 25L -> handler.postDelayed(standbyPoll, (parked - now - 25L).coerceIn(4L, 40L))
+            // standing on the parked spot (within about one frame): switch if the standby has enough data ahead
+            now <= parked + 60L ->
+                if (buffered >= parked + ahead) swapNow() else handler.postDelayed(standbyPoll, 25L)
+            // the video ran past the parked spot (slow start): park again a little ahead of where it is, but only
+            // where the standby already holds data; the standby just seeks inside what it has loaded
+            else -> {
+                if (buffered >= now + 400L + ahead) {
+                    standbyParked = now + 400L
+                    runCatching { sb.seekTo(standbyParked) }
+                }
+                handler.postDelayed(standbyPoll, 40L)
+            }
+        }
+    }
+
+    private fun findPlayerView(v: android.view.View): PlayerView? {
+        if (v is PlayerView) return v
+        if (v is android.view.ViewGroup) for (i in 0 until v.childCount) findPlayerView(v.getChildAt(i))?.let { return it }
+        return null
+    }
+
+    /** Picture + sound change hands, on the main thread, in one step. */
+    private fun swapNow() {
+        val sb = standby ?: return
+        val c = standbyChoice ?: return
+        val old = player
+        handler.removeCallbacks(standbyPoll)
+        standby = null; standbyChoice = null
+        val ok = runCatching {
+            sb.setSeekParameters(androidx.media3.exoplayer.SeekParameters.CLOSEST_SYNC)
+            sb.volume = if (old.volume > 0.01f) old.volume else 1f
+            old.removeListener(playerListener)
+            sb.addListener(playerListener)
+            // sound first (the standby is warm: it starts at once), then the old one goes silent
+            sb.playWhenReady = true
+            old.playWhenReady = false
+            old.volume = 0f
+            sb.setAudioAttributes(mediaAudioAttributes(), true)      // takes the audio focus over
+            player = sb
+            findPlayerView(window.decorView)?.player = sb            // the picture follows in the same step
+            playerRef.value = sb                                     // ... and the controls
+            if (!isLocal) {
+                runCatching { mediaSession?.release() }
+                mediaSession = MediaSession.Builder(this, sb).build()
+            }
+            playUrlState.value = c.video
+            true
+        }.getOrDefault(false)
+        releaseStandbySurface()
+        if (ok) {
+            runCatching { old.release() }
+            standbyTries = 0
+            refreshPip()
+        } else {
+            // the hand-over itself failed: the old player is still the one on screen, go the plain way
+            runCatching { sb.release() }
+            runCatching { old.volume = 1f; old.addListener(playerListener) }
+            player = old
+            applyChoice(c, old.currentPosition, true, true)
+        }
+    }
+
+    private fun standbyFailed() {
+        val c = standbyChoice
+        cancelStandby()
+        if (c != null && !isFinishing && !isDestroyed) applyChoice(c, player.currentPosition, true, player.playWhenReady)
+    }
+
+    private fun releaseStandbySurface() {
+        runCatching { standbySurface?.release() }
+        runCatching { standbyTex?.release() }
+        standbySurface = null; standbyTex = null
+    }
+
+    private fun cancelStandby() {
+        handler.removeCallbacks(standbyPoll)
+        val sb = standby
+        standby = null; standbyChoice = null
+        if (sb != null) runCatching { sb.release() }
+        releaseStandbySurface()
+    }
+
+    private fun mediaAudioAttributes() = AudioAttributes.Builder()
+        .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+        .setUsage(C.USAGE_MEDIA)
+        .build()
+
+    /**
+     * One fully configured ExoPlayer: used once at start and once for every seamless quality switch (the standby).
+     * Start playing after ~0.8 s of data instead of the 2.5 s default.
+     * 1440p / 4K / 8K carry 3-10x the bytes per second of 1080p. 60 s of 8K in memory would run the app out of
+     * heap, so those get a short buffer and a hard byte cap; everything else keeps the old long buffer.
+     */
+    private fun newExo(handleAudioFocus: Boolean = true): ExoPlayer {
+        val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
+            .apply {
+                if (hiResLoad) {
+                    // start after 1 s of data, but after a stall wait for 3 s so it does not stall again at once
+                    setBufferDurationsMs(18_000, 50_000, 1_000, 3_000)
+                    setBackBuffer(5_000, false)
+                    setTargetBufferBytes(hiResBytes)
+                    setPrioritizeTimeOverSizeThresholds(false)
+                } else {
+                    setBufferDurationsMs(20_000, 60_000, 800, 1_800)
+                    setBackBuffer(20_000, true)        // short rewinds / replays come from memory, not the network
+                    setTargetBufferBytes(144 * 1024 * 1024)
+                    setPrioritizeTimeOverSizeThresholds(true)
+                }
+            }
+            .build()
+        // A device decoder that fails to start (VP9 / AV1 on weak chips) falls back to the next one
+        // instead of ending in a playback error.
+        // Asynchronous codec queueing: the decoder is fed from its own thread, so a busy UI thread no longer drops 2K / 4K frames.
+        val renderers = androidx.media3.exoplayer.DefaultRenderersFactory(this)
+            .setEnableDecoderFallback(true)
+            .forceEnableMediaCodecAsynchronousQueueing()
+        // HLS / DASH: climb after ~7 s of spare buffer, drop only when really needed, use 75 % of the measured speed.
+        val trackSelector = androidx.media3.exoplayer.trackselection.DefaultTrackSelector(
+            this, androidx.media3.exoplayer.trackselection.AdaptiveTrackSelection.Factory(7_000, 25_000, 25_000, 0.75f)
+        )
+        return ExoPlayer.Builder(this, renderers).setLoadControl(loadControl)
+            .setBandwidthMeter(meter).setTrackSelector(trackSelector).build().apply {
+            // Snappy scrubbing on streams: seeks land on the nearest keyframe instead of decoding up to the exact frame.
+            setSeekParameters(androidx.media3.exoplayer.SeekParameters.CLOSEST_SYNC)
+            // Adaptive streams never pick a picture bigger than the screen (saves data and decoder load).
+            trackSelectionParameters = trackSelectionParameters.buildUpon()
+                .setViewportSizeToPhysicalDisplaySize(this@PlayerActivity, true)
+                .build()
+            setAudioAttributes(mediaAudioAttributes(), handleAudioFocus)
+            setHandleAudioBecomingNoisy(true)
+            setWakeMode(C.WAKE_MODE_NETWORK)
+        }
+    }
+
+    // ---- Network recovery + slow-connection step-down ----------------------------------------------------------------
+
+    /**
+     * Wakes the player up the moment a network is back. Before, three quick retries (1.2 / 2.4 / 3.6 s) were all a dropped
+     * connection got: a tunnel or a wifi -> mobile hand-over longer than that ended on an error screen that needed a tap.
+     * Healthy playback is never touched: the callback only acts when an error / a failed lookup is actually waiting.
+     */
+    private fun watchNetwork() {
+        if (isLocal || netCallback != null) return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager ?: return
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) { runOnUiThread { onNetworkBack() } }
+        }
+        if (runCatching { cm.registerDefaultNetworkCallback(cb) }.isSuccess) netCallback = cb
+    }
+
+    private fun unwatchNetwork() {
+        val cb = netCallback ?: return
+        netCallback = null
+        runCatching {
+            (getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager).unregisterNetworkCallback(cb)
+        }
+    }
+
+    private fun onNetworkBack() {
+        if (isFinishing || isDestroyed) return
+        if (resolveFailed && canResolve && !resolving.value) {
+            resolveFailed = false
+            retry()                                   // the page lookup failed while offline: do it again now
+            return
+        }
+        val err = player.playerError ?: return
+        val netError = err.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+            err.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT
+        if (netError || waitingForNet) {
+            waitingForNet = false
+            netRetries = 0
+            player.prepare()
+            player.playWhenReady = true
+        }
+    }
+
+    /**
+     * A resolved stream (plain MP4 / WebM) has no adaptive bitrate: on a connection too slow for its quality it just stalls
+     * again and again. Two stalls within 45 s -> one quality down, same second. Never overrides a quality picked by hand,
+     * never counts seeks, and stops after 3 steps.
+     */
+    private fun onPossibleStall() {
+        if (isLocal || audioOnly || userPickedQuality || wantHeight > 0 || stallStepDowns >= 3) return
+        if (choices.value.size < 2 || !(handoff == 0 || handoff == 3) || resolving.value) return
+        val startedAt = SystemClock.elapsedRealtime()
+        handler.postDelayed({
+            if (isFinishing || isDestroyed) return@postDelayed
+            // still waiting for data 1.5 s later, and not because of a seek: a real stall
+            if (player.playbackState != Player.STATE_BUFFERING || !player.playWhenReady) return@postDelayed
+            if (lastSeekAt >= startedAt - 300L) return@postDelayed
+            stallAt2 = stallAt1
+            stallAt1 = startedAt
+            if (stallAt2 > 0L && stallAt1 - stallAt2 <= 45_000L) stepDownForSlowNetwork()
+        }, 1_500L)
+    }
+
+    private fun stepDownForSlowNetwork() {
+        val list = choices.value
+        val cur = choiceIndex.intValue
+        val now = list.getOrNull(cur) ?: return
+        val nowH = MediaTools.plainHeight(now.height)
+        if (nowH <= 480) return
+        val next = (cur + 1 until list.size).firstOrNull {
+            val h = MediaTools.plainHeight(list[it].height)
+            h in 1 until nowH
+        } ?: return
+        stallStepDowns++
+        stallAt1 = 0L; stallAt2 = 0L
+        lastReadyAt = 0L                              // the new stream's own start-up buffering is not a stall
+        val nextQ = MediaTools.playerText(MediaTools.labelForHeight(list[next].height))
+        Toast.makeText(this, AppLang.translate("Slow connection, switched to $nextQ"), Toast.LENGTH_SHORT).show()
+        selectChoice(next, player.currentPosition)
     }
 
     private var decoderStepDowns = 0
@@ -1039,6 +1436,7 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        if (standby != null) standbyFailed()      // leaving the screen: finish the switch the plain way, free the standby
         savePosition()
         if (!audioOnly && (Build.VERSION.SDK_INT < 26 || (!isInPictureInPictureMode && !pipRequested))) player.pause()
     }
@@ -1048,11 +1446,13 @@ class PlayerActivity : ComponentActivity() {
         publishSync()
         handler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(pipReceiver) }
+        unwatchNetwork()
         if (cardUp) {
             cardUp = false
             MediaNotif.detachLocal(localCtl)
             BrowserMediaService.live?.dismissNow()
         }
+        cancelStandby()
         mediaSession?.release()
         player.release()
         super.onDestroy()
@@ -1300,10 +1700,15 @@ internal fun PlayerScreen(
     onClose: () -> Unit,
     onPip: () -> Unit,
     onDownload: () -> Unit,
+    // true from the tap on a quality until the new stream's first picture: spinner at once, last frame dimmed, no jitter
+    switching: Boolean = false,
     // overlay = drawn over the page's own <video> (WebVideoPlayer): transparent, no PlayerView, fit / zoom go to the page
     overlay: Boolean = false,
     onFit: ((Int, Float) -> Unit)? = null
 ) {
+    // A seamless quality switch hands the screen to another ExoPlayer: every handler / loop below reads the current one.
+    @Suppress("NAME_SHADOWING")
+    val player by rememberUpdatedState(player)
     val context = LocalContext.current
     val activity = context as? ComponentActivity
     val audio = remember { context.getSystemService(AudioManager::class.java) }
@@ -1316,7 +1721,14 @@ internal fun PlayerScreen(
     var duration by remember {
         mutableLongStateOf(player.duration.takeIf { it != C.TIME_UNSET && it > 0 } ?: knownDurationMs)
     }
-    var position by remember { mutableLongStateOf(0L) }
+    // A quality switch opens at the second the page was paused on: the time and the bar are right from the first frame
+    // (they started at 0 and the thumb swept across the bar to catch up).
+    var position by remember {
+        mutableLongStateOf(
+            if (overlay) 0L
+            else (context as? android.app.Activity)?.intent?.getLongExtra("startMs", 0L)?.coerceAtLeast(0L) ?: 0L
+        )
+    }
     var bufferedPosition by remember { mutableLongStateOf(0L) }
     var dragging by remember { mutableStateOf(false) }
     var speed by remember { mutableFloatStateOf(player.playbackParameters.speed) }
@@ -1329,6 +1741,20 @@ internal fun PlayerScreen(
     // Where the lock button is on screen: the unlock button appears exactly there, so it does not jump to the side.
     var lockAt by remember { mutableStateOf<androidx.compose.ui.geometry.Offset?>(null) }
     var rootAt by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+    // Quality switch from the in-app player: that player's picture sat lower on screen (its page starts under the status
+    // bar). The full player used to show it dead-centre, so the picture jumped up the moment 4K / 2K was picked. Now it
+    // starts exactly where the old picture was and STAYS there: a quality switch changes the quality and nothing else
+    // (no jump, no glide to the centre afterwards).
+    val srcCenterY = remember {
+        if (overlay) -1f else (context as? android.app.Activity)?.intent?.getFloatExtra("srcCenterY", -1f) ?: -1f
+    }
+    val hostView = LocalView.current
+    var shiftPx by remember { mutableFloatStateOf(0f) }
+    var shiftSet by remember { mutableStateOf(false) }
+    // screen shape (wide / tall) when the shift was taken, and now: a different shape (rotation) or the small picture-in-picture
+    // window cannot use that pixel offset
+    var shiftWide by remember { mutableStateOf(false) }
+    var rootWide by remember { mutableStateOf(false) }
     var hud by remember { mutableStateOf<String?>(null) }
     var zoom by remember { mutableFloatStateOf(1f) }
     // Fit / Crop is remembered SEPARATELY for landscape and for portrait (and kept for the next video too):
@@ -1399,8 +1825,14 @@ internal fun PlayerScreen(
                 }
             }
         }
-        player.addListener(l)
-        onDispose { player.removeListener(l) }
+        val pl = player
+        pl.addListener(l)
+        // a swapped-in player is already playing: catch the controls up with it
+        isPlaying = pl.isPlaying; playWhenReady = pl.playWhenReady
+        buffering = pl.playbackState == Player.STATE_BUFFERING
+        tracks = pl.currentTracks; videoH = pl.videoSize.height; videoW = pl.videoSize.width
+        speed = pl.playbackParameters.speed
+        onDispose { pl.removeListener(l) }
     }
     LaunchedEffect(resolving, resolveError) { if (resolving) error = null }
     LaunchedEffect(Unit) {
@@ -1506,7 +1938,20 @@ internal fun PlayerScreen(
 
     LaunchedEffect(aspectIndex, zoom) { if (overlay) onFit?.invoke(aspectIndex, zoom) }
 
-    Box(Modifier.fillMaxSize().onGloballyPositioned { rootAt = it.positionInRoot() }.then(if (overlay) Modifier else Modifier.background(Color.Black))) {
+    val fitMode = ASPECTS[aspectIndex].second == AspectRatioFrameLayout.RESIZE_MODE_FIT
+    val shownShift = if (fitMode && !pipMode && rootWide == shiftWide) shiftPx else 0f
+    Box(Modifier.fillMaxSize().onGloballyPositioned {
+        rootAt = it.positionInRoot()
+        rootWide = it.size.width > it.size.height
+        if (!shiftSet && srcCenterY >= 0f && it.size.height > 0) {
+            shiftSet = true
+            shiftWide = rootWide
+            val loc = IntArray(2)
+            hostView.getLocationOnScreen(loc)
+            val mine = loc[1] + rootAt.y + it.size.height / 2f
+            shiftPx = (srcCenterY - mine).coerceIn(-it.size.height * 0.1f, it.size.height * 0.1f)
+        }
+    }.then(if (overlay) Modifier else Modifier.background(Color.Black))) {
         if (!overlay) AndroidView(
             factory = { ctx ->
                 PlayerView(ctx).apply {
@@ -1520,7 +1965,10 @@ internal fun PlayerScreen(
                     subtitleView?.setUserDefaultTextSize()
                 }
             },
-            modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = zoom; scaleY = zoom },
+            modifier = Modifier.fillMaxSize().graphicsLayer {
+                scaleX = zoom; scaleY = zoom
+                translationY = shownShift
+            },
             update = { v -> v.player = player; v.useController = false; v.resizeMode = ASPECTS[aspectIndex].second }
         )
 
@@ -1528,7 +1976,10 @@ internal fun PlayerScreen(
             bitmap = bridgeImage,
             contentDescription = null,
             contentScale = if (ASPECTS[aspectIndex].second == AspectRatioFrameLayout.RESIZE_MODE_ZOOM) ContentScale.Crop else ContentScale.Fit,
-            modifier = Modifier.fillMaxSize().background(Color.Black).graphicsLayer { scaleX = zoom; scaleY = zoom }
+            modifier = Modifier.fillMaxSize().background(Color.Black).graphicsLayer {
+                scaleX = zoom; scaleY = zoom
+                translationY = shownShift
+            }
         )
 
         if (!pipMode) {
@@ -1632,13 +2083,19 @@ internal fun PlayerScreen(
                 )
             }
 
-            // Only a spinner, and only when the wait is noticeable (a quick quality switch shows nothing at all).
+            // Quality switch: the buffer screen is there in the same frame as the tap (last picture stays, slightly dimmed,
+            // spinner on top). Any other wait still shows the spinner only once it is noticeable.
             var showSpin by remember { mutableStateOf(false) }
-            LaunchedEffect(buffering, resolving) {
-                if (buffering || resolving) { delay(700); showSpin = true } else showSpin = false
+            LaunchedEffect(buffering, resolving, switching) {
+                if (switching) showSpin = true
+                else if (buffering || resolving) { delay(700); showSpin = true }
+                else showSpin = false
             }
-            if (showSpin && (buffering || resolving)) {
-                CircularProgressIndicator(color = accent, strokeWidth = 2.5.dp, modifier = Modifier.align(Alignment.Center).size(30.dp))
+            val dim by animateFloatAsState(if (switching) 0.38f else 0f, tween(if (switching) 90 else 160), label = "switchDim")
+            if (dim > 0.001f) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = dim)))
+            // `switching` shows the spinner in the SAME frame (no wait for the effect above to run first)
+            if (switching || (showSpin && (buffering || resolving))) {
+                CircularProgressIndicator(color = accent, strokeWidth = 2.5.dp, modifier = Modifier.align(Alignment.Center).size(34.dp))
             }
 
             // ---- top bar (compact) ----
@@ -1688,7 +2145,7 @@ internal fun PlayerScreen(
 
             // ---- centre play / pause (one button, no skip buttons) ----
             AnimatedVisibility(
-                barsVisible && !buffering, Modifier.align(Alignment.Center),
+                barsVisible && !buffering && !switching, Modifier.align(Alignment.Center),
                 enter = fadeIn(tween(140)) + scaleIn(initialScale = 0.85f, animationSpec = spring(dampingRatio = 0.7f, stiffness = 600f)),
                 exit = fadeOut(tween(120)) + scaleOut(targetScale = 0.9f)
             ) {

@@ -86,6 +86,30 @@ fun InlinePlayerHost(s: BrowserState) {
     // row picked from the fallback list: shown at once; cleared when the video's real height changes
     var pickedIdx by remember { mutableStateOf<Int?>(null) }
     LaunchedEffect(tab?.videoHeight) { pickedIdx = null }
+    // true from the tap on a quality until the page video really plays the new one: buffer screen at once (dimmed last
+    // picture + spinner), the controls stay put, nothing flickers. Never longer than 12 s.
+    var switching by remember { mutableStateOf(false) }
+    var switchAt by remember { mutableStateOf(0L) }
+    var switchFromMs by remember { mutableStateOf(0L) }
+    fun startSwitching() {
+        switchAt = android.os.SystemClock.uptimeMillis()
+        switchFromMs = player.currentPosition
+        switching = true
+    }
+    LaunchedEffect(switching) {
+        if (!switching) return@LaunchedEffect
+        while (true) {
+            delay(100)
+            val waited = android.os.SystemClock.uptimeMillis() - switchAt
+            val ready = player.playbackState == androidx.media3.common.Player.STATE_READY
+            val moved = kotlin.math.abs(player.currentPosition - switchFromMs)
+            val paused = !player.playWhenReady
+            // done: the video really runs on past the tap point (a paused one has just settled)
+            // (the page reports s:1 while it holds the video for the switch: the buffer screen stays up until it plays on)
+            if ((waited > 450 && ready && !player.pageSwitching && (moved > 200 || (paused && waited > 700))) || waited > 14_000) break
+        }
+        switching = false
+    }
     LaunchedEffect(Unit) {
         var pending = 0L
         while (true) {
@@ -234,6 +258,7 @@ fun InlinePlayerHost(s: BrowserState) {
             isLocal = qRows.size < 2,  // quality chip only when there is a real choice (online streams)
             choices = qRows,
             choiceIndex = qIndex,
+            switching = switching,
             onChoice = { i ->
                 val pq = pageQ
                 if (pq != null) {
@@ -245,6 +270,7 @@ fun InlinePlayerHost(s: BrowserState) {
                     } else {
                         val pi = if (i > shift) i - shift else i
                         pq.ids.getOrNull(pi)?.let { id ->
+                            startSwitching()                                    // buffer screen in the same frame as the tap
                             s.pipCommand("setQuality('" + id.filter { it.isLetterOrDigit() } + "')")
                             player.beginSwitch()                                // progress bar stays put while the picture changes
                             pageQ = PageQualities(pq.ids, pq.choices, pi, pq.extra) // shown at once, the next poll confirms
@@ -265,6 +291,7 @@ fun InlinePlayerHost(s: BrowserState) {
                             // Normal path: the page's own video switches to that rendition IN PLACE and continues at
                             // the same position - the player stays exactly where it is, only the quality changes.
                             pickedIdx = i
+                            startSwitching()
                             player.beginSwitch()
                             s.switchPageSource(c.video) { r ->
                                 if (r == "start") {
@@ -277,11 +304,13 @@ fun InlinePlayerHost(s: BrowserState) {
                                             n++
                                         }
                                         if (state != "ok") {
+                                            switching = false
                                             pickedIdx = null
                                             s.notify("Couldn't change quality here, kept the current one")
                                         }
                                     }
                                 } else {
+                                    switching = false
                                     pickedIdx = null
                                     openFull()
                                 }

@@ -20,7 +20,7 @@ enum class Hx {
     TICK,
     TOGGLE_ON,
     TOGGLE_OFF,
-    /** Press-and-hold recognised (select mode, copy link ...). */
+    /** Press-and-hold recognised (select mode ...). */
     HOLD,
     /** A drag picked something up / put it down. */
     DRAG_START,

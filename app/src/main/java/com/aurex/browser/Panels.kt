@@ -1197,15 +1197,23 @@ fun launchPlayer(
             return@resolve
         }
         val pageUrl = page.ifBlank { tab?.url.orEmpty() }
-        // Take over from the page video: read its position, pause it, and start the player there.
-        // 1440p / 4K / 8K load slowly. The old hand-over kept the page playing meanwhile and then seeked the
-        // player to where the page had got to, twice: a second buffering stall on a frozen picture. For these the
-        // page is paused right now, so the player starts at exactly that second and never has to seek.
+        // Take over from the page video: read its position (and, for a quality switch, the picture it shows right now, so
+        // the full player opens ON that picture instead of on black) and start the player there.
         val hiRes = MediaTools.plainHeight(height) >= 1440
-        // Launched from the in-app player (quality switch): also take the picture the video shows right now, so the full
-        // player opens ON that picture instead of on black (that black swap was the 'player opens again' look).
-        PlayerSync.capture(tab, keep = !hiRes, frame = keepLandscape) { sync ->
+        // A quality picked in the in-app player (keepLandscape): the full player is opaque and sits on top of the page, so a
+        // page that kept playing under it was invisible - the player showed a frozen picture (no spinner), a time that did
+        // not move and a play button, with the page's sound running underneath; then the picture jumped ahead when the new
+        // stream arrived (and, after a slow 4K start, a second seek / stall). So the page is paused RIGHT NOW, on the exact
+        // frame (position, picture and pause are taken in one step), and the new quality continues from that very second
+        // with a spinner on top (see PlayerActivity "qualitySwitch"): no seek, no jump.
+        // Any other start of the full player (plain "open in player") keeps the page playing until the player has data.
+        PlayerSync.capture(tab, keep = !keepLandscape, frame = keepLandscape) { sync ->
         PlayerSync.setBridge(sync?.frame)
+        // Where the in-app player's picture sits on screen: the full player starts its picture exactly there.
+        val srcCy = tab?.web?.let { w ->
+            if (!keepLandscape || w.height <= 0) -1f
+            else { val loc = IntArray(2); w.getLocationOnScreen(loc); loc[1] + w.height / 2f }
+        } ?: -1f
         val intent = Intent(ctx, PlayerActivity::class.java)
             .putExtra("url", url)
             .putExtra("audioUrl", audioUrl)
@@ -1216,16 +1224,29 @@ fun launchPlayer(
             .putExtra("cookie", siteCookie(url))
         if (accent != null) intent.putExtra("accent", accent)
         if (height > 0) intent.putExtra("height", height)
-        // A switch made from a landscape screen / landscape video must not drop into portrait first.
+        // A quality switch made from the in-app player keeps the screen EXACTLY as it is now: a landscape screen stays
+        // landscape (never drops into portrait first), a portrait screen stays portrait. The video's own shape must not
+        // decide this: a landscape (16:9) video playing in a portrait screen used to flip the phone sideways the moment
+        // 4K / 2K was picked.
         val screenLandscape = ctx.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
-        if (keepLandscape && tab != null && (screenLandscape || tab.videoWidth <= 0 || tab.videoWidth >= tab.videoHeight))
-            intent.putExtra("landscape", true)
+        if (keepLandscape) {
+            intent.putExtra("keepOrient", true).putExtra("landscape", screenLandscape)
+                // the buffer screen (dimmed last picture + spinner) is up from the player's very first frame
+                .putExtra("qualitySwitch", true)
+        }
+        if (srcCy >= 0f) intent.putExtra("srcCenterY", srcCy)
         if (sync != null) {
             intent.putExtra("sync", true).putExtra("syncLive", sync.live)
-                // The page keeps playing (sound continues) until the player has a picture; then it hands over.
-                .putExtra("handoff", !hiRes && sync.playing && !sync.live && sync.ms >= 0)
+                // Plain "open in player": the page keeps playing (sound continues) until the player has a picture, then it
+                // hands over. A quality switch never does this: the page is already paused (see above).
+                .putExtra("handoff", !keepLandscape && sync.playing && !sync.live && sync.ms >= 0)
             if (sync.ms >= 0) intent.putExtra("startMs", sync.ms)
+            // the length the page video reports: the progress bar is right from the first frame, not after the lookup
+            if (sync.durMs > 0) intent.putExtra("durMs", sync.durMs)
         }
+        // A quality switch was paused by the capture above. Anything else that is not handing over (page paused / live /
+        // 1440p+) is frozen where it is now, as before.
+        if (!keepLandscape && hiRes && !(sync != null && sync.playing && !sync.live && sync.ms >= 0)) PlayerSync.take { }
         // no slide animation: the full player must appear in place of the in-app one, not open 'again' on top of it
         val started = runCatching {
             ctx.startActivity(intent, android.app.ActivityOptions.makeCustomAnimation(ctx, 0, 0).toBundle())

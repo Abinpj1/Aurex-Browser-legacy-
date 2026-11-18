@@ -1021,6 +1021,7 @@ function sync_(){report();try{window.__aurexReport&&window.__aurexReport();}catc
 function toggle(){
  if(fwd('toggle'))return;
  var v=cur();if(!v)return;
+ swEnd(false);
  var was=!v.paused&&!v.ended;
  userPaused=was;
  /* One press = ONE change of the <video> element, made inside the allow bracket only (doPause /
@@ -1039,7 +1040,7 @@ function toggle(){
  },500);
  setTimeout(sync_,1200);
 }
-function pause(){if(fwd('pause'))return;userPaused=true;var v=cur();if(v)doPause(v);setTimeout(report,120);}
+function pause(){if(fwd('pause'))return;swEnd(false);userPaused=true;var v=cur();if(v)doPause(v);setTimeout(report,120);}
 /* Used right after the window opens: continue only if the user did not pause it themselves. */
 function resume(){if(fwd('resume'))return;var v=cur();if(v&&v.paused&&!v.ended&&!userPaused)doPlay(v);setTimeout(report,120);}
 /* Picture watchdog: sound keeps playing but no new video frames are produced (black / frozen PiP
@@ -1143,7 +1144,7 @@ function syncOut(keep,fr){
    retUntil=0;
    setTimeout(report,160);
   }
-  return JSON.stringify({ok:true,t:(ad||live)?-1:t,playing:playing,live:live,ad:ad,f:shot});
+  return JSON.stringify({ok:true,t:(ad||live)?-1:t,playing:playing,live:live,ad:ad,f:shot,d:(ad||live)?-1:v.duration});
  }catch(e){return JSON.stringify({ok:false});}
 }
 function syncIn(t,play){
@@ -1184,8 +1185,12 @@ function info(){
   if(frameMode&&pipOn)return (Date.now()-kidInfoAt<3000)?kidInfo:'';
   var v=cur();if(!v)return '';
   var d=v.duration;if(!isFinite(d)||d<=0)d=0;
-  return JSON.stringify({t:v.currentTime,d:d,p:(v.paused&&!v.ended)?0:1,e:v.ended?1:0,r:v.playbackRate||1,
-   b:(!v.paused&&v.readyState<3)?1:0,ad:isAd(ytp())?1:0});
+  /* during a quality switch: report what the video WILL do (play on), and 'buffering' until it really does */
+  var swing=(swHold||window.__lqSrc==='pending')?1:0;
+  var pl=swHold?(swHold.was?1:0):((v.paused&&!v.ended)?0:1);
+  var bf=swHold?(swHold.was?1:0):(window.__lqSrc==='pending'?1:((!v.paused&&v.readyState<3)?1:0));
+  return JSON.stringify({t:v.currentTime,d:d,p:pl,e:v.ended?1:0,r:v.playbackRate||1,
+   b:bf,s:swing,ad:isAd(ytp())?1:0});
  }catch(e){return '';}
 }
 function seekAbs(t){
@@ -1200,7 +1205,7 @@ function rate(r){
  try{if(p&&p.setPlaybackRate&&!isAd(p))p.setPlaybackRate(r);}catch(e){}
  try{v.playbackRate=r;}catch(e){}
 }
-function setPlay(b){if(fwd('setPlay',[b]))return;var v=cur();if(!v)return;userPaused=!b;if(b)doPlay(v);else doPause(v);setTimeout(report,120);}
+function setPlay(b){if(fwd('setPlay',[b]))return;var v=cur();if(!v)return;swEnd(false);userPaused=!b;if(b)doPlay(v);else doPause(v);setTimeout(report,120);}
 function mute(m){if(fwd('mute',[m]))return;var v=cur();if(v)try{v.muted=!!m;}catch(e){}}
 var fitMode='contain',zoomV=1;
 function fit(m,z){
@@ -1273,11 +1278,53 @@ function qualities(){
   return JSON.stringify({k:'',l:[],c:'',a:1,w:out.w,h:out.h});
  }catch(e){return '';}
 }
+/* ---- Quality switch = HOLD, LOAD, RESUME ------------------------------------------------------------------------
+   The page keeps playing the old quality (its sound too) while the new one loads, and afterwards the site left the video
+   paused. So a hand-picked quality works like this: the video is paused at once (old sound stops, the guard keeps the site
+   from restarting it), the new quality loads in the background, and when it has data the video plays on - from the same
+   second, with the new quality's sound. info() reports 'buffering' for the whole time (s:1), so the app's buffer screen
+   stays up until playback really runs. Never longer than 12 s; a play/pause press by the person cancels the hold. */
+var swHold=null,swTok=0;
+function swEnd(resume){
+ var h=swHold;if(!h)return;
+ swHold=null;swTok++;
+ if(!resume)return;
+ var v=h.v;if(!v||!v.isConnected)return;
+ userPaused=false;
+ var p=ytp();
+ allow=true;try{if(p&&p.playVideo&&!isAd(p))p.playVideo();}catch(e){}allow=false;
+ doPlay(v);
+ /* the site may still answer with a pause of its own: look again and play on */
+ var again=function(){try{if(!swHold&&v.isConnected&&v.paused&&!v.ended&&!userPaused){allow=true;try{if(p&&p.playVideo&&!isAd(p))p.playVideo();}catch(e){}allow=false;doPlay(v);}}catch(e){}};
+ setTimeout(again,350);setTimeout(again,1100);setTimeout(again,2200);
+ setTimeout(sync_,250);setTimeout(sync_,1200);
+}
+function swBegin(v){
+ var was=swHold?swHold.was:(!v.paused&&!v.ended);   /* a second pick during a switch keeps the first intent */
+ var tok=++swTok;
+ swHold={v:v,was:was,t0:Date.now(),h0:v.videoHeight|0,saw:false};
+ if(was){userPaused=true;doPause(v);}                /* old sound stops NOW */
+ var iv=setInterval(function(){
+  var want=false;
+  try{
+   if(!swHold||swTok!==tok){clearInterval(iv);return;}
+   want=swHold.was;
+   var el=Date.now()-swHold.t0;
+   if(!v.isConnected){clearInterval(iv);swEnd(false);return;}
+   if(v.seeking||v.readyState<3)swHold.saw=true;
+   if((v.videoHeight|0)>0&&(v.videoHeight|0)!==swHold.h0)swHold.saw=true;
+   var ready=!v.seeking&&v.readyState>=3;
+   /* data is there for the new quality (seen the reload, or 1.5 s passed without one): play on. 12 s = give up and play. */
+   if(el>=12000||(ready&&el>=350&&(swHold.saw||el>=1500))){clearInterval(iv);swEnd(want);}
+  }catch(e){clearInterval(iv);swEnd(want);}
+ },80);
+}
 function setQuality(id){
  try{
   id=String(id);
-  /* the site may pause / replay the video while it switches: open the guard for the switch only */
-  allowUntil=Date.now()+3000;
+  /* a hand-picked quality is held (see above); only 'auto' keeps the old rule: the site may pause / replay briefly */
+  var hv=(id!=='auto')?cur():null;
+  if(hv)swBegin(hv);else allowUntil=Date.now()+3000;
   var y=ytQ();
   if(y&&(id==='auto'||YQH[id])){
    if(id==='auto'){
@@ -1289,6 +1336,10 @@ function setQuality(id){
     try{y.setPlaybackQualityRange(id,id);}catch(e){}
     try{y.setPlaybackQuality(id);}catch(e){}
    }
+   /* Apply NOW. YouTube only changes the quality of data it has not loaded yet and keeps playing ~30 s of the old one.
+      Seeking to the very same second drops that buffer: the new quality starts at exactly this moment (and the video
+      reports 'waiting', so the app's buffer screen and the real state agree). */
+   if(id!=='auto'){try{var ct=y.getCurrentTime();if(isFinite(ct)&&ct>=0&&!isAd(y))y.seekTo(ct,true);}catch(e){}}
    setTimeout(sync_,400);setTimeout(sync_,1500);
    return;
   }
@@ -1358,43 +1409,6 @@ function setSource(url){
 }
 window.__lqPip={qualities:qualities,setQuality:setQuality,setSource:setSource,setPlay:setPlay,mute:mute,fit:fit,info:info,seekAbs:seekAbs,rate:rate,syncOut:syncOut,syncIn:syncIn,enter:enter,exit:exit,toggle:toggle,pause:pause,resume:resume,seek:seek,report:report,revive:revive};
 report();
-})()"""
-
-/**
- * Long-press an anchor to copy its URL. Also handles right-click / context menu
- * so the same shortcut works with a mouse or trackpad.
- */
-private const val LINK_JS = """(function(){
-if(window.__aurexLinks)return;window.__aurexLinks=1;
-var timer=null,startX=0,startY=0,current=null,longPressed=false;
-function copy(a){try{var h=a&&a.href;if(h)window.AurexMedia.copyLink(h);}catch(e){}}
-function clear(){if(timer){clearTimeout(timer);timer=null;}current=null;longPressed=false;}
-document.addEventListener('touchstart',function(e){
- if(e.touches.length!==1)return;
- var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;
- if(!a)return;
- current=a;startX=e.touches[0].clientX;startY=e.touches[0].clientY;longPressed=false;
- if(timer)clearTimeout(timer);
- timer=setTimeout(function(){if(current){longPressed=true;copy(current);}timer=null;},520);
-},{passive:true,capture:true});
-document.addEventListener('touchmove',function(e){
- if(!timer)return;var t=e.touches[0];if(!t)return;
- if(Math.abs(t.clientX-startX)>10||Math.abs(t.clientY-startY)>10){clearTimeout(timer);timer=null;}
-},{passive:true,capture:true});
-var swallowAt=0;
-document.addEventListener('touchend',function(e){
- if(longPressed)swallowAt=Date.now();
- clear();
-},{passive:true,capture:true});
-document.addEventListener('click',function(e){
- if(swallowAt&&Date.now()-swallowAt<700){e.preventDefault();e.stopPropagation();}
- swallowAt=0;
-},{passive:false,capture:true});
-document.addEventListener('touchcancel',clear,{passive:true,capture:true});
-document.addEventListener('contextmenu',function(e){
- var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;
- if(a){e.preventDefault();copy(a);}
-},{passive:false,capture:true});
 })()"""
 
 /** Keeps YouTube media playing when the page becomes hidden / browser enters PiP. */
@@ -3630,8 +3644,6 @@ class BrowserState(private val act: Activity) {
                     if (mediaPlayerEnabled) {
                         view.evaluateJavascript(MEDIA_JS, null)
                     }
-                    // Link copying works independently of media detection.
-                    view.evaluateJavascript(LINK_JS, null)
                     view.evaluateJavascript(PIP_JS, null)
                 }
                 view.evaluateJavascript(THEME_COLOR_JS) { raw ->
@@ -4198,12 +4210,6 @@ class BrowserState(private val act: Activity) {
                     tab.videoHeight = height
                 }
             }
-        }
-
-        @JavascriptInterface
-        fun copyLink(url: String) {
-            if (url.isBlank()) return
-            act.runOnUiThread { copy(url) }
         }
     }
 

@@ -22,7 +22,7 @@ import java.util.Locale
  */
 object PlayerSync {
     /** [frame]: the picture the page video showed at that moment (only when asked for, see [capture]). */
-    class Info(val ms: Long, val playing: Boolean, val live: Boolean, val frame: Bitmap? = null)
+    class Info(val ms: Long, val playing: Boolean, val live: Boolean, val frame: Bitmap? = null, val durMs: Long = -1L)
 
     // The last picture of the page video, handed to the full player so it opens ON that picture instead of on black.
     @Volatile private var bridgeBmp: Bitmap? = null
@@ -66,7 +66,8 @@ object PlayerSync {
                         ms = if (t >= 0) (t * 1000).toLong() else -1L,
                         playing = o.optBoolean("playing"),
                         live = o.optBoolean("live"),
-                        frame = if (frame) decodeFrame(o.optString("f")) else null
+                        frame = if (frame) decodeFrame(o.optString("f")) else null,
+                        durMs = o.optDouble("d", -1.0).let { if (it > 0.0) (it * 1000).toLong() else -1L }
                     )
                 )
             }

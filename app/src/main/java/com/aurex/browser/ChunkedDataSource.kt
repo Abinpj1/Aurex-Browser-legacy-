@@ -28,6 +28,7 @@ class ChunkedDataSource(
     private var pos = 0L          // next absolute byte handed to the caller
     private var reqEnd = unset    // exclusive end the caller asked for (unset = to the end of the file)
     private var total = unset     // size of the whole file once the CDN told it
+    private var gotInChunk = false // the chunk that is open right now has delivered at least one byte
 
     override fun addTransferListener(transferListener: TransferListener) {
         upstream.addTransferListener(transferListener)
@@ -66,6 +67,7 @@ class ChunkedDataSource(
         val d = s.buildUpon().setPosition(pos).setLength(len.coerceAtLeast(1L)).build()
         upstream.open(d)
         upOpen = true
+        gotInChunk = false
         if (total == unset) {
             // "Content-Range: bytes 0-8388607/123456789" -> 123456789
             val cr = upstream.responseHeaders.entries
@@ -86,10 +88,16 @@ class ChunkedDataSource(
             if (n == C.RESULT_END_OF_INPUT) {
                 upstream.close()
                 upOpen = false
+                // A range that ends without a single byte (misbehaving CDN / proxy) would be re-requested forever in a tight
+                // loop. Fail it as an I/O error instead: the player's normal retry + back-off takes over.
+                if (!gotInChunk && !((reqEnd != unset && pos >= reqEnd) || pos >= total)) {
+                    throw java.io.IOException("Empty range response at byte $pos")
+                }
                 if ((reqEnd != unset && pos >= reqEnd) || pos >= total) return C.RESULT_END_OF_INPUT
                 continue                      // this chunk is used up: the next range continues seamlessly
             }
             pos += n
+            gotInChunk = true
             return n
         }
     }

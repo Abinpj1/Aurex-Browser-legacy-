@@ -547,10 +547,10 @@ Video engine updated
 Video engine is up to date
 Finish or pause the running downloads first
 Couldn't update · check your connection
-Downloaded videos, music and images show up in your Gallery and music apps (a copy is kept in the AurexBrowser folder).
-Hidden from Gallery and music apps. They stay in the Downloads list here.
-Media visibility
-Visible in Gallery
+All downloaded files (PDF, APK, videos, music, images and more) are saved in your phone's Downloads folder, so File Manager and Gallery can show them (a copy is kept in Downloads/AurexBrowser).
+Hidden from File Manager and Gallery. Files stay private in the Downloads list here.
+Files visibility
+Visible in Downloads
 Hidden
 Files are saved in the app's Download folder.
 Updating…

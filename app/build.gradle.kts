@@ -30,8 +30,8 @@ android {
         applicationId = "com.aurex.browser"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.1.1"
         // The bundled downloader engine (Python + yt-dlp + ffmpeg) is large per ABI.
         // These cover virtually every phone plus the emulator.
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }

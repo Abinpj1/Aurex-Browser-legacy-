@@ -31,6 +31,9 @@ class WebVideoPlayer(private val s: BrowserState) : SimpleBasePlayer(Looper.getM
     private var muted = false
     private var lockUntil = 0L      // right after a command the page may still report the old state
     private var misses = 0
+    /** True while the page holds its video for a quality switch (old sound off, new quality loading). */
+    @Volatile var pageSwitching = false
+        private set
     /** > 0 while the page does not answer (video gone / page navigated). */
     val missCount: Int get() = misses
 
@@ -103,6 +106,7 @@ class WebVideoPlayer(private val s: BrowserState) : SimpleBasePlayer(Looper.getM
                     durMs = newDur
                 }
                 buffering = o.optInt("b") == 1
+                pageSwitching = o.optInt("s") == 1
                 if (SystemClock.uptimeMillis() >= lockUntil) {
                     ended = o.optInt("e") == 1
                     playing = o.optInt("p") == 1
