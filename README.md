@@ -5,31 +5,36 @@
 <br>
 <br>
 <p>
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/badge/Download-Latest%20APK-0A84FF?style=for-the-badge&logo=android&logoColor=white" alt="Download latest APK"></a>
-<a href="https://t.me/aurex_oss"><img src="https://img.shields.io/badge/Telegram-Community-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram"></a>
+<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/badge/Download-Latest%20APK-0A84FF?style=for-the-badge&logo=android&logoColor=white" alt="Download latest APK"></a>&nbsp;<a href="https://t.me/aurex_oss"><img src="https://img.shields.io/badge/Telegram-Community-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram"></a>
 </p>
 <br>
 <p>
 <a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/github/v/release/aman-nitb-cse/Aurex-Browser?style=flat-square&color=0A84FF&labelColor=1C1C1E&label=Release" alt="Release"></a>&nbsp;&nbsp;
 <img src="https://img.shields.io/badge/Android-7.0%2B-30D158?style=flat-square&labelColor=1C1C1E&logo=android&logoColor=white" alt="Android 7.0+">&nbsp;&nbsp;
 <a href="https://github.com/aman-nitb-cse/Aurex-Browser/stargazers"><img src="https://badgen.net/github/stars/aman-nitb-cse/Aurex-Browser?color=FF9F0A&labelColor=1C1C1E&icon=github" alt="Stars"></a>&nbsp;&nbsp;
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases"><img src="https://badgen.net/github/assets-dl/aman-nitb-cse/Aurex-Browser?color=30D158&labelColor=1C1C1E&label=Downloads" alt="Downloads"></a>&nbsp;&nbsp;
+<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases"><img src="https://img.shields.io/github/downloads/aman-nitb-cse/Aurex-Browser/total?style=flat-square&color=30D158&labelColor=1C1C1E&logo=github&logoColor=white&label=Downloads" alt="Total downloads"></a>&nbsp;&nbsp;
 <img src="https://img.shields.io/badge/License-GPL%20v3-BF5AF2?style=flat-square&labelColor=1C1C1E" alt="GPL v3">
 </p>
 <br>
-<p>
-<a href="#screens"><img src="https://img.shields.io/badge/Screens-2C2C2E?style=flat-square" alt="Screens"></a>&nbsp;&nbsp;
-<a href="#glass"><img src="https://img.shields.io/badge/Liquid%20Glass-2C2C2E?style=flat-square" alt="Liquid Glass"></a>&nbsp;&nbsp;
-<a href="#shield"><img src="https://img.shields.io/badge/Shield-2C2C2E?style=flat-square" alt="Shield"></a>&nbsp;&nbsp;
-<a href="#downloads"><img src="https://img.shields.io/badge/Downloads-2C2C2E?style=flat-square" alt="Downloads"></a>&nbsp;&nbsp;
-<a href="#player"><img src="https://img.shields.io/badge/Player-2C2C2E?style=flat-square" alt="Player"></a>&nbsp;&nbsp;
-<a href="#privacy"><img src="https://img.shields.io/badge/Privacy-2C2C2E?style=flat-square" alt="Privacy"></a>&nbsp;&nbsp;
-<a href="#install"><img src="https://img.shields.io/badge/Install-2C2C2E?style=flat-square" alt="Install"></a>
-</p>
-<br>
-<br>
-<img src="docs/stats.svg" alt="4 to 48 download parts, 2 to 16 parallel connections, 7 search engines, 12 haptic events, 0 accounts" width="100%">
+<sub>⭐ If Aurex is useful to you, please consider giving the repo a star — it really helps!</sub>
 </div>
+
+<br>
+
+<a id="install"></a>
+
+## 📥 Download & Install
+
+<div align="center">
+<p>
+<a href="https://rookieenough.github.io/Orion-Data/app/?id=aurex-browser"><img src="https://raw.githubusercontent.com/RookieEnough/Orion-Store/refs/heads/main/assets/orion-badge.png" alt="Get it on Orion Store" height="64"></a>&nbsp;&nbsp;&nbsp;
+<a href="https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/Aman-nitb-cse/Aurex-Browser"><img src="https://raw.githubusercontent.com/ImranR98/Obtainium/main/assets/graphics/badge_obtainium.png" alt="Get it on Obtainium" height="64"></a>
+</p>
+</div>
+
+<br>
+
+> Aurex Browser is **fully open source** — every line of it is in this repository, free to read and audit (see **Build** below). It simply renders the pages you browse; what a site does with your data is governed by **that site's own privacy policy**, not Aurex's. The developer takes no responsibility for the content, behaviour or policies of third-party websites, or for how the app and its downloader are used — that is on the person using it, within the laws of their country.
 
 <br>
 
@@ -164,18 +169,6 @@ Reader mode, find in page, bookmarks, history, desktop site, data saver and long
 <div align="center">
 <img src="docs/tech-marquee.svg" alt="Kotlin, Jetpack Compose, Material 3, AndroidX Media3, ExoPlayer, OkHttp, yt-dlp, FFmpeg, youtubedl-android, Android WebView" width="100%">
 </div>
-
-<br>
-
-<a id="install"></a>
-
-## 📲 Install
-
-1. Download the `.apk` from the [latest release](https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest)
-2. Open it and allow installation if asked
-3. Tap **Install**
-
-Needs Android 7.0 or newer.
 
 <br>
 
