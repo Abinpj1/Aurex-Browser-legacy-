@@ -37,10 +37,12 @@ object NotifArt {
         "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
 
     private val cards = LruCache<String, Bitmap>(8)
+    private val squares = LruCache<String, Bitmap>(8)
     private val loading: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val failedAt = ConcurrentHashMap<String, Long>()
     private val io = Executors.newFixedThreadPool(2)
     @Volatile private var fallback: Bitmap? = null
+    @Volatile private var fallbackSquare: Bitmap? = null
 
     private fun keyOf(url: String): String = YtThumb.idOf(url)?.let { "yt:$it" } ?: url
 
@@ -60,10 +62,13 @@ object NotifArt {
             val retryOk = failed == null || System.currentTimeMillis() - failed > 90_000L
             if (retryOk && loading.add(key)) {
                 io.execute {
-                    val bmp = runCatching { loadThumb(url) }.getOrNull()?.let { runCatching { bake(it) }.getOrNull() }
+                    val raw = runCatching { loadThumb(url) }.getOrNull()
+                    val bmp = raw?.let { runCatching { bake(it) }.getOrNull() }
+                    val sq = raw?.let { runCatching { bakeSquare(it) }.getOrNull() }
                     loading.remove(key)
                     if (bmp != null) {
                         cards.put(key, bmp)
+                        if (sq != null) squares.put(key, sq)
                         runCatching { onReady() }
                     } else {
                         failedAt[key] = System.currentTimeMillis()
@@ -72,6 +77,18 @@ object NotifArt {
             }
         }
         return fallbackCard(ctx)
+    }
+
+    /** Full-bleed 512x512 square artwork for native Notification.MediaStyle & OS Dynamic Islands. */
+    fun mediaArt(ctx: Context, pageUrl: String?, onReady: () -> Unit): Bitmap {
+        val url = pageUrl.orEmpty().trim().substringBefore('#')
+        if (url.startsWith("http") || url.startsWith("file:", true)) {
+            val key = keyOf(url)
+            squares.get(key)?.let { return it }
+            card(ctx, pageUrl, onReady)
+            squares.get(key)?.let { return it }
+        }
+        return fallbackSquareCard(ctx)
     }
 
     // ── Loading ──────────────────────────────────────────────────────────────
@@ -208,6 +225,35 @@ object NotifArt {
             d.draw(c)
         }
         fallback = out
+        return out
+    }
+
+    private fun bakeSquare(src: Bitmap): Bitmap {
+        val side = minOf(src.width, src.height).coerceAtLeast(1)
+        val sx = (src.width - side) / 2
+        val sy = (src.height - side) / 2
+        val out = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888)
+        val c = Canvas(out)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        c.drawBitmap(src, Rect(sx, sy, sx + side, sy + side), RectF(0f, 0f, 512f, 512f), p)
+        return out
+    }
+
+    private fun fallbackSquareCard(ctx: Context): Bitmap {
+        fallbackSquare?.let { return it }
+        val out = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888)
+        val c = Canvas(out)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        p.shader = LinearGradient(0f, 0f, 512f, 512f, 0xFF14223D.toInt(), 0xFF0A0D18.toInt(), Shader.TileMode.CLAMP)
+        c.drawRect(0f, 0f, 512f, 512f, p)
+        ContextCompat.getDrawable(ctx, R.drawable.ic_stat_aurex)?.mutate()?.let { d ->
+            val s = 216
+            val l = (512 - s) / 2
+            d.setBounds(l, l, l + s, l + s)
+            d.alpha = 240
+            d.draw(c)
+        }
+        fallbackSquare = out
         return out
     }
 

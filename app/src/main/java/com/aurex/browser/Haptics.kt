@@ -3,6 +3,7 @@ package com.aurex.browser
 import android.content.Context
 import android.os.Build
 import android.os.SystemClock
+import android.os.VibrationAttributes
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -10,78 +11,53 @@ import android.view.HapticFeedbackConstants
 import android.view.View
 import java.lang.ref.WeakReference
 
-/** What happened - every haptic in the app is one of these, so the feel is the same everywhere. */
+/** Every haptic event in Aurex maps to a crisp mechanical "TAK" or watch-dial "tik" (zero mushy buzz). */
 enum class Hx {
-    /** Finger touches something that can be pressed (very light). */
     PRESS,
-    /** A button / row / chip was tapped. */
     TAP,
-    /** One step of a slider, a lens slot, a list reorder slot. */
     TICK,
     TOGGLE_ON,
     TOGGLE_OFF,
-    /** Press-and-hold recognised (select mode ...). */
+    WINDOW_OPEN,
+    WINDOW_CLOSE,
     HOLD,
-    /** A drag picked something up / put it down. */
     DRAG_START,
     DRAG_END,
-    /** A swipe or drag crossed the "will commit" line, or a slider reached its end. */
     THRESHOLD,
-    /** Download finished, link copied ... */
     SUCCESS,
     ERROR,
-    /** Destructive action (delete). */
     WARN
 }
 
 /**
- * One place for all vibration.
- *
- *  - Honours the Settings -> "Haptic feedback" switch everywhere ([enabled]) and the
- *    "Haptic strength" choice ([level]: 0 light, 1 medium, 2 strong).
- *  - Three tiers, best first, picked once per phone:
- *      1. composition primitives (Android 11+ with a real haptic motor): crisp, scaled click / tick / thud.
- *         Every primitive is checked on its own and a missing one is replaced by the nearest one the motor
- *         does have (before, one missing primitive disabled the whole tier);
- *      2. predefined effects (Android 10+): the motor's own tuned tick / click / heavy click / double click;
- *      3. the stock "performHapticFeedback" constant that best matches the event on this Android version.
- *  - Two haptics within a few ms are merged into one (no double buzz when a tap also shows a toast), and
- *    ticks are spaced a little wider so a fast slider drag feels like a ratchet instead of a buzz.
- *  - Events fired without a view (downloads finishing) only buzz while the app window has focus.
+ * Pure mechanical "TAK-TAK" haptic engine:
+ *  - Controlled by the single Settings -> "Haptic feedback" on/off switch ([enabled]).
+ *  - Routes every vibration through `VibrationAttributes.USAGE_TOUCH` (Android 13+) so modern
+ *    X-axis linear motors fire on the ultra-low-latency hardware touch channel at full crispness.
+ *  - Pre-builds every `VibrationEffect` once in [init] (0 allocations per tap).
+ *  - Single razor-sharp `PRIMITIVE_CLICK` (1.0f, zero ring-out) for all taps, switches, buttons,
+ *    window open & window collapse; crisp `PRIMITIVE_TICK` for slider/scrub ratchets; and cleanly
+ *    separated `TAK · (60ms silence) · TAK` for hold, confirm, warn, and error.
  */
 object Haptics {
     @Volatile var enabled: Boolean = true
-
-    /** 0 = light, 1 = medium (default), 2 = strong. Read from the settings by [init], changed live by the settings page. */
-    @Volatile var level: Int = 1
 
     private var vibrator: Vibrator? = null
     private var anchor: WeakReference<View>? = null
     private var lastAt = 0L
     private var lastTickAt = 0L
     private var inited = false
-
-    // what this phone's motor can do
     private var hasMotor = false
-    private var hasClick = false
-    private var hasTick = false
-    private var hasLow = false
-    private var hasThud = false
-    private var predefined = false
 
-    /** Output multiplier for the primitives (clamped to 1 afterwards, so "strong" lifts the soft ones the most). */
-    private fun gain(): Float = when (level) {
-        0 -> 0.7f
-        2 -> 1.35f
-        else -> 1f
-    }
+    // Pre-built per-Hx hardware effects (API 26+) and touch attributes (API 33+)
+    private var effects: Array<VibrationEffect?>? = null
+    private var touchAttrs: Any? = null
 
     fun init(ctx: Context) {
         if (inited) return
         inited = true
         runCatching {
             val app = ctx.applicationContext
-            level = app.getSharedPreferences("liquid", Context.MODE_PRIVATE).getInt("hapticLevel", 1).coerceIn(0, 2)
             val v: Vibrator? = if (Build.VERSION.SDK_INT >= 31) {
                 (app.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
             } else {
@@ -91,13 +67,20 @@ object Haptics {
             vibrator = v
             hasMotor = v != null && v.hasVibrator()
             if (hasMotor && v != null) {
-                if (Build.VERSION.SDK_INT >= 30) {
-                    hasClick = primitive(v, VibrationEffect.Composition.PRIMITIVE_CLICK)
-                    hasTick = primitive(v, VibrationEffect.Composition.PRIMITIVE_TICK)
-                    hasLow = primitive(v, VibrationEffect.Composition.PRIMITIVE_LOW_TICK)
-                    hasThud = primitive(v, VibrationEffect.Composition.PRIMITIVE_THUD)
+                if (Build.VERSION.SDK_INT >= 33) {
+                    touchAttrs = VibrationAttributes.Builder()
+                        .setUsage(VibrationAttributes.USAGE_TOUCH)
+                        .build()
                 }
-                predefined = Build.VERSION.SDK_INT >= 29
+                if (Build.VERSION.SDK_INT >= 26) {
+                    val hasClick = primitive(v, VibrationEffect.Composition.PRIMITIVE_CLICK)
+                    val hasTick = primitive(v, VibrationEffect.Composition.PRIMITIVE_TICK)
+                    val arr = arrayOfNulls<VibrationEffect>(Hx.values().size)
+                    for (hx in Hx.values()) {
+                        arr[hx.ordinal] = buildEffect(hx, hasClick, hasTick)
+                    }
+                    effects = arr
+                }
             }
         }
     }
@@ -105,7 +88,74 @@ object Haptics {
     private fun primitive(v: Vibrator, id: Int): Boolean =
         runCatching { Build.VERSION.SDK_INT >= 30 && v.areAllPrimitivesSupported(id) }.getOrDefault(false)
 
-    /** Called by the theme of every window (browser, player) so events without a view know where to buzz. */
+    private fun buildEffect(kind: Hx, hasClick: Boolean, hasTick: Boolean): VibrationEffect? {
+        // Tier 1 (Android 11+ with LRA primitives): pure single-cycle PRIMITIVE_CLICK ("TAK") & PRIMITIVE_TICK ("tik")
+        if (Build.VERSION.SDK_INT >= 30 && (hasClick || hasTick)) {
+            val clickId = if (hasClick) VibrationEffect.Composition.PRIMITIVE_CLICK else VibrationEffect.Composition.PRIMITIVE_TICK
+            val tickId = if (hasTick) VibrationEffect.Composition.PRIMITIVE_TICK else VibrationEffect.Composition.PRIMITIVE_CLICK
+            return runCatching {
+                val c = VibrationEffect.startComposition()
+                when (kind) {
+                    // Crisp watch-dial tik for slider steps & drag ticks
+                    Hx.PRESS -> c.addPrimitive(tickId, 0.85f)
+                    Hx.TICK -> c.addPrimitive(tickId, 0.95f)
+                    // Pure punchy single mechanical TAK everywhere (zero overlapping buzz!)
+                    Hx.TAP -> c.addPrimitive(clickId, 1.00f)
+                    Hx.TOGGLE_ON -> c.addPrimitive(clickId, 1.00f)
+                    Hx.TOGGLE_OFF -> c.addPrimitive(clickId, 0.86f)
+                    Hx.WINDOW_OPEN -> c.addPrimitive(clickId, 0.96f)
+                    Hx.WINDOW_CLOSE -> c.addPrimitive(clickId, 0.84f)
+                    Hx.DRAG_START -> c.addPrimitive(clickId, 0.96f)
+                    Hx.DRAG_END -> c.addPrimitive(clickId, 0.86f)
+                    Hx.THRESHOLD -> c.addPrimitive(clickId, 1.00f)
+                    // Cleanly separated TAK ... TAK (58-68ms silence gap -> zero blur/buzz!)
+                    Hx.HOLD -> {
+                        c.addPrimitive(clickId, 1.00f)
+                        c.addPrimitive(clickId, 0.92f, 58)
+                    }
+                    Hx.WARN -> {
+                        c.addPrimitive(clickId, 1.00f)
+                        c.addPrimitive(clickId, 0.85f, 55)
+                    }
+                    Hx.SUCCESS -> {
+                        c.addPrimitive(clickId, 0.85f)
+                        c.addPrimitive(clickId, 1.00f, 62)
+                    }
+                    Hx.ERROR -> {
+                        c.addPrimitive(clickId, 1.00f)
+                        c.addPrimitive(clickId, 1.00f, 68)
+                    }
+                }
+                c.compose()
+            }.getOrNull()
+        }
+
+        // Tier 2 (Android 10+): hardware-tuned predefined clicks (never mushy!)
+        if (Build.VERSION.SDK_INT >= 29) {
+            val id = when (kind) {
+                Hx.PRESS, Hx.TICK -> VibrationEffect.EFFECT_TICK
+                Hx.TAP, Hx.TOGGLE_ON, Hx.TOGGLE_OFF, Hx.WINDOW_OPEN, Hx.WINDOW_CLOSE, Hx.DRAG_START, Hx.DRAG_END -> VibrationEffect.EFFECT_CLICK
+                Hx.THRESHOLD, Hx.HOLD, Hx.WARN -> VibrationEffect.EFFECT_HEAVY_CLICK
+                Hx.SUCCESS, Hx.ERROR -> VibrationEffect.EFFECT_DOUBLE_CLICK
+            }
+            return runCatching { VibrationEffect.createPredefined(id) }.getOrNull()
+        }
+
+        // Tier 3 (Android 8-9): ultra-short sharp impulse at max amplitude
+        if (Build.VERSION.SDK_INT >= 26) {
+            return runCatching {
+                when (kind) {
+                    Hx.PRESS, Hx.TICK -> VibrationEffect.createOneShot(7L, 210)
+                    Hx.HOLD, Hx.SUCCESS, Hx.ERROR, Hx.WARN ->
+                        VibrationEffect.createWaveform(longArrayOf(0L, 11L, 58L, 11L), intArrayOf(0, 255, 0, 240), -1)
+                    else -> VibrationEffect.createOneShot(11L, 255)
+                }
+            }.getOrNull()
+        }
+        return null
+    }
+
+    /** Called by the theme of every window (browser, player) so background events know where to fire. */
     fun attach(view: View) {
         if (anchor?.get() !== view) anchor = WeakReference(view)
     }
@@ -115,162 +165,70 @@ object Haptics {
         if (view != null) {
             if (anchor?.get() !== view) anchor = WeakReference(view)
         } else {
-            // event from the background (a download finished): only while our window is in front
             val a = anchor?.get() ?: return
             if (!a.hasWindowFocus()) return
         }
         if (!gate(kind)) return
-        if (play(kind)) return
+        if (vibrateNow(kind)) return
         val target = view ?: anchor?.get() ?: return
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) viewHaptic(target, kind)
-        else target.post { viewHaptic(target, kind) }      // downloads finish on worker threads
+        else target.post { viewHaptic(target, kind) }
     }
 
-    /**
-     * For taps on the notification's buttons: the app window is not in front there, so the focus gate of [fire] would
-     * swallow the haptic. Same motor tiers, same Settings switch, no window needed.
-     */
+    /** For notification buttons where the app window is not focused. */
     fun fireDetached(kind: Hx) {
         if (!enabled) return
         if (!gate(kind)) return
-        if (play(kind)) return
+        if (vibrateNow(kind)) return
         val v = vibrator ?: return
         runCatching {
-            if (Build.VERSION.SDK_INT >= 26) {
-                val ms = (if (kind == Hx.ERROR) 30L else 16L) * (if (level == 2) 3 else 2) / 2
-                val amp = when (level) { 0 -> 90; 2 -> 200; else -> 140 }
-                v.vibrate(VibrationEffect.createOneShot(ms, amp))
-            } else {
-                @Suppress("DEPRECATION")
-                v.vibrate(16L)
-            }
+            @Suppress("DEPRECATION")
+            v.vibrate(10L)
         }
     }
 
-    /** Merge near-simultaneous events; space ticks wider than everything else. */
+    /**
+     * Prevents two back-to-back haptics (e.g. Button TAP + Window OPEN on the next 8ms frame)
+     * from colliding on the LRA motor and turning a crisp "TAK" into a buzz.
+     */
     private fun gate(kind: Hx): Boolean {
         val now = SystemClock.uptimeMillis()
-        if (now - lastAt < 14L) return false
-        if ((kind == Hx.TICK || kind == Hx.PRESS) && now - lastTickAt < 26L) return false
+        if (kind == Hx.TICK || kind == Hx.PRESS) {
+            if (now - lastTickAt < 22L || now - lastAt < 22L) return false
+            lastTickAt = now
+            lastAt = now
+            return true
+        }
+        if (now - lastAt < 36L) return false
         lastAt = now
-        if (kind == Hx.TICK || kind == Hx.PRESS) lastTickAt = now
         return true
     }
 
-    private fun play(kind: Hx): Boolean {
+    private fun vibrateNow(kind: Hx): Boolean {
         if (!hasMotor) return false
-        if (hasClick && hasTick && playPrimitives(kind)) return true
-        return playPredefined(kind)
-    }
-
-    // ── Tier 1: composition primitives ───────────────────────────────────────
-
-    private enum class P { CLICK, TICK, LOW, THUD }
-
-    /** Id of [p] on this motor, or the closest one it has (as a pair with the scale to apply), or null. */
-    private fun resolve(p: P): Pair<Int, Float>? {
-        if (Build.VERSION.SDK_INT < 30) return null
-        val c = VibrationEffect.Composition.PRIMITIVE_CLICK
-        val t = VibrationEffect.Composition.PRIMITIVE_TICK
-        val l = VibrationEffect.Composition.PRIMITIVE_LOW_TICK
-        val th = VibrationEffect.Composition.PRIMITIVE_THUD
-        return when (p) {
-            P.CLICK -> if (hasClick) c to 1f else if (hasThud) th to 0.85f else if (hasTick) t to 1f else null
-            P.TICK -> if (hasTick) t to 1f else if (hasLow) l to 1f else if (hasClick) c to 0.6f else null
-            P.LOW -> if (hasLow) l to 1f else if (hasTick) t to 0.7f else if (hasClick) c to 0.4f else null
-            P.THUD -> if (hasThud) th to 1f else if (hasClick) c to 1f else if (hasTick) t to 1f else null
-        }
-    }
-
-    private fun playPrimitives(kind: Hx): Boolean {
-        if (Build.VERSION.SDK_INT < 30) return false
         val v = vibrator ?: return false
-        val g = gain()
-        return runCatching {
-            val comp = VibrationEffect.startComposition()
-            var count = 0
-            fun add(p: P, scale: Float, delayMs: Int = 0) {
-                val (id, k) = resolve(p) ?: return
-                comp.addPrimitive(id, (scale * k * g).coerceIn(0.05f, 1f), delayMs)
-                count++
-            }
-            when (kind) {
-                Hx.PRESS -> add(P.LOW, 0.45f)
-                Hx.TAP -> add(P.CLICK, 0.55f)
-                Hx.TICK -> add(P.TICK, 0.42f)
-                // rising pair = "switch clicked on", falling pair = "switch let go"
-                Hx.TOGGLE_ON -> { add(P.TICK, 0.5f); add(P.CLICK, 0.8f, 26) }
-                Hx.TOGGLE_OFF -> { add(P.CLICK, 0.6f); add(P.LOW, 0.4f, 26) }
-                Hx.HOLD -> { add(P.THUD, 0.7f); add(P.LOW, 0.3f, 45) }
-                // picked up: light touch then a firm click; put down: click that settles
-                Hx.DRAG_START -> { add(P.TICK, 0.5f); add(P.CLICK, 0.85f, 22) }
-                Hx.DRAG_END -> { add(P.CLICK, 0.6f); add(P.LOW, 0.3f, 24) }
-                Hx.THRESHOLD -> { add(P.CLICK, 0.9f); add(P.TICK, 0.5f, 18) }
-                Hx.SUCCESS -> { add(P.LOW, 0.3f); add(P.TICK, 0.5f, 40); add(P.CLICK, 0.9f, 48) }
-                Hx.ERROR -> { add(P.CLICK, 0.9f); add(P.CLICK, 0.9f, 70); add(P.THUD, 0.7f, 90) }
-                Hx.WARN -> { add(P.THUD, 0.85f); add(P.LOW, 0.4f, 60) }
-            }
-            if (count == 0) return@runCatching false
-            v.vibrate(comp.compose())
-            true
-        }.getOrDefault(false)
-    }
-
-    // ── Tier 2: the motor's own predefined effects (Android 10+) ─────────────
-
-    private fun playPredefined(kind: Hx): Boolean {
-        if (!predefined || Build.VERSION.SDK_INT < 29) return false
-        val v = vibrator ?: return false
-        val tick = VibrationEffect.EFFECT_TICK
-        val click = VibrationEffect.EFFECT_CLICK
-        val heavy = VibrationEffect.EFFECT_HEAVY_CLICK
-        val dbl = VibrationEffect.EFFECT_DOUBLE_CLICK
-        val lvl = level
-        val id = when (kind) {
-            Hx.PRESS, Hx.TICK -> tick
-            Hx.TAP -> if (lvl == 0) tick else click
-            Hx.TOGGLE_ON, Hx.DRAG_START, Hx.THRESHOLD -> if (lvl == 2) heavy else click
-            Hx.TOGGLE_OFF, Hx.DRAG_END -> if (lvl == 2) click else tick
-            Hx.HOLD -> if (lvl == 0) click else heavy
-            Hx.SUCCESS -> dbl
-            Hx.ERROR -> dbl
-            Hx.WARN -> heavy
+        if (Build.VERSION.SDK_INT >= 26) {
+            val eff = effects?.getOrNull(kind.ordinal) ?: return false
+            return runCatching {
+                if (Build.VERSION.SDK_INT >= 33 && touchAttrs is VibrationAttributes) {
+                    v.vibrate(eff, touchAttrs as VibrationAttributes)
+                } else {
+                    v.vibrate(eff)
+                }
+                true
+            }.getOrDefault(false)
         }
-        return runCatching {
-            v.vibrate(VibrationEffect.createPredefined(id))
-            true
-        }.getOrDefault(false)
+        return false
     }
-
-    // ── Tier 3: stock view haptics ───────────────────────────────────────────
 
     private fun viewHaptic(view: View, kind: Hx) {
         val sdk = Build.VERSION.SDK_INT
         val c = when (kind) {
-            Hx.PRESS -> HapticFeedbackConstants.CLOCK_TICK
-            Hx.TAP -> HapticFeedbackConstants.KEYBOARD_TAP
-            Hx.TICK -> if (sdk >= 34) HapticFeedbackConstants.SEGMENT_FREQUENT_TICK else HapticFeedbackConstants.CLOCK_TICK
-            Hx.TOGGLE_ON -> when {
-                sdk >= 34 -> HapticFeedbackConstants.TOGGLE_ON
-                sdk >= 30 -> HapticFeedbackConstants.CONFIRM
-                else -> HapticFeedbackConstants.KEYBOARD_TAP
-            }
-            Hx.TOGGLE_OFF -> if (sdk >= 34) HapticFeedbackConstants.TOGGLE_OFF else HapticFeedbackConstants.CLOCK_TICK
+            Hx.PRESS, Hx.TICK -> if (sdk >= 34) HapticFeedbackConstants.SEGMENT_FREQUENT_TICK else HapticFeedbackConstants.CLOCK_TICK
             Hx.HOLD -> HapticFeedbackConstants.LONG_PRESS
-            Hx.DRAG_START -> when {
-                sdk >= 34 -> HapticFeedbackConstants.DRAG_START
-                sdk >= 30 -> HapticFeedbackConstants.GESTURE_START
-                else -> HapticFeedbackConstants.LONG_PRESS
-            }
-            Hx.DRAG_END -> if (sdk >= 30) HapticFeedbackConstants.GESTURE_END else HapticFeedbackConstants.CLOCK_TICK
-            Hx.THRESHOLD -> when {
-                sdk >= 34 -> HapticFeedbackConstants.GESTURE_THRESHOLD_ACTIVATE
-                else -> HapticFeedbackConstants.CONTEXT_CLICK
-            }
-            Hx.SUCCESS -> if (sdk >= 30) HapticFeedbackConstants.CONFIRM else HapticFeedbackConstants.KEYBOARD_TAP
-            Hx.ERROR -> if (sdk >= 30) HapticFeedbackConstants.REJECT else HapticFeedbackConstants.LONG_PRESS
-            Hx.WARN -> HapticFeedbackConstants.LONG_PRESS
+            Hx.ERROR, Hx.WARN -> if (sdk >= 30) HapticFeedbackConstants.REJECT else HapticFeedbackConstants.LONG_PRESS
+            else -> if (sdk >= 23) HapticFeedbackConstants.CONTEXT_CLICK else HapticFeedbackConstants.KEYBOARD_TAP
         }
-        view.performHapticFeedback(c, HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING)
+        view.performHapticFeedback(c)
     }
 }

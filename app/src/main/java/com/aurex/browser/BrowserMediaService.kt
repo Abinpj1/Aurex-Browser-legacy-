@@ -8,8 +8,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.drawable.Icon
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
@@ -60,11 +60,7 @@ class BrowserMediaService : Service() {
     private val bg = Handler(bgThread.looper)
     private val refreshPending = AtomicBoolean(false)
     private val notifLock = Any()
-    // The last real picture stays on the card while the next video's picture loads (no flash of the placeholder).
-    private var lastCard: Bitmap? = null
-    private var scaledSrc: Bitmap? = null
-    private var scaledSmall: Bitmap? = null
-    private var scaledBig: Bitmap? = null
+    private var lastArt: Bitmap? = null
     private val settleRun = Runnable { settlePaused() }
     private val idleRun = Runnable {
         MediaNotif.stop()
@@ -232,6 +228,26 @@ class BrowserMediaService : Service() {
         }.onFailure { refreshPending.set(false) }
     }
 
+    fun syncPositionOnly() {
+        if (!shown) return
+        val ss = session ?: return
+        val s = MediaNotif.snap ?: return
+        val playing = s.playing
+        val pos = if (!s.live) s.posMs else PlaybackState.PLAYBACK_POSITION_UNKNOWN
+        runCatching {
+            ss.setPlaybackState(
+                PlaybackState.Builder()
+                    .setActions(SESSION_ACTIONS)
+                    .setState(
+                        if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                        pos,
+                        if (playing) 1f else 0f
+                    )
+                    .build()
+            )
+        }
+    }
+
     // ── Foreground promotion ─────────────────────────────────────────────────
 
     private fun promoteToForeground() {
@@ -329,7 +345,16 @@ class BrowserMediaService : Service() {
         refresh()
     }
 
-    // ── Media session (headset / Bluetooth / lock-screen keys) ───────────────
+    // ── Media session (Dynamic Island, Fluid Cloud, HyperIsland, Atomic Island, Lockscreen, BT) ──
+
+    private val SESSION_ACTIONS =
+        PlaybackState.ACTION_PLAY or
+            PlaybackState.ACTION_PAUSE or
+            PlaybackState.ACTION_PLAY_PAUSE or
+            PlaybackState.ACTION_SKIP_TO_NEXT or
+            PlaybackState.ACTION_SKIP_TO_PREVIOUS or
+            PlaybackState.ACTION_SEEK_TO or
+            PlaybackState.ACTION_STOP
 
     private fun ensureSession(): MediaSession? {
         session?.let { return it }
@@ -343,6 +368,7 @@ class BrowserMediaService : Service() {
                     override fun onSkipToNext() = MediaNotif.perform(MediaNotif.ACTION_NEXT)
                     override fun onSkipToPrevious() = MediaNotif.perform(MediaNotif.ACTION_PREV)
                     override fun onSeekTo(pos: Long) = MediaNotif.seekTo(pos)
+                    override fun onStop() = dismissNow()
                 })
                 s.isActive = true
                 session = s
@@ -357,30 +383,29 @@ class BrowserMediaService : Service() {
         metaKey = ""
     }
 
-    private fun syncSession(card: Bitmap, heading: String, s: MediaNotif.Snap?, playing: Boolean) {
-        val ss = ensureSession() ?: return
+    private fun syncSession(art: Bitmap, heading: String, artist: String, s: MediaNotif.Snap?, playing: Boolean): MediaSession.Token? {
+        val ss = ensureSession() ?: return null
         runCatching {
             val dur = if (s != null && !s.live && s.durMs > 0) s.durMs else -1L
-            val key = "$heading|$mediaHost|$dur|${System.identityHashCode(card)}"
+            val key = "$heading|$artist|$dur|${System.identityHashCode(art)}"
             if (key != metaKey) {
                 metaKey = key
                 ss.setMetadata(
                     MediaMetadata.Builder()
                         .putString(MediaMetadata.METADATA_KEY_TITLE, heading)
-                        .putString(MediaMetadata.METADATA_KEY_ARTIST, mediaHost.ifBlank { "Aurex Browser" })
+                        .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
+                        .putString(MediaMetadata.METADATA_KEY_ALBUM, "Aurex Browser")
                         .putLong(MediaMetadata.METADATA_KEY_DURATION, dur)
-                        .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, card)
+                        .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, art)
+                        .putBitmap(MediaMetadata.METADATA_KEY_ART, art)
+                        .putBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON, art)
                         .build()
                 )
             }
             val pos = if (s != null && !s.live) s.posMs else PlaybackState.PLAYBACK_POSITION_UNKNOWN
             ss.setPlaybackState(
                 PlaybackState.Builder()
-                    .setActions(
-                        PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
-                            PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS or
-                            PlaybackState.ACTION_SEEK_TO
-                    )
+                    .setActions(SESSION_ACTIONS)
                     .setState(
                         if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
                         pos,
@@ -389,17 +414,12 @@ class BrowserMediaService : Service() {
                     .build()
             )
         }
+        return ss.sessionToken
     }
 
-    /**
-     * The "now playing" card, in the app's look: rounded 16:9 thumbnail, title, "site · Playing / Paused", an accent
-     * progress bar (with elapsed / remaining when expanded) and prev - play/pause - next. Collapsed and expanded
-     * both carry all three buttons.
-     */
     private fun buildNotification(): Notification {
-        ensureNotificationChannel()     // re-applies the channel name / description in the current app language
+        ensureNotificationChannel()
         val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        // Tap on the card: the page where the video plays (or the player showing the downloaded video).
         val open = if (MediaNotif.local != null) {
             PendingIntent.getActivity(
                 this, 205,
@@ -416,50 +436,50 @@ class BrowserMediaService : Service() {
                 flags
             )
         }
-        // Buttons go straight to this service: faster and more reliable than a broadcast to the activity.
         fun svc(code: Int, action: String) =
             PendingIntent.getService(this, code, Intent(this, BrowserMediaService::class.java).setAction(action), flags)
-        val acts = NotifViews.MediaActs(
-            svc(201, MediaNotif.ACTION_TOGGLE),
-            svc(203, MediaNotif.ACTION_PREV),
-            svc(204, MediaNotif.ACTION_NEXT)
-        )
-        val dismiss = PendingIntent.getService(
-            this, 202,
-            Intent(this, BrowserMediaService::class.java).setAction(ACTION_DISMISS),
-            flags
-        )
+
+        val prevPi = svc(203, MediaNotif.ACTION_PREV)
+        val togglePi = svc(201, MediaNotif.ACTION_TOGGLE)
+        val nextPi = svc(204, MediaNotif.ACTION_NEXT)
+        val dismissPi = svc(202, ACTION_DISMISS)
 
         val s = MediaNotif.snap
         val playing = s?.playing ?: isPlaying
         val heading = mediaTitle.ifBlank { "Aurex Browser" }
         val site = mediaHost.ifBlank { "Aurex Browser" }
-        val sub = "$site · " + AppLang.translate(if (playing) "Playing" else "Paused")
-        val left: String
-        val right: String
-        when {
-            s == null -> { left = "0:00"; right = "" }
-            s.live -> { left = ""; right = AppLang.translate("Live").uppercase() }
-            else -> {
-                left = MediaNotif.fmt(s.posMs)
-                right = if (s.durMs > 0) "-" + MediaNotif.fmt(s.durMs - s.posMs) else ""
-            }
-        }
-        val night = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
-        val fresh = NotifArt.card(this, mediaUrl) { thumbReady() }
-        val card = if (NotifArt.has(mediaUrl)) { lastCard = fresh; fresh } else (lastCard ?: fresh)
-        if (scaledSrc !== card) {
-            scaledSrc = card
-            scaledSmall = Bitmap.createScaledBitmap(card, 192, 108, true)
-            scaledBig = Bitmap.createScaledBitmap(card, 384, 216, true)
-        }
-        val mui = NotifViews.MediaUi(
-            heading, sub, MediaNotif.bar(s?.frac ?: 0f, accent), left, right,
-            playing, s?.hasNext ?: true, accent, night
-        )
-        val small = NotifViews.mediaSmall(this, scaledSmall ?: card, mui, acts)
-        val big = NotifViews.mediaBig(this, scaledBig ?: card, mui, acts)
-        syncSession(scaledBig ?: card, heading, s, playing)
+        val statusSuffix = if (s?.live == true) AppLang.translate("Live").uppercase()
+            else AppLang.translate(if (playing) "Playing" else "Paused")
+        val sub = "$site · $statusSuffix"
+
+        val fresh = NotifArt.mediaArt(this, mediaUrl) { thumbReady() }
+        val art = if (NotifArt.has(mediaUrl)) { lastArt = fresh; fresh } else (lastArt ?: fresh)
+        val token = syncSession(art, heading, site, s, playing)
+
+        val prevAct = Notification.Action.Builder(
+            Icon.createWithResource(this, R.drawable.ic_media_prev),
+            AppLang.translate("Previous"),
+            prevPi
+        ).build()
+        val playPauseAct = Notification.Action.Builder(
+            Icon.createWithResource(this, if (playing) R.drawable.ic_pip_pause else R.drawable.ic_pip_play),
+            AppLang.translate(if (playing) "Pause" else "Play"),
+            togglePi
+        ).build()
+        val nextAct = Notification.Action.Builder(
+            Icon.createWithResource(this, R.drawable.ic_pip_next),
+            AppLang.translate("Next"),
+            nextPi
+        ).build()
+        val closeAct = Notification.Action.Builder(
+            Icon.createWithResource(this, R.drawable.ic_notif_close),
+            AppLang.translate("Close"),
+            dismissPi
+        ).build()
+
+        val mediaStyle = Notification.MediaStyle()
+            .setShowActionsInCompactView(0, 1, 2)
+        if (token != null) mediaStyle.setMediaSession(token)
 
         @Suppress("DEPRECATION")
         val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -468,19 +488,26 @@ class BrowserMediaService : Service() {
             Notification.Builder(this).setPriority(Notification.PRIORITY_LOW)
         }
         b.setSmallIcon(R.drawable.ic_stat_aurex)
+            .setLargeIcon(art)
             .setColor(accent)
             .setContentTitle(heading)
             .setContentText(sub)
+            .setSubText(if (s?.live == true) AppLang.translate("Live").uppercase() else null)
             .setContentIntent(open)
-            .setDeleteIntent(dismiss)
-            .setStyle(Notification.DecoratedCustomViewStyle())
-            .setCustomContentView(small)
-            .setCustomBigContentView(big)
-            .setOngoing(fgUp)                 // paused + detached: the user can swipe it away
+            .setDeleteIntent(dismissPi)
+            .addAction(prevAct)
+            .addAction(playPauseAct)
+            .addAction(nextAct)
+            .addAction(closeAct)
+            .setStyle(mediaStyle)
+            .setOngoing(fgUp)
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setCategory(Notification.CATEGORY_TRANSPORT)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            b.setColorized(true)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
         }

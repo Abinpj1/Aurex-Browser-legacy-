@@ -7,7 +7,12 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.clickable
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,6 +29,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -36,10 +42,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
+import androidx.activity.compose.BackHandler
 import androidx.core.content.FileProvider
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
@@ -90,7 +94,7 @@ object Updater {
     }
 
     private val client by lazy {
-        OkHttpClient.Builder()
+        AurexHttp.shared.newBuilder()
             .connectTimeout(12, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .build()
@@ -162,11 +166,23 @@ object Updater {
         }
         val latest = rels.first()
         val apk = latest.o.optJSONArray("assets")?.let { assets ->
+            val abis = Build.SUPPORTED_ABIS.map { it.lowercase() }
             var pick: JSONObject? = null
+            var pickScore = -1
             for (i in 0 until assets.length()) {
                 val a = assets.optJSONObject(i) ?: continue
-                if (a.optString("name").endsWith(".apk", true)) {
-                    if (pick == null || a.optString("name").contains("aurex", true)) pick = a
+                val n = a.optString("name").lowercase()
+                if (!n.endsWith(".apk")) continue
+                val abiScore = when {
+                    abis.any { it == "arm64-v8a" } && ("arm64" in n) -> 30
+                    abis.any { it == "armeabi-v7a" } && ("armeabi" in n || "v7a" in n) -> 20
+                    ("arm64" !in n && "armeabi" !in n && "x86" !in n) -> 10
+                    else -> 0
+                }
+                val score = abiScore + (if ("aurex" in n) 5 else 0)
+                if (score > pickScore) {
+                    pickScore = score
+                    pick = a
                 }
             }
             pick
@@ -392,24 +408,9 @@ fun UpdatePrompt(u: UpdateState) {
     if (!u.visible) return
     val ctx = LocalContext.current
     val force = info.force
-    // The file is ready: open the installer straight away (once per download).
     LaunchedEffect(u.phase) { if (u.phase == UpdateState.READY) u.install() }
-    Dialog(
-        onDismissRequest = { if (!force) u.snoozed = true },
-        properties = DialogProperties(
-            dismissOnBackPress = !force,
-            dismissOnClickOutside = !force,
-            usePlatformDefaultWidth = false
-        )
-    ) {
-        Box(Modifier.fillMaxSize().background(scrim(0.60f)), contentAlignment = Alignment.Center) {
-            Column(
-                Modifier
-                    .padding(24.dp)
-                    .widthIn(max = 380.dp)
-                    .liquidGlass(CardShape, 1.1f)
-                    .padding(20.dp)
-            ) {
+
+    val cardBody: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit = {
                 Text(
                     if (force) "Update required" else "Update available",
                     color = TextPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold
@@ -456,7 +457,46 @@ fun UpdatePrompt(u: UpdateState) {
                         )
                     }
                 }
-            }
-        }
+    }
+
+    val updView = androidx.compose.ui.platform.LocalView.current
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        Haptics.fire(updView, Hx.WINDOW_OPEN)
+        onDispose { Haptics.fire(updView, Hx.WINDOW_CLOSE) }
+    }
+    BackHandler(enabled = true) { if (!force) u.snoozed = true }
+    GlassLiveWindowLease(active = true)
+    val enter = remember(info) { Animatable(0f) }
+    LaunchedEffect(info) { enter.animateTo(1f, spring(dampingRatio = 0.68f, stiffness = 420f)) }
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(scrim(0.46f))
+            .clickable(remember { MutableInteractionSource() }, null) { if (!force) u.snoozed = true },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            Modifier
+                .padding(24.dp)
+                .widthIn(max = 340.dp)
+                .graphicsLayer {
+                    val p = enter.value
+                    alpha = p.coerceIn(0f, 1f)
+                    val sc = 0.90f + 0.10f * p
+                    scaleX = sc
+                    scaleY = sc
+                }
+                .liquidWindowDrag(
+                    maxPullDp = 50.dp,
+                    dismissDir = if (force) LiquidDismissDir.NONE else LiquidDismissDir.DOWN,
+                    dismissThresholdDp = 96.dp,
+                    onDismiss = if (force) null else ({ u.snoozed = true })
+                )
+                .liquidGlass(FloatingPopoverShape, 1.20f, 0.08f, reactive = false, blurProgress = { 1f })
+                .liquidEntranceSheen(info)
+                .clickable(remember { MutableInteractionSource() }, null) {}
+                .padding(20.dp),
+            content = cardBody
+        )
     }
 }

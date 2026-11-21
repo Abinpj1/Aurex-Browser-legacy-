@@ -37,6 +37,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -54,7 +55,11 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -131,63 +136,115 @@ fun MediaDockPanel(s: BrowserState, onClose: () -> Unit, onPanel: (Panel) -> Uni
     val finished by remember(all) { derivedStateOf { all.filter { it.status == DlStatus.DONE }.takeLast(2).reversed() } }
     val playing = tab?.videoActive == true
 
-    Column(Modifier.fillMaxSize()) {
-        ScreenHeader(
-            "Media",
+    val parentBackdrop = LocalGlassBackdrop.current
+    val mediaBackdrop = remember(parentBackdrop) { GlassBackdrop(parent = parentBackdrop) }
+    val liquidScroll = rememberGlassScrollState()
+    val listState = rememberLazyListState()
+    val scrolledTop by remember { derivedStateOf { listState.canScrollBackward } }
+    val density = LocalDensity.current
+    var headerPx by remember { mutableIntStateOf(0) }
+    val headerDp = if (headerPx > 0) with(density) { headerPx.toDp() } else 132.dp
+
+    Box(Modifier.fillMaxSize()) {
+        GlassBackdropHost(mediaBackdrop, Modifier.fillMaxSize()) {
             when {
-                !s.videoDownload -> "Video download is off"
-                playing -> "Now playing · ${live.count { it.status == DlStatus.RUNNING }} downloading"
-                live.isNotEmpty() -> "${live.count { it.status == DlStatus.RUNNING }} downloading"
-                else -> "${found.size} detected on this page"
-            },
-            onClose
-        ) {
-            if (s.mediaPlayerEnabled && s.videoDownload) {
-                GlassIconButton(
-                    AppleIcons.Refresh, "Rescan page",
-                    onClick = { tab?.web?.reload() }, size = 44.dp, iconSize = 19.dp, filled = false
-                )
-            }
-        }
-
-        if (!s.videoDownload) {
-            EmptyState(
-                AppleIcons.Download, "Video download is off",
-                "Pages are not scanned for videos and the downloader uses no memory. Turn it on to detect videos and save them.",
-                action = { GlassPillButton("Turn on", { s.setVideoDownload(true) }, icon = AppleIcons.Download, accent = true) }
-            )
-            return@Column
-        }
-
-        if (!playing && found.isEmpty() && all.isEmpty()) {
-            Box(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) { UniversalDownloadCard(s, tab) }
-            EmptyState(
-                AppleIcons.MusicNote, "Nothing playing or downloading",
-                "Play a video or open a page with media. Audio, HLS, DASH and video links are detected automatically."
-            )
-            return@Column
-        }
-
-        LazyColumn(
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 2.dp, bottom = 32.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            if (playing && tab != null) item("now") { NowPlayingCard(s, tab) }
-            item("save") { UniversalDownloadCard(s, tab) }
-
-            if (all.isNotEmpty()) {
-                item("dl-head") {
-                    DockSection("Downloads", if (all.size > 3) "See all" else null) { onPanel(Panel.Downloads) }
+                !s.videoDownload -> {
+                    Box(Modifier.fillMaxSize().padding(top = headerDp)) {
+                        EmptyState(
+                            AppleIcons.Download, "Video download is off",
+                            "Pages are not scanned for videos and the downloader uses no memory. Turn it on to detect videos and save them.",
+                            action = { GlassPillButton("Turn on", { s.setVideoDownload(true) }, icon = AppleIcons.Download, accent = true) }
+                        )
+                    }
                 }
-                item("dl-sum") { DownloadSummary(s, live, finished.size) }
-                items(live.take(4), key = { "l${it.id}" }) { DockDownloadRow(s, it, Modifier.animateItemPlacement()) }
-                items(finished, key = { "f${it.id}" }) { DockDownloadRow(s, it, Modifier.animateItemPlacement()) }
-            }
+                !playing && found.isEmpty() && all.isEmpty() -> {
+                    Column(Modifier.fillMaxSize().padding(top = headerDp)) {
+                        Box(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) { UniversalDownloadCard(s, tab) }
+                        EmptyState(
+                            AppleIcons.MusicNote, "Nothing playing or downloading",
+                            "Play a video or open a page with media. Audio, HLS, DASH and video links are detected automatically."
+                        )
+                    }
+                }
+                else -> {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize().liquidOverscrollJelly().liquidScrollTrack(liquidScroll),
+                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = headerDp + 4.dp, bottom = 44.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        if (playing) item("now") {
+                            Box(Modifier.liquidScrollCard(liquidScroll)) { NowPlayingCard(s, tab) }
+                        }
+                        item("save") {
+                            Box(Modifier.liquidScrollCard(liquidScroll)) { UniversalDownloadCard(s, tab) }
+                        }
 
-            if (found.isNotEmpty() && s.mediaPlayerEnabled && tab != null) {
-                item("found-head") { DockSection("On this page", null) {} }
-                items(found.take(12), key = { "m$it" }) { url -> DetectedRow(s, tab, url, Modifier.animateItemPlacement()) }
+                        if (all.isNotEmpty()) {
+                            item("dl-head") {
+                                DockSection("Downloads", if (all.size > 3) "See all" else null) { onPanel(Panel.Downloads) }
+                            }
+                            item("dl-sum") {
+                                Box(Modifier.liquidScrollCard(liquidScroll)) { DownloadSummary(s, live, finished.size) }
+                            }
+                            items(live.take(4), key = { "l${it.id}" }) {
+                                DockDownloadRow(s, it, Modifier.animateItem().liquidScrollCard(liquidScroll, 0.025f, 1.8f))
+                            }
+                            items(finished, key = { "f${it.id}" }) {
+                                DockDownloadRow(s, it, Modifier.animateItem().liquidScrollCard(liquidScroll, 0.025f, 1.8f))
+                            }
+                        }
+
+                        if (found.isNotEmpty() && s.mediaPlayerEnabled && tab != null) {
+                            item("found-head") { DockSection("On this page", null) {} }
+                            items(found.take(12), key = { "m$it" }) { url ->
+                                DetectedRow(s, tab, url, Modifier.animateItem().liquidScrollCard(liquidScroll, 0.025f, 1.8f))
+                            }
+                        }
+                    }
+                }
             }
+        }
+
+        androidx.compose.runtime.CompositionLocalProvider(LocalGlassBackdrop provides mediaBackdrop) {
+            ScrollEdgeBlur(
+                isTop = true,
+                active = scrolledTop,
+                height = headerDp + 16.dp,
+                strength = 0.94f,
+                modifier = Modifier.align(Alignment.TopCenter)
+            )
+            Box(
+                Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .onSizeChanged { headerPx = it.height }
+            ) {
+                ScreenHeader(
+                    "Media",
+                    when {
+                        !s.videoDownload -> "Video download is off"
+                        playing -> "Now playing · ${live.count { it.status == DlStatus.RUNNING }} downloading"
+                        live.isNotEmpty() -> "${live.count { it.status == DlStatus.RUNNING }} downloading"
+                        else -> "${found.size} detected on this page"
+                    },
+                    onClose
+                ) {
+                    if (s.mediaPlayerEnabled && s.videoDownload) {
+                        GlassIconButton(
+                            AppleIcons.Refresh, "Rescan page",
+                            onClick = { tab?.web?.reload() }, size = 44.dp, iconSize = 19.dp, filled = false
+                        )
+                    }
+                }
+            }
+            ScrollEdgeBlur(
+                isTop = false,
+                active = true,
+                height = 52.dp,
+                strength = 0.65f,
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
         }
     }
 }
@@ -252,12 +309,12 @@ private fun NowPlayingCard(s: BrowserState, tab: Tab) {
     Column(
         Modifier
             .fillMaxWidth()
-            .liquidGlass(CardShape, 1.25f, 0.04f)
+            .liquidGlass(CardShape, 1.25f, 0.04f, reactive = true)
             .drawBehind {
                 // soft accent bloom behind the artwork: the card "lights up" while it plays
                 drawCircle(
                     Brush.radialGradient(
-                        listOf(accent.copy(alpha = glow.value), Color.Transparent),
+                        listOf(accent.copy(alpha = glow.value.coerceIn(0f, 1f)), Color.Transparent),
                         center = Offset(size.width * 0.14f, size.height * 0.10f),
                         radius = size.width * 0.75f
                     ),
@@ -331,8 +388,8 @@ private fun NowPlayingCard(s: BrowserState, tab: Tab) {
                     tab.pageJs("p.setPlay($next)")
                     info = i?.let { PvInfo(it.t, it.d, next, it.rate, it.ad, it.buffering) }
                 },
-                modifier = Modifier.size(68.dp).background(accent, CircleShape),
-                shape = CircleShape, haptic = false
+                modifier = Modifier.size(68.dp).tintedGlass(CircleShape, accent, swell = 0.08f),
+                shape = CircleShape, haptic = false, glassBody = true
             ) {
                 Crossfade(isPlaying, animationSpec = tween(120), label = "npPP") { on ->
                     Icon(
@@ -371,7 +428,7 @@ private fun NowPlayingCard(s: BrowserState, tab: Tab) {
 @Composable
 private fun SkipButton(forward: Boolean, enabled: Boolean, onClick: () -> Unit) {
     val view = LocalView.current
-    GlowPress({ performPress(view); onClick() }, Modifier.size(52.dp), CircleShape, enabled = enabled, haptic = false) {
+    GlowPress(onClick, Modifier.size(52.dp), CircleShape, enabled = enabled, haptic = true) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (!forward) Icon(AppleIcons.ArrowBack, "Back 10 seconds", tint = TextPrimary, modifier = Modifier.size(17.dp))
             Text("10", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, style = DockNum)
@@ -475,7 +532,7 @@ private fun DownloadSummary(s: BrowserState, live: List<DlItem>, doneCount: Int)
     val ringColor = if (live.isEmpty()) Good else accent
 
     Row(
-        Modifier.fillMaxWidth().liquidGlass(CardShape, 1f).padding(horizontal = 16.dp, vertical = 14.dp),
+        Modifier.fillMaxWidth().liquidGlass(CardShape, 1f, reactive = true).padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(Modifier.size(58.dp), contentAlignment = Alignment.Center) {
@@ -548,7 +605,7 @@ private fun DockDownloadRow(s: BrowserState, d: DlItem, modifier: Modifier = Mod
         modifier
             .fillMaxWidth()
             .animateContentSize(spring(dampingRatio = 0.85f, stiffness = 500f))
-            .groupedSurface(TileShape)
+            .groupedSurface(TileShape, reactive = true)
             .then(
                 if (done) Modifier.clickableHaptic {
                     if (d.file.exists() && MediaTools.isPlayable(d.file))
@@ -622,7 +679,7 @@ private fun DetectedRow(s: BrowserState, tab: Tab, url: String, modifier: Modifi
     val tint = if (audio) MusicRed else VideoPurple
     val file = url.substringBefore('?').substringAfterLast('/').ifBlank { hostOf(url) }
     Row(
-        modifier.fillMaxWidth().groupedSurface(TileShape).padding(horizontal = 14.dp, vertical = 12.dp),
+        modifier.fillMaxWidth().groupedSurface(TileShape, reactive = true).padding(horizontal = 14.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(Modifier.size(48.dp).glassTile(RoundedCornerShape(13.dp), 0.14f, tint), contentAlignment = Alignment.Center) {

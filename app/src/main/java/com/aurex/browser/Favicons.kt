@@ -5,7 +5,6 @@ import android.graphics.BitmapFactory
 import android.util.LruCache
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -13,21 +12,68 @@ import java.util.concurrent.TimeUnit
 /**
  * Real website icons with a three-tier cache: memory, disk, network.
  * Network order: origin favicon.ico -> DuckDuckGo -> Google s2.
+ * All decoded bitmaps are bounded to <= 96x96 px (~36 KB max) and trimmed automatically on memory pressure.
  */
 object Favicons {
+    private const val MAX_ICON_PX = 96
     private val memory = LruCache<String, Bitmap>(160)
     private val failed = java.util.Collections.synchronizedSet(mutableSetOf<String>())
-    private val client = OkHttpClient.Builder()
+    private val client by lazy { AurexHttp.shared.newBuilder()
         .followRedirects(true)
         .followSslRedirects(true)
         .connectTimeout(6, TimeUnit.SECONDS)
         .readTimeout(8, TimeUnit.SECONDS)
-        .build()
+        .build() }
 
     private fun key(host: String): String =
         host.lowercase().removePrefix("www.").substringBefore(':').trim('.', ' ')
 
+    private fun maxEntries(): Int = when (PerfTier.tier) {
+        PerfTier.TIER_LOW -> 40
+        PerfTier.TIER_BALANCED -> 90
+        else -> 160
+    }
+
+    private fun putMemory(h: String, bmp: Bitmap) {
+        memory.put(h, bmp)
+        val cap = maxEntries()
+        if (memory.size() > cap) memory.trimToSize(cap)
+    }
+
+    fun trim(aggressive: Boolean = false) {
+        if (aggressive) {
+            memory.evictAll()
+            failed.clear()
+        } else {
+            memory.trimToSize(maxEntries() / 2)
+        }
+    }
+
     fun cached(host: String): Bitmap? = memory.get(key(host))
+
+    private fun decodeBounded(bytes: ByteArray): Bitmap? {
+        if (bytes.isEmpty()) return null
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val w = bounds.outWidth
+        val h = bounds.outHeight
+        if (w <= 0 || h <= 0) return null
+        var sample = 1
+        while (w / (sample * 2) >= MAX_ICON_PX && h / (sample * 2) >= MAX_ICON_PX) {
+            sample *= 2
+        }
+        val opts = BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
+        val maxSide = maxOf(bmp.width, bmp.height)
+        if (maxSide <= MAX_ICON_PX) return bmp
+        val scale = MAX_ICON_PX.toFloat() / maxSide.toFloat()
+        val sw = (bmp.width * scale).toInt().coerceAtLeast(1)
+        val sh = (bmp.height * scale).toInt().coerceAtLeast(1)
+        return runCatching { Bitmap.createScaledBitmap(bmp, sw, sh, true) }.getOrDefault(bmp)
+    }
 
     suspend fun load(context: android.content.Context, host: String): Bitmap? {
         val h = key(host)
@@ -38,9 +84,9 @@ object Favicons {
             memory.get(h)?.let { return@withContext it }
             val disk = File(context.cacheDir, "favicon_${h.hashCode()}.img")
             if (disk.exists()) {
-                val bmp = runCatching { BitmapFactory.decodeFile(disk.absolutePath) }.getOrNull()
+                val bmp = runCatching { decodeBounded(disk.readBytes()) }.getOrNull()
                 if (bmp != null) {
-                    memory.put(h, bmp)
+                    putMemory(h, bmp)
                     return@withContext bmp
                 }
             }
@@ -52,10 +98,10 @@ object Favicons {
             for (url in sources) {
                 val bmp = fetch(url)
                 if (bmp != null) {
-                    memory.put(h, bmp)
+                    putMemory(h, bmp)
                     runCatching {
                         disk.outputStream().use { out ->
-                            bmp.compress(Bitmap.CompressFormat.PNG, 90, out)
+                            bmp.compress(Bitmap.CompressFormat.PNG, 85, out)
                         }
                     }
                     return@withContext bmp
@@ -77,12 +123,10 @@ object Favicons {
                 if (!r.isSuccessful) return@use null
                 val body = r.body ?: return@use null
                 if (body.contentLength() > 2_000_000L) return@use null
-                body.byteStream().use { input ->
-                    val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
-                    BitmapFactory.decodeStream(input, null, opts)
-                }
+                val bytes = body.bytes()
+                if (bytes.size > 2_000_000) return@use null
+                decodeBounded(bytes)
             }
         }.getOrNull()
     }
-
 }

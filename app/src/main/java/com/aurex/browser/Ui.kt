@@ -5,7 +5,9 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.Animatable
 import androidx.compose.runtime.derivedStateOf
@@ -21,6 +23,8 @@ import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -51,22 +55,6 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Article
-import androidx.compose.material.icons.filled.DesktopWindows
-import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.ErrorOutline
-import androidx.compose.material.icons.filled.History
-import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.automirrored.filled.Article
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -94,6 +82,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
@@ -123,6 +112,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import kotlin.math.abs
+import android.os.Build
 
 enum class Panel { Tabs, Bookmarks, History, Downloads, Media, Settings }
 
@@ -243,28 +233,106 @@ fun MainScreen(s: BrowserState) {
         }
     }
 
+    val pageBackdrop = remember { GlassBackdrop() }
+    val uiCopyHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
+    // Never allow 3-dot Menu and Download Quality Sheet to overlap or fight over touches!
+    LaunchedEffect(s.qualityPrompt) {
+        if (s.qualityPrompt != null && menu) menu = false
+    }
+    LaunchedEffect(menu) {
+        if (menu && s.qualityPrompt != null) s.qualityPrompt = null
+    }
+
+    val anyWebWindowOpen = menu || s.qualityPrompt != null || findOpen || s.jsDialog != null || s.screenshot != null || (s.update.visible && s.update.info != null)
+    val webCopyPool = remember { arrayOfNulls<android.graphics.Bitmap>(2) }
+    var webCopySlot by remember { mutableIntStateOf(0) }
+
+    // While a floating window is open over a webpage playing video (YouTube, Shorts, Reels):
+    // continuously copy ONLY the unobstructed video region (strictly OUTSIDE the floating window -> 0 feedback!)
+    // so the blurred Liquid Glass live-pulses & moves in real time with the playing video!
+    LaunchedEffect(anyWebWindowOpen, tab.videoPlaying, tab.isHome) {
+        if (!anyWebWindowOpen || tab.isHome || !tab.videoPlaying || PerfTier.low || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            if (pageBackdrop.ambientBitmap != null) pageBackdrop.setAmbientVideoFrame(null)
+            return@LaunchedEffect
+        }
+        val win = act?.window ?: return@LaunchedEffect
+        val decor = win.decorView
+        val intervalMs = if (PerfTier.balanced) 340L else 220L
+        var inFlight = false
+        while (true) {
+            val vw = decor.width
+            val vh = decor.height
+            if (!inFlight && vw > 64 && vh > 64) {
+                runCatching {
+                    // Unobstructed top video zone (portrait YouTube) or left half (landscape): never overlaps right-bottom popover!
+                    val srcRect = if (vh >= vw) {
+                        android.graphics.Rect(0, (vh * 0.08f).toInt(), vw, (vh * 0.42f).toInt())
+                    } else {
+                        android.graphics.Rect(0, 0, (vw * 0.52f).toInt(), vh)
+                    }
+                    val bw = 120
+                    val bh = 80
+                    val slot = webCopySlot and 1
+                    webCopySlot = slot xor 1
+                    val existing = webCopyPool[slot]
+                    val bmp = if (existing != null && !existing.isRecycled && existing.width == bw && existing.height == bh) {
+                        existing
+                    } else {
+                        android.graphics.Bitmap.createBitmap(bw, bh, android.graphics.Bitmap.Config.RGB_565).also { webCopyPool[slot] = it }
+                    }
+                    inFlight = true
+                    android.view.PixelCopy.request(win, srcRect, bmp, { res ->
+                        inFlight = false
+                        if (res == android.view.PixelCopy.SUCCESS) {
+                            pageBackdrop.setAmbientVideoFrame(bmp)
+                        }
+                    }, uiCopyHandler)
+                }.onFailure { inFlight = false }
+            }
+            delay(intervalMs)
+        }
+    }
+
+    androidx.compose.runtime.CompositionLocalProvider(
+        LocalGlassBackdrop provides pageBackdrop
+    ) {
     Box(Modifier.fillMaxSize()) {
-        // PiP window: a plain black surface, no animated backdrop competing with the video.
-        if (s.bare) Box(Modifier.fillMaxSize().background(Color.Black)) else AppBackground()
+        if (!s.bare && tab.isHome) {
+            AppBackground()
+        } else {
+            Box(Modifier.fillMaxSize().background(if (s.bare || LocalPalette.current.dark) Color.Black else LocalPalette.current.bg))
+        }
 
         Box(Modifier.fillMaxSize()) {
-            // Current page + (while swiping) its neighbour, each a card. They are keyed by
-            // tab id so a page keeps the very same WebView host when it changes role —
-            // no re-parenting at the end of the swipe, which is what used to blink.
-            val neighbour = if (dragSign != 0 && s.tabs.size > 1)
-                s.tabs[(s.current + (if (dragSign > 0) -1 else 1) + s.tabs.size) % s.tabs.size]
-            else null
-            for (page in listOfNotNull(tab, neighbour).distinct()) {
-                key(page.id) {
-                    LaunchedEffect(page.id) { s.ensureLoaded(page) }
-                    PageCard(
-                        s = s,
-                        page = page,
-                        isCurrent = page.id == tab.id,
-                        onSearch = { editing = true },
-                        onPanel = openPanel,
-                        onMenu = { menu = true }
-                    )
+            // Live backdrop source: captures WebView webpages AND HomePage into a GPU RenderNode
+            // so floating Liquid Glass chrome (toolbar, menu, FAB, quality sheet) blurs & refracts live.
+            GlassBackdropHost(
+                backdrop = pageBackdrop,
+                modifier = Modifier.fillMaxSize(),
+                enabled = !s.bare && panel == null && s.fullscreen == null && s.shotSession == null
+            ) {
+                androidx.compose.runtime.CompositionLocalProvider(LocalGlassBackdrop provides null) {
+                    // Current page + (while swiping) its neighbour, each a card. They are keyed by
+                    // tab id so a page keeps the very same WebView host when it changes role —
+                    // no re-parenting at the end of the swipe, which is what used to blink.
+                    val neighbour = if (dragSign != 0 && s.tabs.size > 1)
+                        s.tabs[(s.current + (if (dragSign > 0) -1 else 1) + s.tabs.size) % s.tabs.size]
+                    else null
+                    for (page in listOfNotNull(tab, neighbour).distinct()) {
+                        key(page.id) {
+                            LaunchedEffect(page.id) { s.ensureLoaded(page) }
+                            PageCard(
+                                s = s,
+                                page = page,
+                                isCurrent = page.id == tab.id,
+                                swiping = dragSign != 0,
+                                liveBackdrop = if (page.id == tab.id && !page.isHome && page.error == null && panel == null && !s.bare && s.fullscreen == null && s.shotSession == null) pageBackdrop else null,
+                                onSearch = { editing = true },
+                                onPanel = openPanel,
+                                onMenu = { menu = true }
+                            )
+                        }
+                    }
                 }
             }
 
@@ -299,6 +367,13 @@ fun MainScreen(s: BrowserState) {
                     )
                 }
                 if (s.barTop) {
+                    ScrollEdgeBlur(
+                        isTop = true,
+                        active = !tab.isHome && s.shotSession == null && s.fullscreen == null && (s.barVisible || editing),
+                        height = 44.dp,
+                        strength = 0.28f,
+                        modifier = Modifier.align(Alignment.TopCenter)
+                    )
                     Box(
                         Modifier
                             .align(Alignment.TopCenter)
@@ -307,6 +382,13 @@ fun MainScreen(s: BrowserState) {
                             .imePadding()
                     ) { chrome() }
                 } else {
+                    ScrollEdgeBlur(
+                        isTop = false,
+                        active = !tab.isHome && s.shotSession == null && s.fullscreen == null,
+                        height = 44.dp,
+                        strength = if (s.barVisible || editing || s.toolbarLocked) 0.26f else 0.14f,
+                        modifier = Modifier.align(Alignment.BottomCenter)
+                    )
                     Box(
                         Modifier
                             .align(Alignment.BottomCenter)
@@ -330,26 +412,27 @@ fun MainScreen(s: BrowserState) {
             // (fading and shrinking a little, exactly like the bar) and come back up with it.
             val fabBottom = if (s.barTop) 18.dp else toolbarFootprint(s.toolbarRows) + 20.dp
             val chromeHidden = !s.barVisible && !s.toolbarLocked && !tab.isHome && !editing
-            val fabShow by animateFloatAsState(
+            val fabShowState = animateFloatAsState(
                 if (chromeHidden) 0f else 1f,
                 spring(dampingRatio = 0.82f, stiffness = 420f),
                 label = "mediaFabWithBar"
             )
+            val fabShown by remember { derivedStateOf { fabShowState.value > 0.04f } }
             AnimatedVisibility(
                 visible = (s.mediaFab || (s.downloadFab && s.videoDownload)) &&
                     tabShowsVideo(tab) && !tab.isHome && !s.bare &&
                     s.fullscreen == null &&
-                    s.qualityPrompt == null,      // hidden while the quality sheet is open
+                    s.qualityPrompt == null && !menu && (!chromeHidden || fabShown),
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .navigationBarsPadding()
                     .padding(end = 14.dp, bottom = fabBottom)
                     .graphicsLayer {
-                        // Far enough to leave the screen: its own offset above the bottom + the button + the system bar.
-                        translationY = (1f - fabShow) * (fabBottom + 110.dp).toPx()
-                        alpha = fabShow.coerceIn(0f, 1f)
-                        scaleX = 0.92f + 0.08f * fabShow
-                        scaleY = 0.92f + 0.08f * fabShow
+                        val f = fabShowState.value
+                        translationY = (1f - f) * (fabBottom + 110.dp).toPx()
+                        alpha = f.coerceIn(0f, 1f)
+                        scaleX = 0.92f + 0.08f * f
+                        scaleY = 0.92f + 0.08f * f
                         transformOrigin = TransformOrigin(1f, 1f)
                     },
                 enter = fadeIn(tween(180)) + slideInVertically { it / 2 } + scaleIn(initialScale = 0.82f),
@@ -375,12 +458,9 @@ fun MainScreen(s: BrowserState) {
 
         // Right-side fluid three-dot drawer
         // (not composed at all while PiP starts / is open: removed at once, no exit animation inside the PiP window)
-        if (overlaysOn) AnimatedVisibility(
-            visible = menu,
-            enter = fadeIn(tween(170)),
-            exit = fadeOut(tween(160))
-        ) {
+        if (overlaysOn) {
             BrowserMenu(
+                visible = menu,
                 s = s,
                 tab = tab,
                 onDismiss = { menu = false },
@@ -389,18 +469,30 @@ fun MainScreen(s: BrowserState) {
             )
         }
 
-        // Full screen panels — Apple sheet spring: rises from below with
-        // a soft overshoot (dampingRatio 0.84) then settles; exits quick.
+        // Window bloom + collapse haptics for every full-screen panel (Tabs, Bookmarks, History, Downloads, Media, Settings)
+        val panelView = LocalView.current
+        var prevPanelOpen by remember { mutableStateOf(false) }
+        val isPanelOpen = panel != null
+        LaunchedEffect(isPanelOpen) {
+            if (isPanelOpen && !prevPanelOpen) Haptics.fire(panelView, Hx.WINDOW_OPEN)
+            else if (!isPanelOpen && prevPanelOpen) Haptics.fire(panelView, Hx.WINDOW_CLOSE)
+            prevPanelOpen = isPanelOpen
+        }
+
+        // Full screen panels — ultra-snappy spring enter + 95ms exit with Frame-0 touch pass-through!
         if (overlaysOn) AnimatedVisibility(
-            visible = panel != null,
-            enter = slideInVertically(spring(dampingRatio = 0.84f, stiffness = 420f)) { it / 5 } +
-                fadeIn(tween(160)) +
-                scaleIn(initialScale = 0.97f, animationSpec = spring(dampingRatio = 0.84f, stiffness = 420f)),
-            exit  = slideOutVertically(spring(dampingRatio = 1f, stiffness = 600f)) { it / 8 } +
-                fadeOut(tween(150)) +
-                scaleOut(targetScale = 0.98f, animationSpec = tween(150))
+            visible = isPanelOpen,
+            enter = if (PerfTier.low) fadeIn(tween(95))
+                    else slideInVertically(spring(dampingRatio = 0.86f, stiffness = 580f)) { it / 6 } +
+                        fadeIn(tween(115)) +
+                        scaleIn(initialScale = 0.98f, animationSpec = spring(dampingRatio = 0.86f, stiffness = 580f)),
+            exit  = if (PerfTier.low) fadeOut(tween(75))
+                    else slideOutVertically(tween(95)) { it / 10 } +
+                        fadeOut(tween(95))
         ) {
-            PanelHost(s = s, panel = shownPanel, onClose = { panel = null }, onPanel = { panel = it })
+            androidx.compose.runtime.CompositionLocalProvider(LocalWindowInteractive provides isPanelOpen) {
+                PanelHost(s = s, panel = shownPanel, onClose = { panel = null }, onPanel = { panel = it })
+            }
         }
 
         // Snackbar: drawn AFTER the full-screen panels so toasts (e.g. "Link copied") show on top of them
@@ -422,7 +514,13 @@ fun MainScreen(s: BrowserState) {
         ) {
             Row(
                 Modifier
-                    .liquidGlass(Capsule, 1.1f)
+                    .liquidWindowDrag(
+                        maxPullDp = 42.dp,
+                        dismissDir = LiquidDismissDir.ANY,
+                        dismissThresholdDp = 58.dp,
+                        onDismiss = { s.snack = null }
+                    )
+                    .liquidGlass(Capsule, 1.12f, reactive = true)
                     .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -476,8 +574,12 @@ fun MainScreen(s: BrowserState) {
             )
         }
 
+        // Update prompt rendered in-tree so it live-renders & refracts the exact screen behind it!
+        UpdatePrompt(s.update)
+
         // Private tab lock: drawn last, so nothing of a private tab shows (or can be tapped) before the phone lock.
         PrivateLockCover(s)
+    }
     }
 }
 
@@ -489,10 +591,10 @@ private fun PrivateLockCover(s: BrowserState) {
         if (locked) s.requirePrivate(onCancel = { s.leavePrivate() }) { }
     }
     if (!locked) return
+    val lockBackdrop = remember { GlassBackdrop() }
     Box(
         Modifier
             .fillMaxSize()
-            .background(LocalPalette.current.bg)
             // Swallows every touch so the page underneath can't be used while locked.
             .pointerInput(Unit) {
                 awaitPointerEventScope {
@@ -501,30 +603,39 @@ private fun PrivateLockCover(s: BrowserState) {
             },
         contentAlignment = Alignment.Center
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
-            Icon(AppleIcons.Incognito, null, tint = Color(0xFFBF5AF2), modifier = Modifier.size(56.dp))
-            Spacer(Modifier.height(16.dp))
-            Text("Private tabs are locked", color = TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(6.dp))
-            Text("Use your phone lock to continue", color = TextSecondary, fontSize = 13.sp)
-            Spacer(Modifier.height(24.dp))
-            Text(
-                "Unlock",
-                color = LocalGlassStyle.current.accent,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.SemiBold,
+        AppBackground()
+        androidx.compose.runtime.CompositionLocalProvider(
+            LocalGlassBackdrop provides lockBackdrop
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
-                    .clickableHaptic { s.requirePrivate(onCancel = { s.leavePrivate() }) { } }
-                    .padding(horizontal = 24.dp, vertical = 10.dp)
-            )
-            Text(
-                "Back to normal tabs",
-                color = TextSecondary,
-                fontSize = 14.sp,
-                modifier = Modifier
-                    .clickableHaptic { s.cancelPrivateUnlock() }
-                    .padding(horizontal = 24.dp, vertical = 10.dp)
-            )
+                    .padding(horizontal = 28.dp)
+                    .widthIn(max = 360.dp)
+                    .liquidWindowDrag(maxPullDp = 44.dp)
+                    .liquidGlass(CardShape, 1.2f, 0.04f, reactive = false)
+                    .padding(horizontal = 28.dp, vertical = 30.dp)
+            ) {
+                Box(
+                    Modifier.size(76.dp).liquidGlass(CircleShape, 0.95f, reactive = true),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(AppleIcons.Incognito, null, tint = Color(0xFFBF5AF2), modifier = Modifier.size(40.dp))
+                }
+                Spacer(Modifier.height(16.dp))
+                Text("Private tabs are locked", color = TextPrimary, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                Text("Use your phone lock to continue", color = TextSecondary, fontSize = 13.sp)
+                Spacer(Modifier.height(22.dp))
+                GlassPillButton(
+                    "Unlock",
+                    onClick = { s.requirePrivate(onCancel = { s.leavePrivate() }) { } },
+                    icon = AppleIcons.LockOpen,
+                    accent = true
+                )
+                Spacer(Modifier.height(10.dp))
+                GlassPillButton("Back to normal tabs", onClick = { s.cancelPrivateUnlock() })
+            }
         }
     }
 }
@@ -542,6 +653,8 @@ private fun PageCard(
     s: BrowserState,
     page: Tab,
     isCurrent: Boolean,
+    swiping: Boolean = false,
+    liveBackdrop: GlassBackdrop? = null,
     onSearch: () -> Unit,
     onPanel: (Panel) -> Unit,
     onMenu: () -> Unit
@@ -564,18 +677,21 @@ private fun PageCard(
                 shape = RoundedCornerShape(PageCardRadius.toPx() * minOf(1f, f * 6f))
             }
     ) {
-        // Home pages are transparent over the backdrop; give the card its own so the
-        // page underneath never shows through.
-        if (page.isHome) AppBackground()
+        val cardBgBackdrop = if (page.isHome) remember { GlassBackdrop() } else null
+        // Only paint opaque card backdrop while swiping between tabs so normal resting HomePage stays 0 Hz idle!
+        if (page.isHome && (!isCurrent || swiping)) {
+            AppBackground()
+        }
         WebHost(
             tab = page,
             alpha = if (page.isHome) 0f else 1f,
-            // Always the same modifier: the PiP window has no status-bar inset (padding = 0), and
-            // flipping it on return made the page jump by the status-bar height (second relayout).
+            liveBackdrop = liveBackdrop,
             modifier = Modifier.statusBarsPadding()
         )
-        if (page.isHome) {
-            HomePage(s = s, tab = page, onSearch = onSearch, onPanel = onPanel, onMenu = onMenu)
+        if (page.isHome && cardBgBackdrop != null) {
+            androidx.compose.runtime.CompositionLocalProvider(LocalGlassBackdrop provides cardBgBackdrop) {
+                HomePage(s = s, tab = page, onSearch = onSearch, onPanel = onPanel, onMenu = onMenu)
+            }
         }
         if (page.error != null && !page.isHome) {
             ErrorPage(
@@ -598,7 +714,27 @@ private fun PageCard(
 }
 
 @Composable
-private fun WebHost(tab: Tab, alpha: Float, modifier: Modifier = Modifier) {
+private fun WebHost(
+    tab: Tab,
+    alpha: Float,
+    liveBackdrop: GlassBackdrop? = null,
+    modifier: Modifier = Modifier
+) {
+    val clearBg = LocalPalette.current.bg.toArgb()
+    androidx.compose.runtime.DisposableEffect(liveBackdrop, tab.web, alpha, clearBg) {
+        val aw = tab.web as? AurexWebView
+        if (liveBackdrop != null && alpha > 0f && aw != null) {
+            liveBackdrop.attachWebView(aw, clearBg)
+            aw.onBackdropDirty = { settleOnly -> liveBackdrop.scheduleWebSnapshot(settleOnly = settleOnly) }
+        } else {
+            aw?.onBackdropDirty = null
+            liveBackdrop?.attachWebView(null)
+        }
+        onDispose {
+            (tab.web as? AurexWebView)?.onBackdropDirty = null
+            liveBackdrop?.attachWebView(null)
+        }
+    }
     key(tab.id) {
         AndroidView(
             factory = { ctx ->
@@ -609,11 +745,16 @@ private fun WebHost(tab: Tab, alpha: Float, modifier: Modifier = Modifier) {
                 .graphicsLayer { this.alpha = alpha },
             update = { fl ->
                 fl.visibility = if (alpha == 0f) View.GONE else View.VISIBLE
-                val w = tab.web ?: return@AndroidView
+                val w = tab.web
+                if (w == null) { fl.removeAllViews(); return@AndroidView }
                 if (fl.getChildAt(0) !== w) {
                     fl.removeAllViews()
                     (w.parent as? ViewGroup)?.removeView(w)
                     fl.addView(w, ViewGroup.LayoutParams(-1, -1))
+                }
+                if (liveBackdrop != null && alpha > 0f) {
+                    liveBackdrop.attachWebView(w, clearBg)
+                    (w as? AurexWebView)?.onBackdropDirty = { settleOnly -> liveBackdrop.scheduleWebSnapshot(settleOnly = settleOnly) }
                 }
             }
         )
@@ -835,16 +976,25 @@ private fun BrowserChrome(
             else TextFieldValue("")
         )
     }
+    val view = LocalView.current
     val hidden = !s.barVisible && !s.toolbarLocked && !tab.isHome && !editing
+    val showCompactPill = hidden && s.shotSession == null && s.fullscreen == null
     val barHeight = if (s.toolbarRows == 1) ToolbarDoubleHeight else ToolbarBarHeight
 
-    // The bar leaves the screen completely — no capsule, no invisible tap target.
-    // Spring tuned for smooth 60-fps hide on scroll, snappy show on tap.
-    val visibleAnim by animateFloatAsState(
+    // Apple iOS 26 Safari spring: full floating bar recedes into an ultra-compact frosted domain
+    // capsule while scrolling down, then fluidly expands back on scroll-up or tap.
+    val visibleAnimState = animateFloatAsState(
         if (hidden) 0f else 1f,
-        spring(dampingRatio = 0.82f, stiffness = 420f),
+        spring(dampingRatio = 0.82f, stiffness = 580f),
         label = "chromeVisibility"
     )
+    val compactAnimState = animateFloatAsState(
+        if (showCompactPill) 1f else 0f,
+        spring(dampingRatio = 0.82f, stiffness = 580f),
+        label = "compactPill"
+    )
+    val showFullBar by remember { derivedStateOf { visibleAnimState.value > 0.01f } }
+    val showCompact by remember { derivedStateOf { compactAnimState.value > 0.02f } }
 
     LaunchedEffect(editing, tab.id) {
         if (editing) {
@@ -862,75 +1012,125 @@ private fun BrowserChrome(
         keyboard?.hide()
     }
 
-    Box(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 8.dp, vertical = 5.dp)
-            .graphicsLayer {
-                alpha = visibleAnim
-                translationY = (if (s.barTop) -1f else 1f) * (1f - visibleAnim) * (barHeight + 40.dp).toPx()
-                scaleX = 0.94f + 0.06f * visibleAnim
-                scaleY = 0.92f + 0.08f * visibleAnim
-                transformOrigin = TransformOrigin(0.5f, if (s.barTop) 0f else 1f)
-            },
-        contentAlignment = Alignment.Center
-    ) {
-        if (editing) {
+    Box(Modifier.fillMaxWidth(), contentAlignment = if (s.barTop) Alignment.TopCenter else Alignment.BottomCenter) {
+        if (showCompact) {
             Row(
                 Modifier
-                    .fillMaxWidth()
-                    .height(54.dp)
-                    .liquidGlassBar(Capsule)
-                    .padding(horizontal = 6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                SafariButton(
-                    SafariGlyph.Close, "Cancel editing",
-                    onClick = { onEditing(false); keyboard?.hide() },
-                    size = 38.dp, glyphSize = 17.dp
-                )
-                BasicTextField(
-                    value = field,
-                    onValueChange = { field = it },
-                    singleLine = true,
-                    textStyle = TextStyle(color = TextPrimary, fontSize = 13.5.sp),
-                    cursorBrush = SolidColor(style.accent),
-                    keyboardOptions = KeyboardOptions(
-                        imeAction = ImeAction.Go,
-                        keyboardType = KeyboardType.Uri
-                    ),
-                    keyboardActions = KeyboardActions(onGo = { submit() }),
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(horizontal = 9.dp)
-                        .focusRequester(focus),
-                    decorationBox = { inner ->
-                        Box {
-                            if (field.text.isEmpty()) {
-                                Text("Search or enter address", color = TextTertiary, fontSize = 13.5.sp)
-                            }
-                            inner()
-                        }
+                    .padding(bottom = if (s.barTop) 0.dp else 4.dp, top = if (s.barTop) 4.dp else 0.dp)
+                    .graphicsLayer {
+                        val v = compactAnimState.value
+                        val c = v.coerceIn(0f, 1f)
+                        alpha = c
+                        val sc = 0.78f + 0.22f * v
+                        scaleX = sc
+                        scaleY = sc
+                        translationY = (if (s.barTop) -1f else 1f) * (1f - c) * 14.dp.toPx()
+                        transformOrigin = TransformOrigin(0.5f, if (s.barTop) 0f else 1f)
                     }
+                    .height(32.dp)
+                    .widthIn(min = 110.dp, max = 210.dp)
+                    .liquidGlass(Capsule, 1.05f, 0f, reactive = false, blurProgress = { 1f })
+                    .clickableHaptic {
+                        s.barVisible = true
+                    }
+                    .padding(horizontal = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                if (tab.url.startsWith("https://")) {
+                    SafariGlyph(SafariGlyph.Lock, size = 11.dp, tint = GoodText)
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(
+                    hostOf(tab.url).ifBlank { prettyUrl(tab.url) },
+                    color = TextPrimary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
-                // The "Go" pill became a glass search button — adaptive accent,
-                // same liquid language as the rest of the chrome.
-                GlassIconButton(
-                    AppleIcons.Search, "Search",
-                    onClick = { submit() },
-                    size = 38.dp, iconSize = 19.dp, filled = false, accent = true
-                )
-                Spacer(Modifier.width(4.dp))
             }
-        } else {
-            ToolbarBar(
-                s = s,
-                tab = tab,
-                rows = s.toolbarRows,
-                onLinkTap = { onEditing(true) },
-                onPanel = onPanel,
-                onMenu = onMenu
-            )
+        }
+
+        if (showFullBar || editing) Box(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 5.dp)
+                .graphicsLayer {
+                    val v = visibleAnimState.value
+                    val c = v.coerceIn(0f, 1f)
+                    alpha = c
+                    translationY = (if (s.barTop) -1f else 1f) * (1f - c) * (barHeight + 36.dp).toPx()
+                    scaleX = 0.86f + 0.14f * v
+                    scaleY = 0.84f + 0.16f * v
+                    transformOrigin = TransformOrigin(0.5f, if (s.barTop) 0f else 1f)
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            AnimatedContent(
+                targetState = editing,
+                transitionSpec = {
+                    (fadeIn(tween(180)) + scaleIn(spring(dampingRatio = 0.80f, stiffness = 500f), initialScale = 0.94f)) togetherWith
+                        (fadeOut(tween(110)) + scaleOut(tween(110), targetScale = 0.96f))
+                },
+                label = "chromeEditMorph"
+            ) { isEdit ->
+                if (isEdit) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(54.dp)
+                            .liquidGlassBar(Capsule)
+                            .padding(horizontal = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        SafariButton(
+                            SafariGlyph.Close, "Cancel editing",
+                            onClick = { onEditing(false); keyboard?.hide() },
+                            size = 38.dp, glyphSize = 17.dp
+                        )
+                        BasicTextField(
+                            value = field,
+                            onValueChange = { field = it },
+                            singleLine = true,
+                            textStyle = TextStyle(color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Medium),
+                            cursorBrush = SolidColor(style.accent),
+                            keyboardOptions = KeyboardOptions(
+                                imeAction = ImeAction.Go,
+                                keyboardType = KeyboardType.Uri
+                            ),
+                            keyboardActions = KeyboardActions(onGo = { submit() }),
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(horizontal = 9.dp)
+                                .focusRequester(focus),
+                            decorationBox = { inner ->
+                                Box {
+                                    if (field.text.isEmpty()) {
+                                        Text("Search or enter website", color = TextTertiary, fontSize = 15.sp)
+                                    }
+                                    inner()
+                                }
+                            }
+                        )
+                        GlassIconButton(
+                            AppleIcons.Search, "Search",
+                            onClick = { submit() },
+                            size = 38.dp, iconSize = 19.dp, filled = false, accent = true
+                        )
+                        Spacer(Modifier.width(4.dp))
+                    }
+                } else {
+                    ToolbarBar(
+                        s = s,
+                        tab = tab,
+                        rows = s.toolbarRows,
+                        onLinkTap = { onEditing(true) },
+                        onPanel = onPanel,
+                        onMenu = onMenu
+                    )
+                }
+            }
         }
     }
 }
@@ -1230,12 +1430,12 @@ private fun ToolbarIconSlot(
         index < drag.startIndex && index >= drag.targetIndex -> 1f
         else -> 0f
     }
-    val shift by animateFloatAsState(
+    val shiftState = animateFloatAsState(
         shiftTarget,
         spring(dampingRatio = 0.80f, stiffness = 620f),
         label = "slotShift"
     )
-    val scale by animateFloatAsState(
+    val scaleState = animateFloatAsState(
         if (dragging) 1.14f else 1f,
         spring(dampingRatio = 0.68f, stiffness = 560f),
         label = "slotScale"
@@ -1246,10 +1446,11 @@ private fun ToolbarIconSlot(
             .zIndex(if (dragging) 20f else 0f)
             .graphicsLayer {
                 translationX = if (dragging) drag.dragOffset.x
-                else shift * (slotSize + 3.dp).toPx() + drag.snapOffset.x
+                else shiftState.value * (slotSize + 3.dp).toPx() + drag.snapOffset.x
                 translationY = if (dragging) drag.dragOffset.y else drag.snapOffset.y
-                scaleX = scale
-                scaleY = scale
+                val sc = scaleState.value
+                scaleX = sc
+                scaleY = sc
                 shadowElevation = if (dragging) 18.dp.toPx() else 0f
             }
             .onGloballyPositioned { coords ->
@@ -1382,8 +1583,8 @@ internal fun ToolbarActionButton(
     forceEnabled: Boolean = false
 ) {
     val activeDownloads = s.downloads.items.count { it.status == DlStatus.RUNNING }
-    val glyph = size * 0.50f
-    val icon = size * 0.48f
+    val glyph = size * 0.55f
+    val icon = size * 0.53f
     fun tap(action: () -> Unit): () -> Unit = if (preview) ({}) else action
 
     when (id) {
@@ -1413,6 +1614,7 @@ internal fun ToolbarActionButton(
                 detectVerticalDragGestures(
                     onDragEnd = {
                         if (s.swipeDownloadDelete && totalY < -30f) {
+                            Haptics.fire(null, Hx.WARN)
                             s.deleteRecentDownload()
                         }
                         totalY = 0f
@@ -1438,6 +1640,7 @@ internal fun ToolbarActionButton(
                 detectVerticalDragGestures(
                     onDragEnd = {
                         if (s.swipeTabClose && totalY < -30f) {
+                            Haptics.fire(null, Hx.WARN)
                             s.closeCurrentTab()
                         }
                         totalY = 0f
@@ -1544,7 +1747,8 @@ private fun MediaFab(s: BrowserState, tab: Tab) {
     if (!showDl && !allowPlay) return        // nothing to offer: no empty glass capsule
     Row(
         Modifier
-            .liquidGlass(Capsule, 1.14f, 0.03f)
+            .liquidWindowDrag(maxPullDp = 36.dp)
+            .liquidGlass(Capsule, 1.18f, 0f, reactive = false)
             .padding(4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -1635,7 +1839,7 @@ internal fun AddressPill(
             if (sign > 0f) s.switchToPrevTab() else s.switchToNextTab()
             v -= sign * travel
             hops++
-            performPress(view)
+            performTap(view)
         }
         setDrag(v.coerceIn(-travel, travel))
         val now = abs(dragPx) > commitDistance()
@@ -1676,7 +1880,7 @@ internal fun AddressPill(
 
     Box(
         modifier
-            .height(38.dp)
+            .height(40.dp)
             .onSizeChanged { pillW = it.width.toFloat().coerceAtLeast(1f) }
     ) {
         Box(
@@ -1687,7 +1891,7 @@ internal fun AddressPill(
                     if (!canSwipe) return@pointerInput
                     // Own gesture loop with a small slop (6dp instead of the default 8dp+)
                     // so the card starts following the finger almost immediately.
-                    val slop = 6.dp.toPx()
+                    val slop = viewConfiguration.touchSlop * 1.15f
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
                         velocity.resetTracking()
@@ -1789,15 +1993,16 @@ private fun PillContent(tab: Tab) {
         Spacer(Modifier.width(7.dp))
         Text(
             if (tab.isHome) "Search or enter website" else prettyUrl(tab.url),
-            color = if (tab.isHome) TextTertiary else TextPrimary,
-            fontSize = 12.sp,
+            color = if (tab.isHome) TextSecondary else TextPrimary,
+            fontSize = 13.5.sp,
+            fontWeight = if (tab.isHome) FontWeight.Normal else FontWeight.Medium,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f)
         )
         if (!tab.isHome) {
             if (tab.url.startsWith("https://")) {
-                SafariGlyph(SafariGlyph.Lock, size = 12.dp, tint = Good)
+                SafariGlyph(SafariGlyph.Lock, size = 12.dp, tint = GoodText)
             }
             // Reload — turns into stop while the page is loading, like every browser.
             Box(
@@ -1819,8 +2024,8 @@ private fun PillContent(tab: Tab) {
                 Icon(
                     if (loading) AppleIcons.Close else AppleIcons.Refresh,
                     if (loading) "Stop loading" else "Reload",
-                    tint = TextSecondary,
-                    modifier = Modifier.size(16.dp)
+                    tint = TextPrimary,
+                    modifier = Modifier.size(17.5.dp)
                 )
             }
         }
@@ -1848,6 +2053,7 @@ fun menuActionIcon(action: MenuAction): ImageVector = when (action) {
 
 @Composable
 private fun BrowserMenu(
+    visible: Boolean,
     s: BrowserState,
     tab: Tab,
     onDismiss: () -> Unit,
@@ -1855,90 +2061,44 @@ private fun BrowserMenu(
     onFind: () -> Unit
 ) {
     val scroll = rememberScrollState()
-    val scope = androidx.compose.runtime.rememberCoroutineScope()
-    var entered by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { entered = true }
-    val dismiss: () -> Unit = {
-        entered = false
-        scope.launch {
-            delay(180)
-            onDismiss()
-        }
-    }
-    // Compact right panel, bottom-aligned
-    val menuWidth = 212.dp
     val atTop = s.barTop
     val pinned = s.menuPinned.mapNotNull { MenuAction.byId(it) }
+    val dismiss = onDismiss
 
-    // One spring drives slide, stretch and scrim together; it settles with a soft overshoot.
-    val progress by animateFloatAsState(
-        if (entered) 1f else 0f,
-        if (entered) spring(dampingRatio = 0.74f, stiffness = 420f)
-        else spring(dampingRatio = 1f, stiffness = 650f),
-        label = "drawerProgress"
-    )
-    val drawerScrim = scrim(0.34f)
-
-    Box(
-        Modifier
-            .fillMaxSize()
-            .drawBehind { drawRect(drawerScrim.copy(alpha = drawerScrim.alpha * progress.coerceIn(0f, 1f))) }
-            .clickableHaptic(haptic = false, onClick = dismiss)
+    LiquidFloatingWindow(
+        visible = visible,
+        onDismiss = dismiss,
+        fromTop = atTop,
+        anchorOffset = toolbarFootprint(s.toolbarRows) + 10.dp
     ) {
-        // Floating card that starts right where the toolbar ends — never over it.
-        Box(
+        Column(
             Modifier
-                .align(if (atTop) Alignment.TopEnd else Alignment.BottomEnd)
-                .statusBarsPadding()
-                .navigationBarsPadding()
-                .padding(
-                    start = 16.dp,
-                    end = 10.dp,
-                    top = if (atTop) toolbarFootprint(s.toolbarRows) + 10.dp else 10.dp,
-                    bottom = if (atTop) 10.dp else toolbarFootprint(s.toolbarRows) + 10.dp
-                )
+                .fillMaxWidth()
+                .weight(1f, fill = false)
+                .verticalScroll(scroll),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            Column(
-                Modifier
-                    .width(menuWidth)
-                    .graphicsLayer {
-                        // Grows out of the menu button: slightly narrower/shorter at first,
-                        // overshoots a hair, then settles.
-                        val p = progress
-                        val c = p.coerceIn(0f, 1f)
-                        alpha = c
-                        scaleX = 0.80f + 0.20f * p
-                        scaleY = 0.68f + 0.32f * p
-                        translationY = (1f - c) * 16.dp.toPx() * (if (atTop) -1f else 1f)
-                        transformOrigin = TransformOrigin(1f, if (atTop) 0f else 1f)
-                    }
-                    .liquidGlass(RoundedCornerShape(26.dp), 1.14f, 0.08f)
-                    .clickableHaptic(haptic = false) {}
-                    .verticalScroll(scroll)
-                    .padding(horizontal = 8.dp, vertical = 8.dp)
-            ) {
-                var rowIndex = 0
-                pinned.forEach { action ->
-                    StaggerItem(rowIndex++) {
+            pinned.forEachIndexed { idx, action ->
+                key(action.id) {
+                    StaggerItem(idx) {
                         MenuRow(
                             icon = menuActionIcon(action),
                             label = actionLabel(s, tab, action),
-                            subtitle = null, // Clean compact layout
+                            subtitle = null,
                             value = actionValue(s, action),
                             active = actionActive(s, tab, action),
                             accent = true,
-                            onClick = { performMenuAction(s, tab, action, dismiss, onPanel, onFind) }
+                            onClick = { if (visible) performMenuAction(s, tab, action, dismiss, onPanel, onFind) }
                         )
                     }
-                    Spacer(Modifier.height(2.dp))
                 }
+            }
 
-                if (pinned.isEmpty()) {
-                    Text(
-                        "No actions selected yet.", color = TextTertiary, fontSize = 11.sp,
-                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 6.dp)
-                    )
-                }
+            if (pinned.isEmpty()) {
+                Text(
+                    "No actions selected yet.", color = TextTertiary, fontSize = 11.sp,
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 6.dp)
+                )
             }
         }
     }
@@ -1946,18 +2106,19 @@ private fun BrowserMenu(
 
 @Composable
 private fun StaggerItem(index: Int, content: @Composable () -> Unit) {
+    if (PerfTier.low) { content(); return }
     var shown by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
-        delay(40L + index * 16L)
+        delay(12L + (index.coerceAtMost(6) * 10L))
         shown = true
     }
-    val a by animateFloatAsState(if (shown) 1f else 0f, tween(230), label = "rowAlpha")
-    val dx by animateFloatAsState(
-        if (shown) 0f else 28f,
-        spring(dampingRatio = 0.78f, stiffness = 520f),
+    val aState = animateFloatAsState(if (shown) 1f else 0f, tween(120), label = "rowAlpha")
+    val dxState = animateFloatAsState(
+        if (shown) 0f else 14f,
+        spring(dampingRatio = 0.82f, stiffness = 680f),
         label = "rowSlide"
     )
-    Box(Modifier.graphicsLayer { alpha = a; translationX = dx }) { content() }
+    Box(Modifier.graphicsLayer { alpha = aState.value.coerceIn(0f, 1f); translationX = dxState.value }) { content() }
 }
 
 @Composable
@@ -1971,42 +2132,61 @@ private fun MenuRow(
     onClick: () -> Unit
 ) {
     val style = LocalGlassStyle.current
+    val dark = LocalPalette.current.dark
+    val iconTint = when {
+        active || accent -> if (dark) androidx.compose.ui.graphics.lerp(style.accent, Color.White, 0.48f) else style.accent
+        else -> TextPrimary
+    }
+    val rowShape = RoundedCornerShape(13.dp)
     Row(
         Modifier
             .fillMaxWidth()
-            .clip(SmallShape)
+            .clip(rowShape)
+            .then(if (active) Modifier.background(style.accent.copy(alpha = if (dark) 0.22f else 0.14f), rowShape) else Modifier)
             .clickableHaptic(onClick = onClick)
-            .padding(horizontal = 6.dp, vertical = 6.dp),
+            .padding(horizontal = 7.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
             Modifier
                 .size(31.dp)
-                .glassTile(CircleShape, if (accent) 0.12f else 0.065f, if (accent) style.accent else Color.White),
+                .glassTile(CircleShape, if (active || accent) 0.20f else 0.12f, if (active || accent) style.accent else Color.White),
             contentAlignment = Alignment.Center
         ) {
             Icon(
                 icon, null,
-                tint = if (accent || active) style.accent else TextSecondary,
-                modifier = Modifier.size(16.dp)
+                tint = iconTint,
+                modifier = Modifier.size(17.dp)
             )
         }
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {
             Text(
-                label, color = TextPrimary, fontSize = 13.sp,
-                fontWeight = if (accent) FontWeight.SemiBold else FontWeight.Medium,
-                maxLines = 1
+                label, color = TextPrimary, fontSize = 13.5.sp,
+                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                maxLines = 1, overflow = TextOverflow.Ellipsis
             )
             if (subtitle != null) {
-                Text(subtitle, color = TextTertiary, fontSize = 9.sp, maxLines = 1)
+                Text(subtitle, color = TextSecondary, fontSize = 10.5.sp, maxLines = 1)
             }
         }
         if (value != null) {
-            Text(
-                value, color = if (active) style.accent else TextTertiary,
-                fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold
-            )
+            Spacer(Modifier.width(6.dp))
+            Box(
+                Modifier
+                    .clip(Capsule)
+                    .background(
+                        if (active) style.accent else (if (dark) Color(0xFF0A0D16).copy(alpha = 0.56f) else Color.Black.copy(alpha = 0.09f)),
+                        Capsule
+                    )
+                    .padding(horizontal = 7.dp, vertical = 2.5.dp)
+            ) {
+                Text(
+                    value,
+                    color = if (active) Color.White else TextPrimary,
+                    fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1
+                )
+            }
         }
     }
 }
@@ -2077,6 +2257,12 @@ private fun FindBar(
     onQuery: (String) -> Unit,
     onClose: () -> Unit
 ) {
+    val fbView = LocalView.current
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        Haptics.fire(fbView, Hx.WINDOW_OPEN)
+        onDispose { Haptics.fire(fbView, Hx.WINDOW_CLOSE) }
+    }
+    GlassLiveWindowLease(active = true)
     // Spring entrance: the find bar glass pill slides down from above.
     val enter = remember { Animatable(0f) }
     LaunchedEffect(Unit) {
@@ -2099,7 +2285,13 @@ private fun FindBar(
         Row(
             Modifier
                 .fillMaxWidth()
-                .liquidGlass(Capsule, 1.1f)
+                .liquidWindowDrag(
+                    maxPullDp = 40.dp,
+                    dismissDir = LiquidDismissDir.UP,
+                    dismissThresholdDp = 54.dp,
+                    onDismiss = onClose
+                )
+                .liquidGlass(Capsule, 1.14f, reactive = false, blurProgress = { 1f })
                 .padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -2108,22 +2300,31 @@ private fun FindBar(
                 value = query,
                 onValueChange = onQuery,
                 singleLine = true,
-                textStyle = TextStyle(color = TextPrimary, fontSize = 13.sp),
+                textStyle = TextStyle(color = TextPrimary, fontSize = 14.5.sp, fontWeight = FontWeight.Medium),
                 cursorBrush = SolidColor(LocalGlassStyle.current.accent),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions = KeyboardActions(onSearch = { s.findNext(tab, true) }),
                 modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
                 decorationBox = { inner ->
                     Box {
-                        if (query.isEmpty()) Text("Find in page", color = TextTertiary, fontSize = 13.sp)
+                        if (query.isEmpty()) Text("Find in page", color = TextTertiary, fontSize = 14.5.sp)
                         inner()
                     }
                 }
             )
-            Text(
-                if (tab.findTotal > 0) "${tab.findCurrent}/${tab.findTotal}" else "",
-                color = TextSecondary, fontSize = 11.sp
-            )
+            if (tab.findTotal > 0) {
+                Box(
+                    Modifier
+                        .clip(Capsule)
+                        .background(LocalGlassStyle.current.accent.copy(alpha = 0.16f), Capsule)
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                ) {
+                    Text(
+                        "${tab.findCurrent}/${tab.findTotal}",
+                        color = LocalGlassStyle.current.accent, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
             Spacer(Modifier.width(6.dp))
             SafariButton(
                 SafariGlyph.Back, "Previous match",
@@ -2170,181 +2371,273 @@ private fun HomePage(
 ) {
     val style = LocalGlassStyle.current
     val scroll = rememberScrollState()
+    val liquidScroll = rememberGlassScrollState()
+    val homeScrolled by remember { derivedStateOf { scroll.value > 10 } }
     val favorites = remember(s.bookmarks.size) {
         (s.bookmarks.take(6).map { HomeSite(hostOf(it.url), it.url) } + DEFAULT_SITES)
             .distinctBy { hostOf(it.url) }
             .take(12)
     }
+    val engineName = ENGINES[s.engine.coerceIn(0, ENGINES.lastIndex)].name
 
-    Column(
-        Modifier
-            .fillMaxSize()
-            .verticalScroll(scroll)
-            .statusBarsPadding()
-            .padding(horizontal = 16.dp)
-            .padding(
-                top = 14.dp,
-                bottom = when {
-                    s.barTop -> 28.dp
-                    s.toolbarRows == 1 -> 154.dp
-                    else -> 100.dp
-                }
-            )
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            AurexMark(46.dp)
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    "Aurex Browser", color = TextPrimary, fontSize = 22.sp,
-                    fontWeight = FontWeight.Black, letterSpacing = (-0.8).sp
+    Box(Modifier.fillMaxSize()) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .liquidOverscrollJelly()
+                .liquidScrollTrack(liquidScroll)
+                .verticalScroll(scroll)
+                .statusBarsPadding()
+                .padding(horizontal = 18.dp)
+                .padding(
+                    top = 14.dp,
+                    bottom = when {
+                        s.barTop -> 32.dp
+                        s.toolbarRows == 1 -> 158.dp
+                        else -> 108.dp
+                    }
                 )
-                Text("Liquid glass browser", color = TextTertiary, fontSize = 11.sp)
-            }
-            GlassIconButton(AppleIcons.Settings, "Settings", { onPanel(Panel.Settings) })
-            Spacer(Modifier.width(6.dp))
-            GlassIconButton(AppleIcons.MoreVert, "Menu", onMenu, accent = true)
-        }
-
-        Spacer(Modifier.height(26.dp))
-
-        Text("Where to next?", color = TextPrimary, fontSize = 28.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.8).sp)
-        Text("Private by design. Fast by default.", color = TextTertiary, fontSize = 12.sp)
-        Spacer(Modifier.height(16.dp))
-
-        GlowPress(
-            onClick = onSearch,
-            shape = Capsule,
-            modifier = Modifier
-                .fillMaxWidth()
-                .liquidGlass(Capsule, 1f)
         ) {
+            // ── iOS 27 Top Brand Bar + Floating Glass Control Cluster ──
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                AurexMark(44.dp)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "Aurex", color = TextPrimary, fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold, letterSpacing = (-0.6).sp
+                    )
+                    Text(
+                        if (tab.incognito) "Private Browsing" else "Liquid Glass · Private",
+                        color = if (tab.incognito) Color(0xFFBF5AF2) else TextSecondary,
+                        fontSize = 12.sp, fontWeight = FontWeight.Medium
+                    )
+                }
+                Row(
+                    Modifier
+                        .liquidGlass(Capsule, 1.04f, 0f, reactive = false)
+                        .padding(horizontal = 3.dp, vertical = 3.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    GlassIconButton(
+                        AppleIcons.Settings, "Settings",
+                        onClick = { onPanel(Panel.Settings) },
+                        size = 38.dp, iconSize = 19.dp, filled = false
+                    )
+                    GlassIconButton(
+                        AppleIcons.MoreVert, "Menu",
+                        onClick = onMenu,
+                        size = 38.dp, iconSize = 19.dp, accent = true
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(18.dp))
+
+            // ── Hero Greeting ──
+            Text(
+                if (tab.incognito) "Private Start Page" else "Where to next?",
+                color = TextPrimary, fontSize = 26.sp,
+                fontWeight = FontWeight.Bold, letterSpacing = (-0.7).sp
+            )
+            Spacer(Modifier.height(3.dp))
+            Text(
+                if (tab.incognito) "History and cookies stay off this device." else "Private by design. Fast by default.",
+                color = TextSecondary, fontSize = 13.5.sp
+            )
+            Spacer(Modifier.height(14.dp))
+
+            // ── Hero Floating Safari iOS 27 Liquid Glass Search Capsule ──
+            GlowPress(
+                onClick = onSearch,
+                shape = Capsule,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp)
+                    .liquidScrollCard(liquidScroll, edgeScale = 0.025f, edgeTilt = 1.8f)
+                    .liquidGlass(Capsule, 1.05f, 0.04f, reactive = true)
+            ) {
+                Row(
+                    Modifier.fillMaxSize().padding(start = 10.dp, end = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        Modifier
+                            .size(36.dp)
+                            .glassTile(CircleShape, 0.16f, style.accent),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(AppleIcons.Search, null, tint = style.accent, modifier = Modifier.size(19.dp))
+                    }
+                    Spacer(Modifier.width(11.dp))
+                    Text(
+                        "Search or enter website",
+                        color = TextSecondary, fontSize = 15.sp, fontWeight = FontWeight.Medium,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Box(
+                        Modifier
+                            .clip(Capsule)
+                            .background(TextPrimary.copy(alpha = 0.08f), Capsule)
+                            .padding(horizontal = 9.dp, vertical = 4.dp)
+                    ) {
+                        Text(engineName, color = TextSecondary, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            // ── Apple Safari Privacy Report Glass Card ──
             Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .liquidScrollCard(liquidScroll, edgeScale = 0.03f, edgeTilt = 2.0f)
+                    .liquidGlass(CardShape, 0.96f, 0.04f, reactive = true)
+                    .clickableHaptic { onPanel(Panel.Settings) }
+                    .padding(horizontal = 13.dp, vertical = 11.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(AppleIcons.Search, null, tint = style.accent, modifier = Modifier.size(19.dp))
-                Spacer(Modifier.width(10.dp))
-                Text(
-                    "Search with ${ENGINES[s.engine.coerceIn(0, ENGINES.lastIndex)].name}",
-                    color = TextSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f)
-                )
-                Text("or type a URL", color = TextTertiary, fontSize = 10.sp)
-            }
-        }
-
-        Spacer(Modifier.height(16.dp))
-
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .liquidGlass(CardShape, 0.9f)
-                .clickableHaptic { onPanel(Panel.Settings) }
-                .padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(
-                Modifier.size(40.dp).glassTile(CircleShape, 0.16f, Good),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(AppleIcons.Shield, null, tint = Good, modifier = Modifier.size(21.dp))
-            }
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text("${s.blocked} threats blocked", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                Text(
-                    "${s.blocker.hostCount} hosts · ${s.tabs.size} tab${if (s.tabs.size > 1) "s" else ""}",
-                    color = TextTertiary, fontSize = 10.5.sp
-                )
-            }
-            Text("Shield on", color = GoodText, fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold)
-        }
-
-        Spacer(Modifier.height(22.dp))
-
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Favorites", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            Text(
-                "Bookmarks", color = style.accent, fontSize = 11.sp,
-                modifier = Modifier.clickableHaptic { onPanel(Panel.Bookmarks) }.padding(4.dp)
-            )
-        }
-        Spacer(Modifier.height(10.dp))
-
-        if (s.showHomeSites) {
-            favorites.chunked(4).forEach { row ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    row.forEach { site ->
-                        Column(
-                            Modifier
-                                .weight(1f)
-                                .clip(TileShape)
-                                .clickableHaptic { s.load(tab, site.url) }
-                                .padding(vertical = 7.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Box(
-                                Modifier.size(50.dp).glassTile(CircleShape, 0.08f),
-                                contentAlignment = Alignment.Center
-                            ) { SiteBadge(hostOf(site.url), 36.dp, site.name) }
-                            Spacer(Modifier.height(5.dp))
-                            Text(
-                                site.name, color = TextSecondary, fontSize = 9.5.sp,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    }
-                    repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
+                Box(
+                    Modifier.size(42.dp).glassTile(CircleShape, 0.18f, Good),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(AppleIcons.Shield, null, tint = Good, modifier = Modifier.size(22.dp))
                 }
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.width(13.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "${s.blocked} threats blocked",
+                        color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
+                        letterSpacing = (-0.2).sp
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        "${s.blocker.hostCount} hosts · ${s.tabs.size} tab${if (s.tabs.size > 1) "s" else ""}",
+                        color = TextSecondary, fontSize = 12.sp
+                    )
+                }
+                Box(
+                    Modifier
+                        .clip(Capsule)
+                        .background(Good.copy(alpha = 0.16f), Capsule)
+                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                ) {
+                    Text("Shield on", color = GoodText, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+                }
             }
-        }
 
-        if (s.showRecent && s.history.isNotEmpty()) {
-            Spacer(Modifier.height(14.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Recent", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                Text(
-                    "History", color = style.accent, fontSize = 11.sp,
-                    modifier = Modifier.clickableHaptic { onPanel(Panel.History) }.padding(4.dp)
-                )
+            // ── Favorites (Apple iOS 27 Concentric Glass Squircles) ──
+            if (s.showHomeSites) {
+                Spacer(Modifier.height(18.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Favorites", color = TextPrimary, fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold, letterSpacing = (-0.3).sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        "Bookmarks", color = style.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clip(Capsule).clickableHaptic { onPanel(Panel.Bookmarks) }.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+
+                val squircle = RoundedCornerShape(17.dp)
+                favorites.chunked(4).forEach { row ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        row.forEach { site ->
+                            Column(
+                                Modifier
+                                    .weight(1f)
+                                    .clip(TileShape)
+                                    .clickableHaptic { s.load(tab, site.url) }
+                                    .padding(vertical = 6.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Box(
+                                    Modifier
+                                        .size(50.dp)
+                                        .liquidGlass(squircle, 0.92f, 0f, reactive = true, optical = true),
+                                    contentAlignment = Alignment.Center
+                                ) { SiteBadge(hostOf(site.url), 34.dp, site.name) }
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    site.name, color = TextPrimary, fontSize = 11.5.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                        repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
             }
-            Spacer(Modifier.height(8.dp))
-            Row(
-                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                s.history.take(8).forEach { h ->
-                    GlowPress(
-                        onClick = { s.load(tab, h.url) },
-                        shape = Capsule,
-                        modifier = Modifier.glassTile(Capsule, 0.07f)
-                    ) {
-                        Row(
-                            Modifier.padding(start = 5.dp, end = 12.dp, top = 5.dp, bottom = 5.dp),
-                            verticalAlignment = Alignment.CenterVertically
+
+            // ── Recent Sites Glass Strip ──
+            if (s.showRecent && s.history.isNotEmpty()) {
+                Spacer(Modifier.height(16.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Recent", color = TextPrimary, fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold, letterSpacing = (-0.3).sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        "History", color = style.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clip(Capsule).clickableHaptic { onPanel(Panel.History) }.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(9.dp)
+                ) {
+                    s.history.take(8).forEach { h ->
+                        GlowPress(
+                            onClick = { s.load(tab, h.url) },
+                            shape = Capsule,
+                            modifier = Modifier.liquidGlass(Capsule, 0.92f, 0f, reactive = true, optical = true)
                         ) {
-                            SiteBadge(hostOf(h.url), 26.dp)
-                            Spacer(Modifier.width(7.dp))
-                            Column {
-                                Text(hostOf(h.url), color = TextPrimary, fontSize = 11.sp, maxLines = 1)
-                                Text(timeAgo(h.time), color = TextTertiary, fontSize = 9.sp)
+                            Row(
+                                Modifier.padding(start = 6.dp, end = 14.dp, top = 6.dp, bottom = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                SiteBadge(hostOf(h.url), 28.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Column {
+                                    Text(hostOf(h.url), color = TextPrimary, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                                    Text(timeAgo(h.time), color = TextSecondary, fontSize = 10.5.sp)
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        Spacer(Modifier.height(22.dp))
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            HomeAction("New tab", AppleIcons.Add, Modifier.weight(1f)) { s.newTab() }
-            HomeAction("Private", AppleIcons.Incognito, Modifier.weight(1f)) { s.newTab("", true) }
-            HomeAction("Downloads", AppleIcons.Download, Modifier.weight(1f)) { onPanel(Panel.Downloads) }
+            // ── Quick Actions Glass Dock ──
+            Spacer(Modifier.height(22.dp))
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .liquidScrollCard(liquidScroll, edgeScale = 0.025f, edgeTilt = 1.6f),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                HomeAction("New tab", AppleIcons.Add, style.accent, Modifier.weight(1f)) { s.newTab() }
+                HomeAction("Private", AppleIcons.Incognito, Color(0xFFBF5AF2), Modifier.weight(1f)) { s.newTab("", true) }
+                HomeAction("Downloads", AppleIcons.Download, Color(0xFF32ADE6), Modifier.weight(1f)) { onPanel(Panel.Downloads) }
+            }
         }
+        ScrollEdgeBlur(
+            isTop = true,
+            active = homeScrolled,
+            height = 56.dp,
+            strength = 0.82f,
+            modifier = Modifier.align(Alignment.TopCenter)
+        )
     }
 }
 
@@ -2352,22 +2645,28 @@ private fun HomePage(
 private fun HomeAction(
     label: String,
     icon: ImageVector,
+    tint: Color,
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
     GlowPress(
         onClick = onClick,
-        shape = TileShape,
-        modifier = modifier.glassTile(TileShape, 0.07f)
+        shape = RoundedCornerShape(18.dp),
+        modifier = modifier
+            .height(42.dp)
+            .liquidGlass(RoundedCornerShape(16.dp), 0.95f, 0f, reactive = true, optical = true)
     ) {
         Row(
-            Modifier.padding(horizontal = 12.dp, vertical = 11.dp),
+            Modifier.padding(horizontal = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center
         ) {
-            Icon(icon, null, tint = TextSecondary, modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(7.dp))
-            Text(label, color = TextSecondary, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+            Icon(icon, null, tint = tint, modifier = Modifier.size(17.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(
+                label, color = TextPrimary, fontSize = 12.5.sp,
+                fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis
+            )
         }
     }
 }
@@ -2378,15 +2677,21 @@ private fun HomeAction(
 private fun ErrorPage(message: String, onAllow: (() -> Unit)? = null, onRetry: () -> Unit) {
     val blocked = message.startsWith("Blocked")
     Box(
-        Modifier.fillMaxSize().background(Ink),
+        Modifier.fillMaxSize(),
         contentAlignment = Alignment.Center
     ) {
+        AppBackground()
         Column(
-            Modifier.padding(28.dp),
+            Modifier
+                .padding(horizontal = 24.dp)
+                .widthIn(max = 370.dp)
+                .liquidWindowDrag(maxPullDp = 42.dp)
+                .liquidGlass(CardShape, 1.18f, 0.04f, reactive = false)
+                .padding(26.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Box(Modifier.size(80.dp).glassTile(CircleShape, 0.08f), contentAlignment = Alignment.Center) {
-                Icon(if (blocked) AppleIcons.Shield else AppleIcons.ErrorOutline, null, tint = Bad, modifier = Modifier.size(36.dp))
+            Box(Modifier.size(76.dp).liquidGlass(CircleShape, 0.9f, reactive = true), contentAlignment = Alignment.Center) {
+                Icon(if (blocked) AppleIcons.Shield else AppleIcons.ErrorOutline, null, tint = Bad, modifier = Modifier.size(34.dp))
             }
             Spacer(Modifier.height(18.dp))
             Text(if (blocked) "Page blocked" else "Can't open this page", color = TextPrimary, fontSize = 19.sp, fontWeight = FontWeight.Bold)
@@ -2415,21 +2720,38 @@ private fun ErrorPage(message: String, onAllow: (() -> Unit)? = null, onRetry: (
 
 @Composable
 private fun JsDialogHost(s: BrowserState, d: JsDialogState) {
+    val jsView = LocalView.current
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        Haptics.fire(jsView, Hx.WINDOW_OPEN)
+        onDispose { Haptics.fire(jsView, Hx.WINDOW_CLOSE) }
+    }
+    GlassLiveWindowLease(active = true)
     val style = LocalGlassStyle.current
     var input by remember(d) { mutableStateOf(d.defaultValue) }
+    val enter = remember(d) { Animatable(0f) }
+    LaunchedEffect(d) { enter.animateTo(1f, spring(dampingRatio = 0.76f, stiffness = 440f)) }
+    val scrimColor = scrim(0.58f)
     Box(
         Modifier
             .fillMaxSize()
-            .background(scrim(0.62f))
-            .clickableHaptic(haptic = false) { s.jsDialog = null; d.result(false, null) },
+            .drawBehind { drawRect(scrimColor.copy(alpha = scrimColor.alpha * enter.value.coerceIn(0f, 1f))) }
+            .clickable(remember { MutableInteractionSource() }, null) { s.jsDialog = null; d.result(false, null) },
         contentAlignment = Alignment.Center
     ) {
         Column(
             Modifier
                 .padding(24.dp)
                 .widthIn(max = 390.dp)
-                .liquidGlass(CardShape, 1.15f)
-                .clickableHaptic(haptic = false) {}
+                .graphicsLayer {
+                    val p = enter.value
+                    alpha = p.coerceIn(0f, 1f)
+                    val sc = 0.90f + 0.10f * p
+                    scaleX = sc
+                    scaleY = sc
+                }
+                .liquidWindowDrag(maxPullDp = 52.dp)
+                .liquidGlass(CardShape, 1.22f, reactive = false, blurProgress = { 1f })
+                .clickable(remember { MutableInteractionSource() }, null) {}
                 .padding(20.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {

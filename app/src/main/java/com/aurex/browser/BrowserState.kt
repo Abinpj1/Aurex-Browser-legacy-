@@ -13,6 +13,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Message
 import android.view.View
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.GeolocationPermissions
 import android.webkit.JavascriptInterface
@@ -92,6 +93,12 @@ class Tab(val id: Int, val incognito: Boolean) {
     /** Epoch-ms when playback last stopped; a quick stop/start (buffering, seek, PiP return) keeps the stable clock. */
     var videoStoppedAt = 0L
     var activeMedia by mutableStateOf<String?>(null)
+    /** Which desktop/mobile mode this tab's current page was loaded in (null = Start Page / not yet loaded). */
+    var loadedDesktop: Boolean? = null
+    /** Which dark-website state this tab's current page was loaded in (null = Start Page / not yet loaded). */
+    var loadedDarkWeb: Boolean? = null
+    /** True while reloading after a Desktop/Mobile mode flip so HTTP cache is bypassed once and restored on finish. */
+    var freshReloadOnce: Boolean = false
     /** Last playing video's intrinsic size and on-page bounds (0..1 fractions). */
     var videoWidth by mutableIntStateOf(0)
     var videoHeight by mutableIntStateOf(0)
@@ -117,9 +124,12 @@ class Tab(val id: Int, val incognito: Boolean) {
     /** Set when the tab goes back to the start screen: the blank page's history is wiped so Back cannot ping-pong into the old page. */
     var wipeHistoryOnBlank = false
 
-    var web: WebView? = null
-    /** Restored tab whose page has not been requested yet (it loads when first shown). */
+    /** Compose state so waking a hibernated tab attaches its fresh WebView immediately in WebHost. */
+    var web by mutableStateOf<WebView?>(null)
+    /** Restored or hibernated tab whose page reloads cleanly when next shown. */
     var pendingUrl: String? = null
+    /** Last foreground touch timestamp used for LRU tab hibernation on memory-constrained phones. */
+    var lastUsedMs: Long = System.currentTimeMillis()
     val isHome: Boolean get() = url.isBlank()
 }
 
@@ -554,8 +564,64 @@ function scanAll(){try{var vs=document.getElementsByTagName('video');for(var i=0
 setTimeout(scanAll,1500);setTimeout(scanAll,5000);
 })();"""
 
-private fun earlyScript(h264: Boolean, adScripts: String): String {
-    val body = DarkEngine.JS + "\n;" + EARLY_TOUCH_JS + (if (h264) EARLY_H264_JS else "") + "\n;" + PIP_JS +
+/**
+ * Document-start Desktop Mode viewport & screen adapter (runs ONLY when Desktop Mode is ON):
+ *  - Rewrites/injects `<meta name="viewport" content="width=1280, user-scalable=yes">` so modern
+ *    responsive websites (YouTube, GitHub, Reddit, Google, Flipkart, Amazon, Tailwind/Bootstrap)
+ *    render their true desktop layout neatly scaled to the screen instead of a stretched mobile page.
+ *  - Softly reports desktop screen dimensions (`>= 1280x800`) to JS breakpoint scripts.
+ */
+private const val DESKTOP_VIEWPORT_JS = """(function(){try{
+if(window!==window.top)return;
+var TARGET='width=1280, user-scalable=yes';
+function applyVp(){
+ try{
+  var h=document.head||document.documentElement;if(!h)return;
+  var ms=document.querySelectorAll('meta[name="viewport" i]');
+  if(ms.length===0){
+   var m=document.createElement('meta');m.name='viewport';m.content=TARGET;h.appendChild(m);
+  }else{
+   for(var i=0;i<ms.length;i++){if(ms[i].getAttribute('content')!==TARGET)ms[i].setAttribute('content',TARGET);}
+  }
+ }catch(e){}
+}
+try{
+ var sw=Math.max(1280,screen.width||1280),sh=Math.max(800,screen.height||800);
+ Object.defineProperty(screen,'width',{get:function(){return sw;},configurable:true});
+ Object.defineProperty(screen,'availWidth',{get:function(){return sw;},configurable:true});
+ Object.defineProperty(screen,'height',{get:function(){return sh;},configurable:true});
+ Object.defineProperty(screen,'availHeight',{get:function(){return sh;},configurable:true});
+}catch(e){}
+applyVp();
+if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',applyVp,{once:true});}
+try{
+ new MutationObserver(function(muts){
+  for(var i=0;i<muts.length;i++){
+   var m=muts[i];
+   if(m.type==='attributes'&&m.target&&m.target.tagName==='META'&&/^viewport$/i.test(m.target.name||'')){applyVp();return;}
+   var a=m.addedNodes;
+   for(var j=0;a&&j<a.length;j++){if(a[j].nodeType===1&&(a[j].tagName==='META'||a[j].tagName==='HEAD')){applyVp();return;}}
+  }
+ }).observe(document.documentElement||document,{childList:true,subtree:true,attributes:true,attributeFilter:['content']});
+}catch(e){}
+}catch(e){}})();"""
+
+/** Instant phone-width viewport snap executed right as Desktop Mode turns OFF (before mobile reload paints). */
+private const val MOBILE_RESET_JS = """(function(){try{
+var ms=document.querySelectorAll('meta[name="viewport" i]');
+var t='width=device-width, initial-scale=1.0';
+if(ms.length===0){
+ var h=document.head||document.documentElement;
+ if(h){var m=document.createElement('meta');m.name='viewport';m.content=t;h.appendChild(m);}
+}else{
+ for(var i=0;i<ms.length;i++)ms[i].setAttribute('content',t);
+}
+}catch(e){}})();"""
+
+private fun earlyScript(h264: Boolean, desktopMode: Boolean, adScripts: String): String {
+    val body = DarkEngine.JS + "\n;" + EARLY_TOUCH_JS +
+        (if (desktopMode) "\n;" + DESKTOP_VIEWPORT_JS else "") +
+        (if (h264) EARLY_H264_JS else "") + "\n;" + PIP_JS +
         "\n;" + SRC_JS +
         (if (adScripts.isEmpty()) "" else "\n;" + adScripts)
     // Installed for every origin, but nothing of it may run on Instagram (nor in a frame Instagram created).
@@ -1238,7 +1304,7 @@ function qualities(){
        without waiting for the engine look-up. */
     try{
      var pr=(y.getPlayerResponse&&y.getPlayerResponse())||window.ytInitialPlayerResponse,af=pr&&pr.streamingData&&pr.streamingData.adaptiveFormats,sx={},xs=[];
-     if(af)for(var q=0;q<af.length;q++){var fh=af[q]&&af[q].height|0,fw=af[q]&&af[q].width|0,sh=(fw>0&&fh>0)?Math.min(fw,fh):fh;if(fh>=1440&&sh<=2160&&!sx[fh]){sx[fh]=1;xs.push(fh);}}
+     if(af)for(var q=0;q<af.length;q++){var fh=af[q]&&af[q].height|0,fw=af[q]&&af[q].width|0,sh=(fw>0&&fh>0)?Math.min(fw,fh):fh,lg=(fw>0&&fh>0)?Math.max(fw,fh):fh*16/9,t=(lg>=3800||sh>=2100)?2160:(lg>=2500||sh>=1400)?1440:0;if(t>=1440&&sh<=2160&&!sx[t]){sx[t]=1;xs.push(t);}}
      xs.sort(function(a,b){return b-a;});out.x=xs;
     }catch(e){}
     var ok=false;for(i=0;i<out.l.length;i++)if(out.l[i].i===qForced)ok=true;
@@ -1579,7 +1645,18 @@ class BrowserState(private val act: Activity) {
     init { AppLang.setWebListener(webLangHook) }
 
     /** Called when the activity goes away, so a later one is not talked to through this (dead) state. */
-    fun release() { AppLang.clearWebListener(webLangHook) }
+    fun release() {
+        AppLang.clearWebListener(webLangHook)
+        blocker.onEngineReady = null
+        shotSession?.cancel()
+        screenshot = null
+        earlyHandles.values.forEach { runCatching { it.remove() } }
+        earlyHandles.clear()
+        tabs.forEach { t ->
+            (t.web as? AurexWebView)?.onBackdropDirty = null
+        }
+        if (live === this) live = null
+    }
 
     // Privacy
     var adblock by mutableStateOf(prefs.getBoolean("adblock", true))
@@ -1615,8 +1692,7 @@ class BrowserState(private val act: Activity) {
     var dynamicAccent by mutableStateOf(false) // adaptive site colour removed
     var glass by mutableFloatStateOf(prefs.getFloat("glass", 0.86f))
     var haptics by mutableStateOf(prefs.getBoolean("haptics", true))
-    /** 0 light, 1 medium, 2 strong - mirrored into [Haptics.level] by [updateHapticLevel]. */
-    var hapticLevel by mutableIntStateOf(prefs.getInt("hapticLevel", 1).coerceIn(0, 2))
+    var dynamicIsland by mutableStateOf(prefs.getBoolean("dynamicIsland", true).also { NotifIsland.enabled = it })
     var glow by mutableStateOf(prefs.getBoolean("glow", true))
     // Toolbar position option removed: the bar is always at the bottom.
     var barTop by mutableStateOf(false)
@@ -1703,6 +1779,12 @@ class BrowserState(private val act: Activity) {
     var swipeDlRightDelete by mutableStateOf(prefs.getBoolean("swipeDlDelete", true))
     /** Downloads list: swipe a finished download to the left to share it. */
     var swipeDlLeftShare by mutableStateOf(prefs.getBoolean("swipeDlShare", true))
+    /** Tabs grid: swipe any tab card left or right to close it smoothly. */
+    var swipeTabCardClose by mutableStateOf(prefs.getBoolean("swipeTabCardClose", true))
+    /** Bookmarks & History lists: swipe right to delete, swipe left to share. */
+    var swipeLibraryActions by mutableStateOf(prefs.getBoolean("swipeLibraryActions", true))
+    /** Panels & Settings: swipe from the left screen edge to go back / close. */
+    var swipeEdgeBack by mutableStateOf(prefs.getBoolean("swipeEdgeBack", true))
     /** Press and hold the Tabs button on the toolbar: a new tab opens with the address bar and keyboard ready. */
     var holdTabsNewTab by mutableStateOf(prefs.getBoolean("holdTabsNew", true))
     /** Press and hold the three-dot menu button on the toolbar: Settings opens. */
@@ -1805,7 +1887,8 @@ class BrowserState(private val act: Activity) {
         if (saved.isNotEmpty()) {
             // Only the last tab (the one on screen) loads now; the others load when first shown.
             // Eight pages starting at once is what made launch slow on low-end phones.
-            val urls = saved.take(8)
+            val restoreCap = when (PerfTier.tier) { PerfTier.TIER_LOW -> 4; PerfTier.TIER_BALANCED -> 6; else -> 8 }
+            val urls = saved.take(restoreCap)
             urls.forEachIndexed { i, u -> newTab(u, defer = i != urls.lastIndex) }
         }
     }
@@ -1814,11 +1897,29 @@ class BrowserState(private val act: Activity) {
     companion object {
         /** A jump the page makes on its own to another site, not an ad for sure but suspicious enough (guard score) to get its own tab. */
         private const val DETOUR_SCORE = 20
+        private val MOBILE_TO_WWW_HOSTS = setOf(
+            "m.imdb.com", "m.cricbuzz.com", "m.ndtv.com", "m.rediff.com", "m.espncricinfo.com",
+            "m.ebay.com", "m.aliexpress.com", "m.twitch.tv", "m.dailymotion.com", "m.amazon.in",
+            "m.amazon.com", "m.flipkart.com", "m.snapdeal.com", "mobile.twitter.com"
+        )
+        private val MOBILE_TO_BARE_HOSTS = setOf(
+            "m.vk.com", "m.ok.ru", "m.soundcloud.com", "m.vimeo.com", "m.reddit.com"
+        )
+        private val EMPTY_BYTES = ByteArray(0)
+        private val EMPTY_GIF = byteArrayOf(
+            71, 73, 70, 56, 57, 97, 1, 0, 1, 0, -128, 0, 0, 0, 0, 0,
+            -1, -1, -1, 33, -7, 4, 1, 0, 0, 0, 0, 44, 0, 0, 0, 0,
+            1, 0, 1, 0, 0, 2, 2, 68, 1, 0, 59
+        )
 
         @Volatile private var live: BrowserState? = null
 
         fun markLive(state: BrowserState) {
             live = state
+        }
+
+        fun onMemoryPressure(aggressive: Boolean) {
+            live?.onMemoryPressure(aggressive)
         }
     }
 
@@ -1936,9 +2037,12 @@ class BrowserState(private val act: Activity) {
         }
     }
 
+    private var bookmarksDirty = false
+    private var historyDirty = false
+
     fun save() {
         if (live !== this) return
-        prefs.edit()
+        val ed = prefs.edit()
             .putBoolean("adblock", adblock)
             .remove("ytadblock").remove("pillWidth").remove("pillHeight")
             .putBoolean("popup", popupBlock)
@@ -1953,7 +2057,7 @@ class BrowserState(private val act: Activity) {
             .putInt("accent", accent).putBoolean("matchSiteColor", dynamicAccent)
             .remove("dynamicAccent")
             .putFloat("glass", glass)
-            .putBoolean("haptics", haptics).putInt("hapticLevel", hapticLevel).putBoolean("glow", glow)
+            .putBoolean("haptics", haptics).putBoolean("dynamicIsland", dynamicIsland).putBoolean("glow", glow)
             .putBoolean("barTop", barTop).putBoolean("autoHide", autoHide)
             .putInt("themeMode", themeMode).putInt("darkWeb", darkWeb)
             .putInt("textZoom", textZoom).putBoolean("backgroundPlay", backgroundPlay)
@@ -1973,10 +2077,19 @@ class BrowserState(private val act: Activity) {
             .putBoolean("swipeDownloadDelete", swipeDownloadDelete).putBoolean("dlAlwaysBest", alwaysBestQuality)
             .putBoolean("swipeLinkTabSwitch", swipeLinkTabSwitch)
             .putBoolean("swipeDlDelete", swipeDlRightDelete).putBoolean("swipeDlShare", swipeDlLeftShare)
+            .putBoolean("swipeTabCardClose", swipeTabCardClose)
+            .putBoolean("swipeLibraryActions", swipeLibraryActions)
+            .putBoolean("swipeEdgeBack", swipeEdgeBack)
             .putBoolean("holdTabsNew", holdTabsNewTab).putBoolean("holdMenuSettings", holdMenuSettings)
-            .putString("bookmarks", bookmarks.joinToString("\n") { it.url + "\t" + Uri.encode(it.title) })
-            .putString("history", history.joinToString("\n") { "${it.time}\t${it.url}\t${Uri.encode(it.title)}" })
-            .apply()
+        if (bookmarksDirty) {
+            bookmarksDirty = false
+            ed.putString("bookmarks", bookmarks.joinToString("\n") { it.url + "\t" + Uri.encode(it.title) })
+        }
+        if (historyDirty) {
+            historyDirty = false
+            ed.putString("history", history.joinToString("\n") { "${it.time}\t${it.url}\t${Uri.encode(it.title)}" })
+        }
+        ed.apply()
     }
 
     fun deleteRecentDownload() {
@@ -2003,11 +2116,17 @@ class BrowserState(private val act: Activity) {
     // Silent on purpose: the address pill's dots and the card animation already
     // show where you landed, and a snackbar popping up after every swipe read as a blink.
     fun switchToNextTab() {
-        if (tabs.size > 1) current = (current + 1) % tabs.size
+        if (tabs.size > 1) {
+            current = (current + 1) % tabs.size
+            onActiveTabChanged()
+        }
     }
 
     fun switchToPrevTab() {
-        if (tabs.size > 1) current = (current - 1 + tabs.size) % tabs.size
+        if (tabs.size > 1) {
+            current = (current - 1 + tabs.size) % tabs.size
+            onActiveTabChanged()
+        }
     }
 
     private fun saveSession() {
@@ -2025,13 +2144,6 @@ class BrowserState(private val act: Activity) {
         else if (tabs.isEmpty()) newTab()
     }
 
-    /** Settings -> Haptic strength: applies at once, saves, and plays a sample so the new strength can be felt. */
-    fun updateHapticLevel(level: Int) {
-        hapticLevel = level.coerceIn(0, 2)
-        Haptics.level = hapticLevel
-        save()
-        Haptics.fire(null, Hx.TOGGLE_ON)
-    }
 
     fun notify(text: String) {
         snack = Snack(System.currentTimeMillis(), text)
@@ -2131,7 +2243,15 @@ class BrowserState(private val act: Activity) {
         if (!darkWebEnabled()) { notify("Dark websites are off · turn them on in Settings"); return }
         darkOffHosts = if (key in darkOffHosts) darkOffHosts - key else darkOffHosts + key
         save()
+        val nowDark = darkOnFor(tab.url)
+        tab.web?.let { w ->
+            w.setBackgroundColor(if (nowDark) 0xFF06070B.toInt() else 0xFFFFFFFF.toInt())
+            applyDarkWeb(w, nowDark, tab.url)
+        }
         refreshDarkEngine()
+        if (DarkEngine.needsReloadOnFlip(key) && tab.url.startsWith("http", true)) {
+            reloadForThemeChange(tab)
+        }
         notify(if (key in darkOffHosts) "Dark mode off for $key" else "Dark mode on for $key")
     }
 
@@ -2144,21 +2264,28 @@ class BrowserState(private val act: Activity) {
     private inner class DarkBridge {
         @android.webkit.JavascriptInterface
         fun cfg(host: String?): String {
-            val on = darkWebEnabled() && !isHandsOffHost(host) && !isDarkOffHost(host) && !DarkEngine.isNativeHost(host)
-            return "{\"on\":$on,\"b\":${DarkEngine.BRIGHTNESS},\"c\":${DarkEngine.CONTRAST},\"s\":${DarkEngine.SEPIA}}"
+            val handsOff = isHandsOffHost(host)
+            val siteDark = darkWebEnabled() && !isDarkOffHost(host)
+            val nativeDark = siteDark && !handsOff && DarkEngine.isNativeHost(host)
+            val on = siteDark && !handsOff && !nativeDark
+            val light = !siteDark && !handsOff
+            return "{\"on\":$on,\"light\":$light,\"nativeDark\":$nativeDark,\"b\":${DarkEngine.BRIGHTNESS},\"c\":${DarkEngine.CONTRAST},\"s\":${DarkEngine.SEPIA}}"
         }
     }
 
     /**
-     * Native (algorithmic) darkening is kept ONLY for video sites, where a page filter would hurt video playback.
-     * Every other page is handled by [DarkEngine], which also works while the app theme is light.
+     * Native (algorithmic) darkening is kept ONLY for video sites when dark websites are active for that host.
+     * Turning dark websites off ALWAYS disables both algorithmic darkening and legacy force-dark.
      */
     private fun applyDarkWeb(web: WebView, enabled: Boolean, url: String? = null) {
-        val native = enabled && DarkEngine.isNativeHost(hostOf(url ?: web.url))
+        val u = url ?: runCatching { web.url }.getOrNull()
+        val host = hostOf(u)
+        val native = enabled && !isDarkOffHost(host) && !isHandsOffHost(host) && DarkEngine.isNativeHost(host)
         runCatching {
             if (Build.VERSION.SDK_INT >= 33) {
                 WebSettingsCompat.setAlgorithmicDarkeningAllowed(web.settings, native)
             } else {
+                @Suppress("DEPRECATION")
                 WebSettingsCompat.setForceDark(
                     web.settings,
                     if (native) WebSettingsCompat.FORCE_DARK_ON else WebSettingsCompat.FORCE_DARK_OFF
@@ -2167,35 +2294,66 @@ class BrowserState(private val act: Activity) {
         }
     }
 
+    /** Clean no-cache reload sending `Sec-CH-Prefers-Color-Scheme: light|dark` so server-themed sites switch instantly. */
+    private fun reloadForThemeChange(tab: Tab) {
+        val w = tab.web ?: return
+        val liveUrl = runCatching { w.url }.getOrNull()?.takeIf { it.startsWith("http", true) }
+            ?: tab.url.takeIf { it.startsWith("http", true) }
+            ?: return
+        if (isHandsOffHost(liveUrl)) return
+        val siteDark = darkOnFor(liveUrl)
+        tab.loadedDarkWeb = siteDark
+        tab.freshReloadOnce = true
+        w.stopLoading()
+        w.setBackgroundColor(if (siteDark) 0xFF06070B.toInt() else 0xFFFFFFFF.toInt())
+        applyDarkWeb(w, siteDark, liveUrl)
+        runCatching { w.settings.cacheMode = WebSettings.LOAD_NO_CACHE }
+        val hdr = HashMap<String, String>()
+        hdr["Cache-Control"] = "no-cache"
+        hdr["Pragma"] = "no-cache"
+        hdr["Sec-CH-Prefers-Color-Scheme"] = if (siteDark) "dark" else "light"
+        if (dnt) hdr["DNT"] = "1"
+        AppLang.webHeader()?.let { hdr["Accept-Language"] = it }
+        w.loadUrl(liveUrl, hdr)
+    }
+
     /**
-     * Called by the theme when light/dark changes. Keeps every live WebView in
-     * sync and reloads once so algorithmic darkening can take effect.
+     * Called by the theme and by [setDarkWebMode] whenever light/dark changes.
+     * Keeps every live WebView's background, native darkening, and DarkEngine in sync,
+     * and cleanly reloads server-themed pages (YouTube, Google, GitHub, Reddit, Wikipedia)
+     * with the matching `Sec-CH-Prefers-Color-Scheme` header so nothing stays stuck in dark mode.
      */
-    fun syncWebTheme(darkTheme: Boolean) {
+    fun syncWebTheme(darkTheme: Boolean, forceReloadActive: Boolean = false) {
         val darkEnabled = darkWebEnabled(darkTheme)
         val themeChanged = lastDarkTheme != null && lastDarkTheme != darkTheme
         val webChanged = lastDarkWeb != null && lastDarkWeb != darkEnabled
         lastDarkTheme = darkTheme
         lastDarkWeb = darkEnabled
-        val bg = if (darkTheme || darkEnabled) 0xFF06070B.toInt() else 0xFFFFFFFF.toInt()
+        val activeTab = tabs.getOrNull(current)
         tabs.forEach { t ->
-            t.web?.setBackgroundColor(bg)
-            t.web?.let { applyDarkWeb(it, darkEnabled) }
+            val w = t.web ?: return@forEach
+            val siteDark = darkEnabled && !isDarkOffHost(hostOf(t.url))
+            w.setBackgroundColor(if (siteDark) 0xFF06070B.toInt() else 0xFFFFFFFF.toInt())
+            applyDarkWeb(w, siteDark, t.url)
         }
         refreshDarkEngine()
-        // Only video sites (native darkening) need a reload; every other page updates live.
-        if (themeChanged || webChanged) {
-            tabs.forEach { if (it.url.startsWith("http") && DarkEngine.isNativeHost(hostOf(it.url))) it.web?.reload() }
+        if (themeChanged || webChanged || forceReloadActive) {
+            if (activeTab != null && !activeTab.isHome && activeTab.url.startsWith("http", true) &&
+                !isHandsOffHost(activeTab.url) && DarkEngine.needsReloadOnFlip(hostOf(activeTab.url))
+            ) {
+                reloadForThemeChange(activeTab)
+            }
         }
     }
 
-    /** Sets the tri-state dark-website mode and refreshes live pages once. */
+    /** Sets the tri-state dark-website mode and refreshes live pages immediately. */
     fun setDarkWebMode(mode: Int) {
+        val prev = darkWebEnabled()
         darkWeb = mode.coerceIn(DarkWebModes.AUTO, DarkWebModes.OFF)
-        lastDarkWeb = null
+        val now = darkWebEnabled()
         save()
         applySettings()
-        syncWebTheme(effectiveDarkTheme())
+        syncWebTheme(effectiveDarkTheme(), forceReloadActive = prev != now)
         notify(
             when (darkWeb) {
                 DarkWebModes.ON -> "Dark websites always on"
@@ -2206,14 +2364,124 @@ class BrowserState(private val act: Activity) {
     }
 
     // ── Tabs ─────────────────────────────────────────────────────────────────
+    /** Ensures a tab has a live WebView (waking it seamlessly if it was hibernated to save RAM). */
+    private fun wakeWeb(tab: Tab): WebView {
+        tab.web?.let { return it }
+        val w = createWeb(tab)
+        tab.web = w
+        installEarlyScript(tab)
+        return w
+    }
+
+    /**
+     * Keeps ONLY the active tab (and any actively playing media tab) at foreground renderer priority;
+     * pauses idle background tabs so JS timers & animations never drain CPU/battery on low-end phones.
+     */
+    fun syncTabActivity() {
+        val active = tabs.getOrNull(current)
+        val now = System.currentTimeMillis()
+        active?.lastUsedMs = now
+        tabs.forEach { t ->
+            val w = t.web ?: return@forEach
+            val keepAwake = (t === active) || t.videoPlaying || t.videoPaused || (t === mediaTab) ||
+                ((w as? AurexWebView)?.backgroundMediaActive == true)
+            runCatching {
+                if (keepAwake) {
+                    w.onResume()
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        w.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+                    }
+                } else {
+                    w.onPause()
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        w.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_WAIVED, true)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * LRU Tab Hibernation: frees idle background WebViews past the device's RAM tier budget
+     * (LOW: 3 live, BALANCED: 6 live, HIGH: 12 live) while keeping title, URL, and favicon intact.
+     * Switching back to a hibernated tab transparently wakes and reloads it.
+     */
+    fun hibernateIdleTabs(forceAggressive: Boolean = false) {
+        val limit = when (PerfTier.tier) {
+            PerfTier.TIER_LOW -> if (forceAggressive) 1 else 2
+            PerfTier.TIER_BALANCED -> if (forceAggressive) 2 else 5
+            else -> if (forceAggressive) 4 else 10
+        }
+        val active = tabs.getOrNull(current)
+        val liveCount = tabs.count { it.web != null }
+        if (liveCount <= limit) return
+
+        val candidates = tabs.filter { t ->
+            val w = t.web
+            w != null &&
+                t !== active &&
+                t !== mediaTab &&
+                !t.videoPlaying &&
+                !t.videoPaused &&
+                (w as? AurexWebView)?.backgroundMediaActive != true &&
+                shotSession?.owns(w) != true
+        }.sortedBy { it.lastUsedMs }
+
+        var toFree = liveCount - limit
+        for (t in candidates) {
+            if (toFree <= 0) break
+            val w = t.web ?: continue
+            if (t.url.isNotBlank() && t.pendingUrl == null) {
+                t.pendingUrl = t.url
+            }
+            earlyHandles.remove(t.id)?.remove()
+            t.web = null
+            runCatching {
+                (w as? AurexWebView)?.onBackdropDirty = null
+                (w.parent as? ViewGroup)?.removeView(w)
+                w.stopLoading()
+                w.onPause()
+                w.destroy()
+            }
+            toFree--
+        }
+    }
+
+    private fun onActiveTabChanged() {
+        val active = tabs.getOrNull(current) ?: return
+        active.lastUsedMs = System.currentTimeMillis()
+        ensureLoaded(active)
+        if (!active.isHome && active.url.startsWith("http", true) && !isHandsOffHost(active.url)) {
+            if (active.loadedDesktop != null && active.loadedDesktop != desktop) {
+                reloadForDesktopChange(active)
+            } else if (active.loadedDarkWeb != null && active.loadedDarkWeb != darkOnFor(active.url) &&
+                DarkEngine.needsReloadOnFlip(hostOf(active.url))
+            ) {
+                reloadForThemeChange(active)
+            }
+        }
+        syncTabActivity()
+        hibernateIdleTabs(forceAggressive = false)
+    }
+
+    fun onMemoryPressure(aggressive: Boolean) {
+        if (aggressive) blocker.trimCache()
+        act.runOnUiThread {
+            if (live !== this) return@runOnUiThread
+            hibernateIdleTabs(forceAggressive = aggressive)
+            syncTabActivity()
+        }
+    }
+
     fun newTab(url: String = "", incognito: Boolean = false, defer: Boolean = false, select: Boolean = true): Tab {
         if (tabs.size >= 25) {
             notify("Tab limit reached · close a tab first")
             return tabs.getOrElse(current) { tabs.first() }
         }
         val t = Tab(nextTabId++, incognito)
-        t.web = createWeb(t)
-        installEarlyScript(t)
+        if (!defer) {
+            wakeWeb(t)
+        }
         tabs.add(t)
         if (select) current = tabs.lastIndex
         if (url.isNotBlank()) {
@@ -2224,11 +2492,19 @@ class BrowserState(private val act: Activity) {
             } else load(t, url)
         }
         barVisible = true
+        if (select) {
+            syncTabActivity()
+            hibernateIdleTabs(forceAggressive = false)
+        }
         return t
     }
 
-    /** Loads a restored tab the first time it is shown. */
+    /** Wakes a restored or hibernated tab the first time it is shown. */
     fun ensureLoaded(tab: Tab) {
+        tab.lastUsedMs = System.currentTimeMillis()
+        if (tab.web == null && (!tab.isHome || tab.pendingUrl != null)) {
+            wakeWeb(tab)
+        }
         val u = tab.pendingUrl ?: return
         tab.pendingUrl = null
         load(tab, u)
@@ -2242,7 +2518,7 @@ class BrowserState(private val act: Activity) {
             earlyHandles.remove(tab.id)?.remove()
             earlyHandles[tab.id] = WebViewCompat.addDocumentStartJavaScript(
                 w,
-                earlyScript(smoothVideo, adEarlyScripts() + AppLang.webScript()),
+                earlyScript(smoothVideo, desktop, adEarlyScripts() + AppLang.webScript()),
                 setOf("*")
             )
         }
@@ -2256,7 +2532,7 @@ class BrowserState(private val act: Activity) {
     /** Document-start scripts for ad / popup protection (empty when both are off). */
     private fun adEarlyScripts(): String {
         val sb = StringBuilder()
-        if (adblock) sb.append(AdBlocker.NET_GUARD_JS).append(AdBlocker.YT_PRUNE_JS).append(blocker.genericScript())
+        if (adblock) sb.append(AdBlocker.NET_GUARD_JS).append(AdBlocker.ANTI_ADBLOCK_JS).append(AdBlocker.YT_PRUNE_JS).append(blocker.genericScript())
         if ((popupBlock || adblock) && smartGuard) sb.append("\n;").append(AdBlocker.POPUP_GUARD_JS)
         return sb.toString()
     }
@@ -2283,6 +2559,7 @@ class BrowserState(private val act: Activity) {
                 else -> current
             }
         }
+        syncTabActivity()
         saveSession()
     }
 
@@ -2303,6 +2580,7 @@ class BrowserState(private val act: Activity) {
         if (i >= 0) {
             current = i
             barVisible = true
+            onActiveTabChanged()
         }
     }
 
@@ -2334,16 +2612,19 @@ class BrowserState(private val act: Activity) {
                 adultBlockedPage(tab, typed)
                 return
             }
-            val url = if (blockAdult) AdultFilter.safeSearchUrl(typed) ?: typed else typed
+            val cleaned = if (adblock) AdBlocker.stripTrackingParams(typed) ?: typed else typed
+            val url = if (blockAdult) AdultFilter.safeSearchUrl(cleaned) ?: cleaned else cleaned
             tab.error = null
             pushHistory(tab, url)
             // DNT is only attached to this one top-level request (never to the page's own XHR / fetch calls), which
             // makes a signed-in Instagram session look odd; Instagram gets a plain, header-for-header normal load.
             val hdr = HashMap<String, String>()
-            if (dnt && !isHandsOffHost(url)) hdr["DNT"] = "1"
-            // website language: the chosen language is asked for on this top-level request too
-            if (!isHandsOffHost(url)) AppLang.webHeader()?.let { hdr["Accept-Language"] = it }
-            tab.web?.loadUrl(url, hdr)
+            if (!isHandsOffHost(url)) {
+                if (dnt) hdr["DNT"] = "1"
+                hdr["Sec-CH-Prefers-Color-Scheme"] = if (darkOnFor(url)) "dark" else "light"
+                AppLang.webHeader()?.let { hdr["Accept-Language"] = it }
+            }
+            wakeWeb(tab).loadUrl(url, hdr)
             barVisible = true
         }
     }
@@ -2566,17 +2847,111 @@ class BrowserState(private val act: Activity) {
         quietNotify("Redirect opened in a new tab")
     }
 
+    /**
+     * Rewrites desktop/mobile subdomain & sticky query params when flipping Desktop Mode so sites
+     * like YouTube (`www.` <-> `m.`, `app=desktop`), Wikipedia (`en.` <-> `en.m.`), IMDb, Cricbuzz,
+     * Twitch, etc. immediately switch to the true desktop or true phone version instead of staying stuck.
+     */
+    private fun rewriteUrlForDesktopMode(rawUrl: String, toDesktop: Boolean): String {
+        if (!rawUrl.startsWith("http", true) || isHandsOffHost(rawUrl)) return rawUrl
+        return runCatching {
+            val uri = Uri.parse(rawUrl)
+            val scheme = uri.scheme ?: return rawUrl
+            val origHost = uri.host ?: return rawUrl
+            val h = origHost.lowercase()
+            val newHost = if (toDesktop) {
+                when {
+                    h == "m.youtube.com" -> "www.youtube.com"
+                    h.endsWith(".m.wikipedia.org") -> h.replace(".m.wikipedia.org", ".wikipedia.org")
+                    h == "m.wikipedia.org" -> "www.wikipedia.org"
+                    h in MOBILE_TO_WWW_HOSTS -> "www." + h.removePrefix("m.").removePrefix("mobile.")
+                    h in MOBILE_TO_BARE_HOSTS -> h.removePrefix("m.").removePrefix("mobile.")
+                    h.startsWith("m.") && h.count { it == '.' } >= 2 -> h.removePrefix("m.")
+                    else -> origHost
+                }
+            } else {
+                when {
+                    h == "www.youtube.com" || h == "youtube.com" -> "m.youtube.com"
+                    h.endsWith(".wikipedia.org") && !h.endsWith(".m.wikipedia.org") -> {
+                        val sub = h.substringBefore(".wikipedia.org")
+                        if (sub == "www") "en.m.wikipedia.org" else "$sub.m.wikipedia.org"
+                    }
+                    h == "www.imdb.com" || h == "imdb.com" -> "m.imdb.com"
+                    h == "www.cricbuzz.com" || h == "cricbuzz.com" -> "m.cricbuzz.com"
+                    h == "www.twitch.tv" || h == "twitch.tv" -> "m.twitch.tv"
+                    else -> origHost
+                }
+            }
+            val dropKeys = if (toDesktop) setOf("app", "m", "mobile") else setOf("app", "persist_app", "nomobile", "desktop", "force_desktop", "view")
+            val rawQuery = uri.encodedQuery
+            val newQuery = if (rawQuery.isNullOrEmpty()) null else {
+                val kept = rawQuery.split('&').filter { part ->
+                    if (part.isEmpty()) return@filter false
+                    val k = part.substringBefore('=').lowercase()
+                    val v = part.substringAfter('=', "").lowercase()
+                    when {
+                        k == "app" && toDesktop && (v == "m" || v == "mobile") -> false
+                        k == "app" && !toDesktop && v == "desktop" -> false
+                        k == "m" && toDesktop && v == "1" -> false
+                        k == "view" && !toDesktop && v == "desktop" -> false
+                        k in dropKeys && k != "app" && k != "m" && k != "view" -> false
+                        else -> true
+                    }
+                }
+                if (kept.isEmpty()) null else kept.joinToString("&")
+            }
+            val portPart = if (uri.port > 0) ":${uri.port}" else ""
+            val pathPart = uri.encodedPath.orEmpty()
+            val qPart = if (newQuery != null) "?$newQuery" else ""
+            val fragPart = uri.encodedFragment?.let { "#$it" }.orEmpty()
+            "$scheme://$newHost$portPart$pathPart$qPart$fragPart"
+        }.getOrDefault(rawUrl)
+    }
+
+    /** Cleanly reloads [tab] into the current [desktop] mode with zero stale HTTP cache or stuck desktop zoom. */
+    private fun reloadForDesktopChange(tab: Tab) {
+        val w = tab.web ?: return
+        val liveUrl = runCatching { w.url }.getOrNull()?.takeIf { it.startsWith("http", true) }
+            ?: tab.url.takeIf { it.startsWith("http", true) }
+            ?: return
+        if (isHandsOffHost(liveUrl)) return
+        val targetUrl = rewriteUrlForDesktopMode(liveUrl, desktop)
+        w.stopLoading()
+        (w as? AurexWebView)?.setPreferredUa(if (desktop) DESKTOP_UA else null)
+        installEarlyScript(tab)
+        if (!desktop) {
+            runCatching { w.evaluateJavascript(MOBILE_RESET_JS, null) }
+            runCatching { w.setInitialScale(0) }
+        }
+        // Bypass stale cached desktop/mobile HTML for this one toggle navigation (restored in onPageFinished!)
+        tab.freshReloadOnce = true
+        tab.loadedDesktop = desktop
+        runCatching { w.settings.cacheMode = WebSettings.LOAD_NO_CACHE }
+        val hdr = HashMap<String, String>()
+        hdr["Cache-Control"] = "no-cache"
+        hdr["Pragma"] = "no-cache"
+        if (dnt) hdr["DNT"] = "1"
+        hdr["Sec-CH-Prefers-Color-Scheme"] = if (darkOnFor(targetUrl)) "dark" else "light"
+        AppLang.webHeader()?.let { hdr["Accept-Language"] = it }
+        w.loadUrl(targetUrl, hdr)
+    }
+
     fun toggleDesktop() {
         desktop = !desktop
         tabs.forEach { t ->
+            val w = t.web ?: return@forEach
             // Instagram keeps the phone's own user agent whatever the switch says (see AurexWebView.setPreferredUa).
-            (t.web as? AurexWebView)?.setPreferredUa(if (desktop) DESKTOP_UA else null)
-            t.web?.settings?.apply {
+            (w as? AurexWebView)?.setPreferredUa(if (desktop) DESKTOP_UA else null)
+            w.settings.apply {
                 useWideViewPort = true
                 loadWithOverviewMode = true
             }
+            if (!desktop) runCatching { w.setInitialScale(0) }
+            installEarlyScript(t)
         }
-        tabs.getOrNull(current)?.web?.reload()
+        tabs.getOrNull(current)?.let { cur ->
+            if (!cur.isHome) reloadForDesktopChange(cur)
+        }
         save()
         notify(if (desktop) "Desktop site on" else "Mobile site on")
     }
@@ -2588,29 +2963,31 @@ class BrowserState(private val act: Activity) {
     }
 
     /**
-     * Long screenshot of the current page (see [LongShot]): the page scrolls by itself, loads what is on screen and is
-     * captured piece by piece; a touch hands the scrolling to the user. The result opens in the preview.
+     * Pro Screenshot capture (see [LongShot]):
+     *  - Ordinary pages: full-page auto/manual scrolling capture with smart fixed-bar hiding & off-thread stitching.
+     *  - Instagram / Facebook (hands-off): instant safe 1-screen capture with zero JS injection & zero scrolling!
      */
-    fun captureScreenshot(tab: Tab) {
+    fun captureScreenshot(tab: Tab, singleScreen: Boolean = false) {
         if (shotSession != null) return
         val web = tab.web
         if (web == null || tab.isHome || web.width <= 0 || web.height <= 0) {
             notify("Open a webpage first to capture a screenshot")
             return
         }
-        // Long screenshot scrolls the page by itself, fast and in steps: on Instagram that is a machine-like
-        // scroll pattern on the live account, so it stays off there (the normal screenshot keys still work).
-        if (isHandsOffHost(runCatching { web.url }.getOrNull() ?: tab.url)) {
-            notify("Long screenshot is off on Instagram / Facebook to keep your account safe")
-            return
-        }
+        val handsOff = isHandsOffHost(runCatching { web.url }.getOrNull() ?: tab.url)
+        val oneScreen = singleScreen || handsOff
         barVisible = false
         val title = tab.title.ifBlank { hostOf(tab.url).ifBlank { "Webpage" } }
-        val session = LongShot(web, if (effectiveDarkTheme()) 0xFF0A0B0F.toInt() else 0xFFFFFFFF.toInt()) { bmp, message, screens ->
+        val pageBg = if (darkOnFor(tab.url)) 0xFF0A0B0F.toInt() else 0xFFFFFFFF.toInt()
+        val session = LongShot(web, pageBg, singleScreenOnly = oneScreen) { bmp, message, screens ->
             shotSession = null
             barVisible = true
-            if (bmp != null) screenshot = ScreenshotData(bmp, true, title, screens)
-            else if (message != null) notify(message)
+            if (bmp != null) {
+                screenshot = ScreenshotData(bmp, !oneScreen, title, screens)
+                if (handsOff) notify("Captured visible screen")
+            } else if (message != null) {
+                notify(message)
+            }
         }
         shotSession = session
         session.start()
@@ -2620,53 +2997,126 @@ class BrowserState(private val act: Activity) {
         shotSession?.cancel()
     }
 
-    private fun pngName(data: ScreenshotData): String {
+    private fun shotFileName(data: ScreenshotData, asJpg: Boolean): String {
         val safeName = data.title.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(36).ifBlank { "page" }
-        return "Aurex_${safeName}_${System.currentTimeMillis()}.png"
+        val ext = if (asJpg) "jpg" else "png"
+        return "Aurex_${safeName}_${System.currentTimeMillis()}.$ext"
     }
 
-    /** Saves the picture to the gallery (Pictures/AurexBrowser). Encoding a tall PNG takes a moment: off the UI thread. */
-    fun saveScreenshot(data: ScreenshotData, onDone: (Boolean) -> Unit) {
+    /** Returns a cropped copy when trimmed, else the original bitmap. Caller recycles only if `res !== src`. */
+    private fun trimmedBitmap(src: Bitmap, topFrac: Float, bottomFrac: Float): Bitmap {
+        val tf = topFrac.coerceIn(0f, 0.94f)
+        val bf = bottomFrac.coerceIn((tf + 0.05f).coerceAtMost(1f), 1f)
+        if (tf <= 0.005f && bf >= 0.995f) return src
+        val y = (src.height * tf).toInt().coerceIn(0, (src.height - 1).coerceAtLeast(0))
+        val h = ((src.height * bf).toInt() - y).coerceIn(1, src.height - y)
+        return runCatching { Bitmap.createBitmap(src, 0, y, src.width, h) }.getOrDefault(src)
+    }
+
+    private fun writeShot(bmp: Bitmap, asJpg: Boolean, out: java.io.OutputStream): Boolean =
+        if (asJpg) bmp.compress(Bitmap.CompressFormat.JPEG, 92, out)
+        else bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+
+    /** Saves the screenshot (PNG or compact JPG, optionally trimmed) to Pictures/AurexBrowser off the UI thread. */
+    fun saveScreenshot(
+        data: ScreenshotData,
+        asJpg: Boolean = false,
+        topFrac: Float = 0f,
+        bottomFrac: Float = 1f,
+        onDone: (Boolean) -> Unit
+    ) {
         Thread {
-            val fileName = pngName(data)
+            val fileName = shotFileName(data, asJpg)
+            val mime = if (asJpg) "image/jpeg" else "image/png"
+            val outBmp = trimmedBitmap(data.bitmap, topFrac, bottomFrac)
             val ok = try {
                 if (Build.VERSION.SDK_INT >= 29) {
                     val values = android.content.ContentValues().apply {
                         put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                        put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/png")
+                        put(android.provider.MediaStore.Images.Media.MIME_TYPE, mime)
                         put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, android.os.Environment.DIRECTORY_PICTURES + "/AurexBrowser")
                     }
                     val uri = act.contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                     uri != null && act.contentResolver.openOutputStream(uri)?.use { out ->
-                        data.bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                        writeShot(outBmp, asJpg, out)
                     } == true
                 } else {
                     val dir = act.getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES)?.apply { mkdirs() } ?: act.filesDir
                     java.io.File(dir, fileName).outputStream().use { out ->
-                        data.bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                        writeShot(outBmp, asJpg, out)
                     }
                 }
-            } catch (e: Throwable) {
+            } catch (_: Throwable) {
                 false
+            } finally {
+                if (outBmp !== data.bitmap) runCatching { outBmp.recycle() }
             }
             act.runOnUiThread {
+                if (ok) Haptics.fire(null, Hx.SUCCESS)
                 notify(if (ok) "Saved to Pictures/AurexBrowser" else "Save failed")
                 onDone(ok)
             }
         }.start()
     }
 
-    /** Opens the share sheet. The picture goes through the cache folder (the gallery copy is not needed for sharing). */
-    fun shareScreenshot(data: ScreenshotData, onDone: () -> Unit = {}) {
+    /** Copies the screenshot image URI straight to the Android clipboard so it can be pasted into any app. */
+    fun copyScreenshot(
+        data: ScreenshotData,
+        asJpg: Boolean = false,
+        topFrac: Float = 0f,
+        bottomFrac: Float = 1f,
+        onDone: (Boolean) -> Unit = {}
+    ) {
         Thread {
+            val outBmp = trimmedBitmap(data.bitmap, topFrac, bottomFrac)
             val file = try {
                 val dir = java.io.File(act.cacheDir, "shots").apply { mkdirs() }
                 dir.listFiles()?.forEach { runCatching { it.delete() } }
-                java.io.File(dir, pngName(data)).also { f ->
-                    f.outputStream().use { out -> data.bitmap.compress(Bitmap.CompressFormat.PNG, 100, out) }
+                java.io.File(dir, shotFileName(data, asJpg)).also { f ->
+                    f.outputStream().use { out -> writeShot(outBmp, asJpg, out) }
                 }
-            } catch (e: Throwable) {
+            } catch (_: Throwable) {
                 null
+            } finally {
+                if (outBmp !== data.bitmap) runCatching { outBmp.recycle() }
+            }
+            act.runOnUiThread {
+                val ok = if (file != null) {
+                    runCatching {
+                        val uri = androidx.core.content.FileProvider.getUriForFile(act, "${act.packageName}.files", file)
+                        val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        cm.setPrimaryClip(android.content.ClipData.newUri(act.contentResolver, "Screenshot", uri))
+                        true
+                    }.getOrDefault(false)
+                } else false
+                if (ok) Haptics.fire(null, Hx.SUCCESS)
+                notify(if (ok) "Screenshot copied" else "Couldn't copy screenshot")
+                onDone(ok)
+            }
+        }.start()
+    }
+
+    /** Opens the share sheet with the trimmed PNG or compact JPG screenshot. */
+    fun shareScreenshot(
+        data: ScreenshotData,
+        asJpg: Boolean = false,
+        topFrac: Float = 0f,
+        bottomFrac: Float = 1f,
+        onDone: () -> Unit = {}
+    ) {
+        Thread {
+            val mime = if (asJpg) "image/jpeg" else "image/png"
+            val outBmp = trimmedBitmap(data.bitmap, topFrac, bottomFrac)
+            val file = try {
+                val dir = java.io.File(act.cacheDir, "shots").apply { mkdirs() }
+                dir.listFiles()?.forEach { runCatching { it.delete() } }
+                java.io.File(dir, shotFileName(data, asJpg)).also { f ->
+                    f.outputStream().use { out -> writeShot(outBmp, asJpg, out) }
+                }
+            } catch (_: Throwable) {
+                null
+            } finally {
+                if (outBmp !== data.bitmap) runCatching { outBmp.recycle() }
             }
             act.runOnUiThread {
                 if (file == null) {
@@ -2675,7 +3125,7 @@ class BrowserState(private val act: Activity) {
                     runCatching {
                         val uri = androidx.core.content.FileProvider.getUriForFile(act, "${act.packageName}.files", file)
                         val intent = Intent(Intent.ACTION_SEND)
-                            .setType("image/png")
+                            .setType(mime)
                             .putExtra(Intent.EXTRA_STREAM, uri)
                             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         act.startActivity(Intent.createChooser(intent, "Share Screenshot"))
@@ -2688,18 +3138,23 @@ class BrowserState(private val act: Activity) {
 
     fun applySettings() {
         tabs.forEach { t ->
-            t.web?.settings?.apply {
-                @SuppressLint("SetJavaScriptEnabled")
-                javaScriptEnabled = jsEnabled
-                blockNetworkImage = blockImages
-                textZoom = this@BrowserState.textZoom
-                mediaPlaybackRequiresUserGesture = !autoplay
-                javaScriptCanOpenWindowsAutomatically = !(popupBlock || adblock)
+            val w = t.web ?: return@forEach
+            runCatching {
+                w.settings.apply {
+                    @SuppressLint("SetJavaScriptEnabled")
+                    javaScriptEnabled = jsEnabled
+                    blockNetworkImage = blockImages
+                    textZoom = this@BrowserState.textZoom
+                    mediaPlaybackRequiresUserGesture = !autoplay
+                    javaScriptCanOpenWindowsAutomatically = !(popupBlock || adblock)
+                }
+                (w as? AurexWebView)?.setPreferredUa(if (desktop) DESKTOP_UA else null)
+                CookieManager.getInstance().setAcceptThirdPartyCookies(w, !t.incognito && thirdPartyCookies)
+                val sd = darkOnFor(t.url)
+                w.setBackgroundColor(if (sd) 0xFF06070B.toInt() else 0xFFFFFFFF.toInt())
+                applyDarkWeb(w, sd, t.url)
+                installEarlyScript(t)
             }
-            (t.web as? AurexWebView)?.setPreferredUa(if (desktop) DESKTOP_UA else null)
-            CookieManager.getInstance().setAcceptThirdPartyCookies(t.web, !t.incognito && thirdPartyCookies)
-            t.web?.let { applyDarkWeb(it, darkWebEnabled()) }
-            installEarlyScript(t)
         }
     }
 
@@ -2713,10 +3168,10 @@ class BrowserState(private val act: Activity) {
         if (tab.url.isBlank()) return
         val existing = bookmarks.firstOrNull { it.url == tab.url }
         if (existing != null) {
-            bookmarks.remove(existing)
+            bookmarks.remove(existing); bookmarksDirty = true
             notify("Bookmark removed")
         } else {
-            bookmarks.add(0, Bookmark(tab.url, tab.title, System.currentTimeMillis()))
+            bookmarks.add(0, Bookmark(tab.url, tab.title, System.currentTimeMillis())); bookmarksDirty = true
             notify("Bookmark saved")
         }
         save()
@@ -2724,12 +3179,19 @@ class BrowserState(private val act: Activity) {
 
     fun isBookmarked(url: String): Boolean = bookmarks.any { it.url == url }
 
+    fun removeBookmark(bm: Bookmark) {
+        if (bookmarks.remove(bm)) {
+            bookmarksDirty = true
+            save()
+        }
+    }
+
     fun deleteHistory(entry: HistoryEntry) {
-        history.remove(entry); save()
+        history.remove(entry); historyDirty = true; save()
     }
 
     fun clearHistory() {
-        history.clear(); save(); notify("History cleared")
+        history.clear(); historyDirty = true; save(); notify("History cleared")
     }
 
     // ── Cookies: the Meta login survives "clear" ──────────────────────────────
@@ -2799,7 +3261,7 @@ class BrowserState(private val act: Activity) {
     }
 
     fun clearBrowsingData() {
-        history.clear()
+        history.clear(); historyDirty = true
         removeCookiesKeepingMeta()
         WebStorage.getInstance().deleteAllData()
         tabs.forEach {
@@ -2851,22 +3313,21 @@ class BrowserState(private val act: Activity) {
         adblock = true; popupBlock = true
         dnt = true; thirdPartyCookies = false
         accent = 0xFF0A84FF.toInt(); dynamicAccent = false
-        glass = 0.86f; haptics = true; glow = true
-        hapticLevel = 1; Haptics.level = 1
+        glass = 0.86f; haptics = true; dynamicIsland = true; NotifIsland.enabled = true; glow = true
         barTop = false; autoHide = true; textZoom = 100
         themeMode = ThemeModes.AUTO; darkWeb = DarkWebModes.AUTO; darkOffHosts = emptySet()
         backgroundPlay = true; autoPip = true; mediaFab = true; downloadFab = true
         setVideoDownload(true, quiet = true)
-        desktop = false; jsEnabled = true; blockImages = false; engine = 0
+        val wasDesktop = desktop; desktop = false; jsEnabled = true; blockImages = false; engine = 0
         autoplay = true; smoothVideo = true; showHomeSites = true; showRecent = true
         toolbarRows = 0; toolbarItems = DEFAULT_TOOLBAR_ITEMS.split(','); toolbarLeft = 0; toolbarTop = -1
         mediaPlayerEnabled = true
-        swipeDlRightDelete = true; swipeDlLeftShare = true
+        swipeDlRightDelete = true; swipeDlLeftShare = true; swipeTabCardClose = true; swipeLibraryActions = true; swipeEdgeBack = true
         holdTabsNewTab = true; holdMenuSettings = true
         resetMenu()
         lastDarkTheme = null; lastDarkWeb = null
         save(); applySettings()
-        tabs.forEach { it.web?.reload() }
+        tabs.forEach { t -> if (wasDesktop && !t.isHome) reloadForDesktopChange(t) else t.web?.reload() }
         notify("Settings reset")
     }
 
@@ -2985,8 +3446,10 @@ class BrowserState(private val act: Activity) {
             out[h] = when {
                 real != null -> real to false
                 known.isNotEmpty() -> {
-                    val hk = known.keys.minByOrNull { kotlin.math.abs(it - h) }!!
-                    ((known[hk]!! * Math.pow(h.toDouble() / hk, 1.5)).toLong()) to true
+                    val hk = known.keys.minByOrNull { kotlin.math.abs(it - h) }
+                    val kv = if (hk != null && hk > 0) known[hk] else null
+                    if (hk != null && kv != null) ((kv * Math.pow(h.toDouble() / hk, 1.5)).toLong()) to true
+                    else 0L to true
                 }
                 media.durationSec > 0 ->
                     (((typicalKbps(h) + 128) * 1000.0 / 8.0 * media.durationSec).toLong()) to true
@@ -3271,14 +3734,14 @@ class BrowserState(private val act: Activity) {
     }
 
     // ── WebView factory ──────────────────────────────────────────────────────
-    private fun webBackground(): Int = if (effectiveDarkTheme()) 0xFF06070B.toInt() else 0xFFFFFFFF.toInt()
+    private fun webBackground(): Int = if (darkWebEnabled()) 0xFF06070B.toInt() else 0xFFFFFFFF.toInt()
 
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     private fun createWeb(tab: Tab): WebView = AurexWebView(act).apply {
         // Fix 1: AurexWebView's init already sets LAYER_TYPE_HARDWARE, RENDERER_PRIORITY_IMPORTANT,
         // mediaPlaybackRequiresUserGesture = false, javaScriptEnabled, domStorageEnabled.
-        // Enable background-media throttle suppression whenever backgroundPlay is on.
-        backgroundMediaActive = backgroundPlay
+        // Only active media playback enables background renderer keep-alive (stops idle tabs from draining CPU/RAM).
+        backgroundMediaActive = false
         sniffEnabled = videoDownload     // off = the stream sniffer never starts in this tab
         setBackgroundColor(webBackground())
         overScrollMode = View.OVER_SCROLL_NEVER
@@ -3286,6 +3749,7 @@ class BrowserState(private val act: Activity) {
         settings.apply {
             javaScriptEnabled = jsEnabled
             domStorageEnabled = true
+            @Suppress("DEPRECATION")
             databaseEnabled = true
             allowFileAccess = true
             allowContentAccess = true
@@ -3320,7 +3784,7 @@ class BrowserState(private val act: Activity) {
         }
         // Note: setRendererPriorityPolicy is already called in AurexWebView.init; skip duplicate.
         applyDarkWeb(this, darkWebEnabled())
-        CookieManager.getInstance().setAcceptThirdPartyCookies(this, !tab.incognito && thirdPartyCookies)
+        runCatching { CookieManager.getInstance().setAcceptThirdPartyCookies(this, !tab.incognito && thirdPartyCookies) }
         addJavascriptInterface(WebBridge(tab), "AurexMedia")
         // Fix 3: AurexMediaBridge handles service start/stop from JS video-state callbacks.
         addJavascriptInterface(AurexMediaBridge(tab), "AurexMediaBridge")
@@ -3335,12 +3799,12 @@ class BrowserState(private val act: Activity) {
         // A finger swipe on the page decides the toolbar on its own, whether or not the page can scroll:
         // swipe up always hides it, swipe down brings it back (so a short page can never trap a hidden bar).
         // The listener only watches (returns false), the page still gets every touch.
-        val swipeDistance = android.view.ViewConfiguration.get(act).scaledTouchSlop * 3f
+        val swipeDistance = android.view.ViewConfiguration.get(act).scaledTouchSlop * 3.5f
         var swipeX = 0f
         var swipeY = 0f
         var swipeDone = true
+        var scrollAccum = 0
         setOnTouchListener { v, ev ->
-            // A long screenshot is running: the touch only tells it that the user took over scrolling.
             val shot = shotSession
             if (shot != null && shot.owns(v)) {
                 shot.onTouch(ev.actionMasked)
@@ -3350,37 +3814,38 @@ class BrowserState(private val act: Activity) {
                 android.view.MotionEvent.ACTION_DOWN -> {
                     swipeX = ev.x; swipeY = ev.y
                     swipeDone = false
+                    scrollAccum = 0
                 }
-                android.view.MotionEvent.ACTION_POINTER_DOWN -> swipeDone = true   // pinch zoom: not a swipe
+                android.view.MotionEvent.ACTION_POINTER_DOWN -> swipeDone = true
                 android.view.MotionEvent.ACTION_MOVE -> if (!swipeDone) {
                     val dx = ev.x - swipeX
                     val dy = ev.y - swipeY
-                    if (abs(dy) >= swipeDistance && abs(dy) > abs(dx) * 1.3f) {
+                    if (abs(dy) >= swipeDistance && abs(dy) > abs(dx) * 1.4f) {
                         swipeDone = true
-                        if (autoHide && !toolbarLocked && !tab.isHome && fullscreen == null && !inlinePlayer) {
-                            if (dy < 0) barVisible = false else barVisible = true
+                        // Touch fallback ONLY when page uses internal CSS scroller (scrollY == 0)
+                        if (autoHide && !toolbarLocked && !tab.isHome && fullscreen == null && !inlinePlayer && v.scrollY == 0) {
+                            val next = dy > 0f
+                            if (barVisible != next) barVisible = next
                         }
                     }
                 }
             }
             false
         }
-        var scrollAccum = 0
         setOnScrollChangeListener { _, _, y, _, oldY ->
             if (!autoHide || toolbarLocked || tab.isHome || shotSession != null) return@setOnScrollChangeListener
             val dy = y - oldY
             if (dy > 0) {
-                // A short downward swipe hides the chrome, but never before the
-                // page has actually moved away from the top.
                 if (scrollAccum < 0) scrollAccum = 0
-                scrollAccum = (scrollAccum + dy).coerceAtMost(260)
-                if (scrollAccum > 36 && y > 120) barVisible = false
+                scrollAccum = (scrollAccum + dy).coerceAtMost(320)
+                if (barVisible && scrollAccum > 48 && y > 140) {
+                    barVisible = false
+                    scrollAccum = 0
+                }
             } else if (dy < 0) {
-                // Any upward movement brings the bar straight back, exactly like
-                // Safari — reading upward should never feel unresponsive.
                 if (scrollAccum > 0) scrollAccum = 0
-                scrollAccum = (scrollAccum + dy).coerceAtLeast(-140)
-                if (!barVisible || scrollAccum < -14 || y <= 10) {
+                scrollAccum = (scrollAccum + dy).coerceAtLeast(-160)
+                if (!barVisible && (scrollAccum < -22 || y <= 16)) {
                     barVisible = true
                     scrollAccum = 0
                 }
@@ -3404,37 +3869,38 @@ class BrowserState(private val act: Activity) {
                 // and its CDN links (signed halves of a DASH stream) are never kept as media links: the page
                 // address is what goes to the engine.
                 // The same holds for every sub-request of a Meta page (Facebook, Threads ...): nothing of it is filtered.
-                if (!request.isForMainFrame && (isMetaCdnHost(reqHost) || isHandsOffHost(pageHostOf(tab)))) return null
-                // Video chunks are requested hundreds of times; they never go through the filters
-                // (a false match there stalls playback) and only the first one is listed as media.
+                val isSub = !request.isForMainFrame
+                val pageHost = if (isSub) pageHostOf(tab) else ""
+                val handsOffPage = isSub && isHandsOffHost(pageHost)
+                if (isSub && (isMetaCdnHost(reqHost) || handsOffPage)) return null
                 if (reqHost.endsWith("googlevideo.com")) {
-                    if (mediaDetect && !request.isForMainFrame &&
+                    if (mediaDetect && isSub &&
                         runCatching { tab.media.none { "googlevideo.com" in it } }.getOrDefault(false)
                     ) addMedia(tab, url)
                     return null
                 }
-                // YouTube's own player files / thumbnails / player API: pure string test, no filter
-                // scan, so the first frame is not held up by ~15 regexes per unique URL.
                 if (isTrustedYoutubeAsset(reqHost, request.url.path.orEmpty())) return null
-                if (request.isForMainFrame && !isHandsOffHost(reqHost) && vetPopup(tab, url)) {
-                    return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                if (!isSub && !isHandsOffHost(reqHost) && vetPopup(tab, url)) {
+                    return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(EMPTY_BYTES))
                 }
                 if (blockAdult) {
-                    // Main frame: whole address. Everything else (frames, images, scripts): cached host check only.
-                    val adult = if (request.isForMainFrame) AdultFilter.matches(url) else AdultFilter.isAdultHost(reqHost)
+                    val adult = if (!isSub) AdultFilter.matches(url) else AdultFilter.isAdultHost(reqHost)
                     if (adult) {
                         countBlocked()
-                        return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                        return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(EMPTY_BYTES))
                     }
                 }
-                if (adblock && !request.isForMainFrame && !isHandsOffHost(pageHostOf(tab)) &&
-                    blocker.shouldBlockRequest(
-                        url, reqHost, pageHostOf(tab),
-                        blocker.inferType(url, request.requestHeaders?.get("Accept"))
-                    )
-                ) {
-                    countBlocked()
-                    return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                if (adblock && isSub && !handsOffPage) {
+                    val reqType = blocker.inferType(url, request.requestHeaders?.get("Accept"))
+                    if (blocker.shouldBlockRequest(url, reqHost, pageHost, reqType)) {
+                        countBlocked()
+                        return when (reqType) {
+                            FilterEngine.T_IMAGE -> WebResourceResponse("image/gif", null, ByteArrayInputStream(EMPTY_GIF))
+                            FilterEngine.T_SCRIPT -> WebResourceResponse("application/javascript", "utf-8", ByteArrayInputStream(EMPTY_BYTES))
+                            FilterEngine.T_CSS -> WebResourceResponse("text/css", "utf-8", ByteArrayInputStream(EMPTY_BYTES))
+                            else -> WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(EMPTY_BYTES))
+                        }
+                    }
                 }
                 if (mediaDetect && !request.isForMainFrame) {
                     // The Referer of the request is the FRAME that asked (the embed player), which is what the
@@ -3521,10 +3987,14 @@ class BrowserState(private val act: Activity) {
                     }
                     return false
                 }
-                // A page that was not tapped must not be able to launch other apps (fake "install" ads).
-                if (!request.hasGesture() && (popupBlock || adblock)) {
-                    act.runOnUiThread { blocked = blocked + 1; quietNotify("Blocked an app launch") }
-                    return true
+                // Block script/click-hijack attempts to launch Play Store or scam apps while allowing UPI/messaging links!
+                if ((popupBlock || adblock) && !guard.isUserTrusted(guardPageHost(tab))) {
+                    val trustedApp = guard.isTrustedExternalScheme(scheme)
+                    val tapMatched = guard.clickMatchesSchemeOrHost(tab.id, uri.toString())
+                    if (!request.hasGesture() || (!trustedApp && !tapMatched && (scheme == "market" || scheme == "intent"))) {
+                        act.runOnUiThread { blocked = blocked + 1; redirectsBlocked += 1; quietNotify("Blocked an app redirect") }
+                        return true
+                    }
                 }
                 return try {
                     if (scheme == "intent") {
@@ -3552,7 +4022,9 @@ class BrowserState(private val act: Activity) {
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-                applyDarkWeb(view, darkWebEnabled(), url)
+                val sdStart = darkOnFor(url)
+                view.setBackgroundColor(if (sdStart) 0xFF06070B.toInt() else 0xFFFFFFFF.toInt())
+                applyDarkWeb(view, sdStart, url)
                 // The blank page behind a "page blocked" screen must not clear that screen.
                 if (url == "about:blank" && tab.error?.startsWith("Blocked") == true) {
                     tab.progress = 1f
@@ -3564,7 +4036,11 @@ class BrowserState(private val act: Activity) {
                     return
                 }
                 tab.url = if (url == "about:blank") "" else url
-                if (url.startsWith("http", true)) guard.visit(tab.id, guard.hostOf(url))
+                if (url.startsWith("http", true)) {
+                    tab.loadedDesktop = desktop
+                    tab.loadedDarkWeb = darkOnFor(url)
+                    guard.visit(tab.id, guard.hostOf(url))
+                }
                 if (tab.hiddenPopup && url != "about:blank") revealPopup(tab)
                 shotSession?.let { if (it.owns(view)) it.cancel() }
                 tab.progress = 0.08f
@@ -3597,6 +4073,24 @@ class BrowserState(private val act: Activity) {
              * built-in player were given that address instead of the video's.
              */
             override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
+                if (blockAdult && url.startsWith("http", true)) {
+                    if (AdultFilter.matches(url)) {
+                        adultBlockedPage(tab, url)
+                        return
+                    }
+                    val safe = AdultFilter.safeSearchUrl(url)
+                    if (safe != null) {
+                        view.loadUrl(safe)
+                        return
+                    }
+                    if (!isReload) {
+                        view.postDelayed({
+                            if (blockAdult && runCatching { view.url }.getOrNull() == url) {
+                                view.evaluateJavascript(AdultFilter.SCAN_JS, null)
+                            }
+                        }, 600L)
+                    }
+                }
                 if (url.startsWith("http", true) && tab.url != url && !isReload) { tab.url = url }
                 prefetchPage(tab, url)
             }
@@ -3604,6 +4098,7 @@ class BrowserState(private val act: Activity) {
             override fun onPageCommitVisible(view: WebView, url: String) {
                 // Inject before first paint so ads and popups never flash.
                 injectProtection(view, url)
+                (view as? AurexWebView)?.notifyBackdropDirty()
             }
 
             override fun onPageFinished(view: WebView, url: String) {
@@ -3614,6 +4109,10 @@ class BrowserState(private val act: Activity) {
                 tab.progress = 1f
                 tab.canBack = view.canGoBack()
                 tab.canForward = view.canGoForward()
+                (view as? AurexWebView)?.let { aw ->
+                    aw.notifyBackdropDirty()
+                    aw.postDelayed({ aw.notifyBackdropDirty() }, 320L)
+                }
                 if (url == "about:blank") {
                     tab.url = ""
                     tab.title = "New tab"
@@ -3652,7 +4151,15 @@ class BrowserState(private val act: Activity) {
                     if (parsed != null) applySiteAccent(tab, parsed)
                     else if (tab.siteAccent == null) applySiteAccent(tab, accentFromBitmap(tab.favicon))
                 }
-                val darkEnabled = darkWebEnabled()
+                if (tab.freshReloadOnce) {
+                    tab.freshReloadOnce = false
+                    runCatching {
+                        view.settings.cacheMode = if (tab.incognito) WebSettings.LOAD_NO_CACHE else WebSettings.LOAD_DEFAULT
+                        if (!desktop) view.setInitialScale(0)
+                    }
+                }
+                val darkEnabled = darkOnFor(url)
+                view.setBackgroundColor(if (darkEnabled) 0xFF06070B.toInt() else 0xFFFFFFFF.toInt())
                 applyDarkWeb(view, darkEnabled, url)
                 // WebViews without document-start scripts: the engine is injected here instead (idempotent).
                 if (!isHandsOffHost(url)) view.evaluateJavascript(DarkEngine.JS + "\n;" + DarkEngine.REFRESH_JS, null)
@@ -3676,6 +4183,9 @@ class BrowserState(private val act: Activity) {
         webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView, newProgress: Int) {
                 tab.progress = newProgress / 100f
+                if (newProgress >= 40 && newProgress % 20 == 0) {
+                    (view as? AurexWebView)?.notifyBackdropDirty()
+                }
             }
 
             override fun onReceivedTitle(view: WebView, title: String) {
@@ -3709,7 +4219,7 @@ class BrowserState(private val act: Activity) {
                 nt.openerId = tab.id
                 nt.popupGuardUntil = now + 6000
                 nt.openerHost = pageHostOf(tab)
-                (resultMsg.obj as WebView.WebViewTransport).webView = nt.web
+                (resultMsg.obj as WebView.WebViewTransport).webView = wakeWeb(nt)
                 resultMsg.sendToTarget()
                 // A window that never loads anything is shown anyway after a moment (scripted pages that fill it later).
                 act.window.decorView.postDelayed({ revealPopup(nt) }, 2500)
@@ -3858,6 +4368,7 @@ class BrowserState(private val act: Activity) {
     /** Cosmetic, popup and YouTube ad protection, safe to run more than once. */
     private fun injectProtection(view: WebView, url: String) {
         if (isHandsOffHost(url)) return
+        if (desktop) view.evaluateJavascript(DESKTOP_VIEWPORT_JS, null)
         val isYt = url.contains("youtube.com") || url.contains("youtu.be") ||
             url.contains("youtube-nocookie.com")
         if (adblock && !isYt) view.evaluateJavascript(AdBlocker.HIDE_JS, null)
@@ -3908,6 +4419,17 @@ class BrowserState(private val act: Activity) {
         if (!(popupBlock || adblock)) return false
         if (tab.popupGuardUntil == 0L || android.os.SystemClock.uptimeMillis() > tab.popupGuardUntil) return false
         if (url == "about:blank") return false
+        if (blockAdult && AdultFilter.matches(url)) {
+            act.window.decorView.post {
+                val i = tabs.indexOf(tab)
+                if (i >= 0) {
+                    blocked = blocked + 1; adultBlocked += 1; popupsBlocked += 1
+                    quietNotify("Adult popup blocked")
+                    closeTab(i)
+                }
+            }
+            return true
+        }
         if (guard.isUserTrusted(tab.openerHost)) return false
         val listHit = blocker.shouldBlock(url) || guard.knownPopNetwork(url)
         val bad = if (smartGuard) {
@@ -4018,7 +4540,7 @@ class BrowserState(private val act: Activity) {
 
     private fun recordHistory(url: String, title: String) {
         history.removeAll { it.url == url }
-        history.add(0, HistoryEntry(url, title, System.currentTimeMillis()))
+        history.add(0, HistoryEntry(url, title, System.currentTimeMillis())); historyDirty = true
         while (history.size > 400) history.removeAt(history.lastIndex)
         if (history.size % 5 == 0) save()
     }
@@ -4186,7 +4708,7 @@ class BrowserState(private val act: Activity) {
                     }
 
                     // Fix 5: keep the AurexWebView renderer alive and start the foreground service.
-                    (tab.web as? AurexWebView)?.backgroundMediaActive = true
+                    (tab.web as? AurexWebView)?.backgroundMediaActive = backgroundPlay
                     if (!wasPlaying) startMediaService(tab)
                 } else {
                     // Video stopped or paused: remember when, the clock itself is only reused when
@@ -4257,7 +4779,7 @@ class BrowserState(private val act: Activity) {
                         tab.videoWidth  = videoWidth
                         tab.videoHeight = videoHeight
                     }
-                    (tab.web as? AurexWebView)?.backgroundMediaActive = true
+                    (tab.web as? AurexWebView)?.backgroundMediaActive = backgroundPlay
                     if (!wasActive) startMediaService(tab)
                 } else {
                     if (wasActive) {

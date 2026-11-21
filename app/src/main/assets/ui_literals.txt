@@ -762,3 +762,34 @@ not installed
 Audio/video merging is unavailable on this device.
 unable to resolve host
 timed out
+Dynamic Island
+Allow Live Updates
+Live status-bar Dynamic Island pill for active downloads and media playback.
+Night mode
+Night mode on · Extra dim
+Night mode off
+Active Downloads
+Live download progress and status-bar pill
+Completed Downloads
+Alerts when a download finishes or fails
+Download complete
+Open
+Connecting to server
+This screen
+Trim screenshot
+Reset crop
+Copy image
+Screenshot copied
+Couldn't copy screenshot
+Captured visible screen
+Capturing page · touch to scroll yourself
+Filling in gaps…
+Stitching screenshot…
+Top
+Bottom
+Cropped
+Audio boost
+Audio boost off
+Normal volume
+Adult popup blocked
+Blocked an app redirect

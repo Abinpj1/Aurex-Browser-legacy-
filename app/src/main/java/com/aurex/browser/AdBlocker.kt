@@ -10,7 +10,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import android.os.Handler
 import android.os.Looper
@@ -35,7 +34,7 @@ class AdBlocker(private val ctx: Context) {
     private val hosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val cache = File(ctx.filesDir, "ab_hosts.txt")
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val http = OkHttpClient.Builder()
+    private val http = AurexHttp.shared.newBuilder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
         .build()
@@ -221,7 +220,9 @@ class AdBlocker(private val ctx: Context) {
         return false
     }
 
-    private val urlCache = android.util.LruCache<String, Boolean>(2500)
+    private val urlCache = android.util.LruCache<String, Boolean>(if (PerfTier.low) 800 else 2500)
+
+    fun trimCache() { urlCache.evictAll() }
 
     fun blocksUrl(url: String): Boolean {
         urlCache.get(url)?.let { return it }
@@ -288,6 +289,42 @@ class AdBlocker(private val ctx: Context) {
     private class FilterList(val id: String, val url: String)
 
     companion object {
+        /** Tracking query parameters stripped from top-level links (never touches auth/payment/Meta URLs). */
+        private val TRACKING_PARAMS = setOf(
+            "fbclid", "gclid", "gbraid", "wbraid", "dclid", "msclkid", "yclid", "twclid",
+            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id", "utm_cid",
+            "mc_cid", "mc_eid", "igshid", "ref_src", "_hsenc", "_hsmi", "oly_enc_id", "oly_anon_id",
+            "vero_id", "wickedid", "rb_clickid", "s_cid", "mkt_tok"
+        )
+
+        /** Returns a cleaner URL without cross-site tracking params, or null when unchanged. */
+        fun stripTrackingParams(url: String): String? {
+            val qAt = url.indexOf('?')
+            if (qAt < 0) return null
+            val low = url.lowercase()
+            if (!low.startsWith("http://") && !low.startsWith("https://")) return null
+            if (isHandsOffHost(url)) return null
+            val hashAt = url.indexOf('#', qAt)
+            val query = if (hashAt >= 0) url.substring(qAt + 1, hashAt) else url.substring(qAt + 1)
+            if (query.isEmpty()) return null
+            val parts = query.split('&')
+            var changed = false
+            val kept = ArrayList<String>(parts.size)
+            for (p in parts) {
+                if (p.isEmpty()) continue
+                val key = p.substringBefore('=').lowercase()
+                if (key in TRACKING_PARAMS) {
+                    changed = true
+                } else {
+                    kept.add(p)
+                }
+            }
+            if (!changed) return null
+            val head = url.substring(0, qAt)
+            val frag = if (hashAt >= 0) url.substring(hashAt) else ""
+            return if (kept.isEmpty()) head + frag else head + "?" + kept.joinToString("&") + frag
+        }
+
         private val ESSENTIAL = listOf(
             "recaptcha.net", "hcaptcha.com", "challenges.cloudflare.com", "gstatic.com", "accounts.google.com",
             "login.microsoftonline.com", "appleid.apple.com", "razorpay.com", "paytm.com", "phonepe.com", "stripe.com",
@@ -303,7 +340,9 @@ class AdBlocker(private val ctx: Context) {
             FilterList("ubo_badware", "https://ublockorigin.github.io/uAssets/filters/badware.txt"),
             FilterList("ubo_unbreak", "https://ublockorigin.github.io/uAssets/filters/unbreak.txt"),
             FilterList("adg_base", "https://filters.adtidy.org/extension/ublock/filters/2.txt"),
-            FilterList("adg_mobile", "https://filters.adtidy.org/extension/ublock/filters/11.txt")
+            FilterList("adg_mobile", "https://filters.adtidy.org/extension/ublock/filters/11.txt"),
+            FilterList("ubo_privacy", "https://ublockorigin.github.io/uAssets/filters/privacy.txt"),
+            FilterList("ubo_quickfixes", "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt")
         )
 
         private val LISTS = listOf(
@@ -442,19 +481,19 @@ class AdBlocker(private val ctx: Context) {
             "yieldmo.com|yieldoptimizer.com|yldbt.com|" +
             "yumenetworks.com|zemanta.com|zeotap.com|zergnet.com|" +
             "zqtk.net|zxcdn.com|exosrv.com|exdynsrv.com|realsrv.com|magsrv.com|adtng.com|" +
-            "trafficjunky.com|trafficfactory.biz|ero-advertising.com|plugrush.com|adxpansion.com|popunder.net"
+            "trafficjunky.com|trafficfactory.biz|ero-advertising.com|plugrush.com|adxpansion.com|popunder.net|monetag.com|effectivegatecpm.com|profitablecpmrate.com|highperformanceformat.com|getadmiral.com|blockthrough.com|btloader.com|ezoic.net|ezodn.com|adthrive.com|raptive.com|playwire.com|snigelweb.com|freestar.io|publift.com|nitropay.com|acscdn.com|dtscout.com|pubfuture.com|clickadilla.com|galaksion.com|evadav.com|richads.com|mondiad.com|pushhouse.io|notifpush.com|izooto.com|webpushr.com|adskeeper.co.uk|pemsrv.com|dolohen.com|o333o.com|whourq.com|onclckmn.com|onclckds.com|alwingulla.com|glizauvo.net|thaudray.com"
 
         // Cosmetic hiding + MutationObserver. Kept narrow so normal content stays visible.
         const val HIDE_JS = """(function(){
 if(window.__liquidAdStyle)return;window.__liquidAdStyle=1;
 var s=document.createElement('style');s.id='liquid-adblock';
-s.textContent='ins.adsbygoogle,[data-ad-slot],[data-ad-client],[id^="google_ads"],[id^="div-gpt-ad"],iframe[src*="doubleclick"],iframe[src*="googlesyndication"],iframe[src*="/ads/"],.adsbygoogle,[class*="advert"],[class*="sponsored"],[id*="sponsored"],[class*="taboola"],[class*="outbrain"],[id*="taboola"],[id*="outbrain"],amp-ad,amp-sticky-ad,ytd-promoted-sparkles-web-renderer,ytd-display-ad-renderer,ytd-ad-slot-renderer,ytd-in-feed-ad-layout-renderer{display:none!important;height:0!important;max-height:0!important;overflow:hidden!important}';
+s.textContent='ins.adsbygoogle,[data-ad-slot],[data-ad-client],[id^="google_ads"],[id^="div-gpt-ad"],iframe[src*="doubleclick"],iframe[src*="googlesyndication"],iframe[src*="/ads/"],iframe[src*="adsterra"],iframe[src*="exoclick"],iframe[src*="popads"],iframe[src*="juicyads"],iframe[src*="trafficjunky"],iframe[src*="mgid"],iframe[src*="taboola"],iframe[src*="outbrain"],iframe[src*="propellerads"],.adsbygoogle,[class*="advert"],[class*="sponsored"],[id*="sponsored"],[class*="taboola"],[class*="outbrain"],[id*="taboola"],[id*="outbrain"],amp-ad,amp-sticky-ad,ytd-promoted-sparkles-web-renderer,ytd-display-ad-renderer,ytd-ad-slot-renderer,ytd-in-feed-ad-layout-renderer{display:none!important;height:0!important;max-height:0!important;overflow:hidden!important}';
 (document.head||document.documentElement).appendChild(s);
 var kill=function(root){
   if(!root||!root.querySelectorAll)return;
   root.querySelectorAll('[class*="advert"],[id*="advert"],[class*="sponsored"],[id*="sponsored"],[class*="taboola"],[class*="outbrain"]').forEach(function(e){
     var t=(e.textContent||'').trim();
-    if(t.length<3||e.querySelector('video,article,p'))e.style.display='none';
+    if(!e.querySelector('video,article,main,form')&&t.length<180)e.style.display='none';
   });
 };
 kill(document);
@@ -559,9 +598,11 @@ function isOverlay(el){
    if(n===document.body||n===document.documentElement)break;
    var cs=getComputedStyle(n);
    if(cs.position!=='fixed'&&cs.position!=='absolute')continue;
-   if((parseInt(cs.zIndex,10)||0)<99999)continue;
+   var zi=parseInt(cs.zIndex,10)||0;
    var r=n.getBoundingClientRect();
-   if(r.width<innerWidth*0.5||r.height<innerHeight*0.5)continue;
+   var overVid=n.tagName==='A'&&r.width>180&&r.height>120&&!!document.querySelector('video');
+   if(zi<999&&!overVid)continue;
+   if(!overVid&&(r.width<innerWidth*0.45||r.height<innerHeight*0.45))continue;
    var bg=cs.backgroundColor,clear=parseFloat(cs.opacity)<0.08||bg==='rgba(0, 0, 0, 0)'||bg==='transparent';
    if(!clear)continue;
    if(document.fullscreenElement)continue;
@@ -688,6 +729,41 @@ try{
  };
 }catch(e){}
 
+/* Block fake push-notification spam prompts ("Allow notifications to prove you're human / play video"). */
+try{
+ if(window.Notification&&typeof Notification.requestPermission==='function'){
+  var origNP=Notification.requestPermission.bind(Notification);
+  Notification.requestPermission=function(cb){
+   try{
+    var recent=(T()-tap.t)<2500;
+    if(!recent||B.popup(location.href,0)===true){
+     if(typeof cb==='function')try{cb('denied');}catch(e){}
+     return Promise.resolve('denied');
+    }
+   }catch(e){}
+   return origNP(cb);
+  };
+ }
+}catch(e){}
+
+/* Remove scripted cross-origin <meta http-equiv="refresh"> ad redirects injected without a tap. */
+try{
+ new MutationObserver(function(ms){
+  if((T()-tap.t)<2500)return;
+  for(var i=0;i<ms.length;i++){
+   var a=ms[i].addedNodes;
+   for(var j=0;j<a.length;j++){
+    var n=a[j];
+    if(n&&n.nodeType===1&&n.tagName==='META'&&/^refresh$/i.test(n.getAttribute('http-equiv')||'')){
+     var c=n.getAttribute('content')||'';
+     var m=/url\s*=\s*['"]?([^'";\s]+)/i.exec(c);
+     if(m&&m[1]&&!sameOrigin(m[1])){try{n.remove();note(1);}catch(e){}}
+    }
+   }
+  }
+ }).observe(document.documentElement,{childList:true,subtree:true});
+}catch(e){}
+
 /* History trap: a page that stacks history entries by itself so Back never leaves. */
 try{
  var ps=history.pushState,hb=[];
@@ -780,18 +856,66 @@ function guardSrc(proto,kind){
 }
 guardSrc(HTMLScriptElement.prototype,1);
 guardSrc(HTMLImageElement.prototype,2);
+guardSrc(HTMLIFrameElement.prototype,16);
 var SA=Element.prototype.setAttribute;
 Element.prototype.setAttribute=function(n,v){
  try{
   if(dead&&typeof n==='string'&&n.length===3&&n.toLowerCase()==='src'){
    var t=this.tagName;
-   if((t==='SCRIPT'&&blk(v,1))||(t==='IMG'&&blk(v,2)))return SA.call(this,n,dead);
+   if((t==='SCRIPT'&&blk(v,1))||(t==='IMG'&&blk(v,2))||(t==='IFRAME'&&blk(v,16)))return SA.call(this,n,dead);
   }
  }catch(e){}
  return SA.apply(this,arguments);
 };
 }catch(e){}})();
 """
+
+        /**
+         * Lightweight document-start anti-adblock defuser (uBlock-style):
+         *  - Exposes benign `canRunAds = true` & stubs legacy `blockAdBlock` / `fuckAdBlock` probes
+         *  - Dismisses scroll-locking "Disable your ad blocker to continue" modal walls cleanly
+         *    without touching login, cookie, or normal site dialogs.
+         */
+        const val ANTI_ADBLOCK_JS = """(function(){try{
+if(window.__aurexAntiAb)return;window.__aurexAntiAb=1;
+try{
+ Object.defineProperty(window,'canRunAds',{value:true,writable:false,configurable:true});
+ Object.defineProperty(window,'isAdBlockActive',{value:false,writable:false,configurable:true});
+ Object.defineProperty(window,'adblock',{value:false,writable:false,configurable:true});
+}catch(e){}
+var noop=function(){return stub;};
+var stub={onDetected:noop,on:function(d,fn){if(!d&&typeof fn==='function')try{fn();}catch(e){}return stub;},onNotDetected:function(fn){if(typeof fn==='function')try{fn();}catch(e){}return stub;},check:function(){return false;},setOption:noop};
+['blockAdBlock','fuckAdBlock','sniffAdBlock','BlockAdBlock','FuckAdBlock'].forEach(function(k){
+ try{Object.defineProperty(window,k,{get:function(){return stub;},set:function(){},configurable:true});}catch(e){}
+});
+var RE=/(disable your ad ?blocker|turn off your ad ?blocker|ad ?blocker detected|adblock detected|please disable adblock|whitelist us to continue)/i;
+function sweepWall(){
+ try{
+  var els=document.querySelectorAll('div,section,aside,dialog');
+  var lim=Math.min(els.length,240),hit=false;
+  for(var i=0;i<lim;i++){
+   var el=els[i];
+   if(!el||el===document.body||el===document.documentElement)continue;
+   var cs=getComputedStyle(el);
+   if(cs.position!=='fixed'&&cs.position!=='sticky')continue;
+   var zi=parseInt(cs.zIndex,10)||0;
+   if(zi<50)continue;
+   var r=el.getBoundingClientRect();
+   if(r.width<innerWidth*0.55||r.height<innerHeight*0.35)continue;
+   var tx=(el.innerText||'').slice(0,450);
+   if(RE.test(tx)&&!el.querySelector('video,form[action*="login"],input[type="password"]')){
+    el.remove();hit=true;
+   }
+  }
+  if(hit){
+   document.documentElement.style.setProperty('overflow','auto','important');
+   if(document.body)document.body.style.setProperty('overflow','auto','important');
+  }
+ }catch(e){}
+}
+if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',function(){setTimeout(sweepWall,900);setTimeout(sweepWall,2400);},{once:true});}
+else{setTimeout(sweepWall,700);}
+}catch(e){}})();"""
 
         /**
          * Document-start script for YouTube (web, mobile and embeds): removes the ad data from the player /
@@ -804,7 +928,7 @@ try{
 var h=location.hostname;
 if(!/(^|\.)youtube(-nocookie)?\.com$/.test(h)&&h!=='youtu.be')return;
 if(window.__lqYtPrune)return;window.__lqYtPrune=1;
-var K=['adPlacements','adSlots','playerAds','adBreakHeartbeatParams'];
+var K=['adPlacements','adSlots','playerAds','adBreakHeartbeatParams','adBreakParams','playerLegacyDesktopWatchAdsRenderer'];
 function clean(o){
   try{
     if(!o||typeof o!=='object')return o;
@@ -950,10 +1074,16 @@ API.heavy=function(){
   heavyAt=Date.now();
   try{
     document.querySelectorAll('ytd-ad-slot-renderer,ytd-in-feed-ad-layout-renderer,ytd-promoted-video-renderer,ytd-promoted-sparkles-web-renderer,ytd-display-ad-renderer,ytd-reel-video-renderer[is-ad],ytd-merch-shelf-renderer').forEach(function(e){e.remove();});
-    document.querySelectorAll('ytd-enforcement-message-view-model').forEach(function(e){
-      var d=e.closest?e.closest('tp-yt-paper-dialog,ytd-popup-container'):null;
+    var hadNag=false;
+    document.querySelectorAll('ytd-enforcement-message-view-model,ytm-enforcement-message-view-model').forEach(function(e){
+      hadNag=true;
+      var d=e.closest?e.closest('tp-yt-paper-dialog,ytd-popup-container,ytm-dialog'):null;
       if(d&&d.remove)d.remove();else e.remove();
     });
+    if(hadNag){
+      try{var bks=document.querySelectorAll('tp-yt-iron-overlay-backdrop');bks.forEach(function(b){b.remove();});}catch(e){}
+      try{var pv=document.querySelector('video');if(pv&&pv.paused&&!window.__aurexExplicitUserPause)pv.play().catch(function(){});}catch(e){}
+    }
   }catch(e){}
 };
 API.skip=function(){API.cheap();if(Date.now()-heavyAt>2500)API.heavy();};

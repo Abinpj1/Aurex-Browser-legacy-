@@ -3,7 +3,6 @@ package com.aurex.browser
 import android.content.Context
 import android.net.Uri
 import android.util.LruCache
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -34,7 +33,10 @@ import kotlin.concurrent.thread
  */
 object AdultFilter {
 
-    private const val LIST_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts"
+    private val LIST_URLS = listOf(
+        "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts",
+        "https://cdn.jsdelivr.net/gh/StevenBlack/hosts@master/alternates/porn-only/hosts"
+    )
     private const val MAX_AGE_MS = 7L * 86_400_000L
 
     private val domains = ConcurrentHashMap.newKeySet<String>()
@@ -44,7 +46,7 @@ object AdultFilter {
     @Volatile private var bigLoaded = false
 
     private val http by lazy {
-        OkHttpClient.Builder()
+        AurexHttp.shared.newBuilder()
             .connectTimeout(12, TimeUnit.SECONDS)
             .readTimeout(40, TimeUnit.SECONDS)
             .build()
@@ -127,14 +129,19 @@ object AdultFilter {
     private fun download(file: File) {
         val tmp = File(file.parentFile, file.name + ".part")
         try {
-            val req = Request.Builder().url(LIST_URL).header("User-Agent", "Mozilla/5.0 AurexBrowser").build()
             var ok = false
-            http.newCall(req).execute().use { r ->
-                val body = r.body
-                if (r.isSuccessful && body != null) {
-                    tmp.outputStream().use { out -> body.byteStream().copyTo(out) }
-                    ok = true
+            for (u in LIST_URLS) {
+                val req = Request.Builder().url(u).header("User-Agent", "Mozilla/5.0 AurexBrowser").build()
+                runCatching {
+                    http.newCall(req).execute().use { r ->
+                        val body = r.body
+                        if (r.isSuccessful && body != null) {
+                            tmp.outputStream().use { out -> body.byteStream().copyTo(out) }
+                            ok = tmp.length() >= 1024
+                        }
+                    }
                 }
+                if (ok) break
             }
             if (!ok || tmp.length() < 1024) {
                 tmp.delete()
@@ -223,12 +230,30 @@ object AdultFilter {
         return i >= 0 && l.getOrNull(i + 3) != 'l'   // XXXL is a clothing size
     }
 
-    /** "p0rn", "s3x", "xvid30s": digits used as letters. Words without digits are returned untouched. */
+    /** Decodes leetspeak ("p0rn", "s3x", "xvid30s", "h3n7a1") and collapses 3+ repeated letters ("pooorrrnn" -> "porn"). */
     private fun unleet(w: String): String {
-        if (w.length < 4 || w.length > 40 || w.none { it in '0'..'9' } || w.none { it in 'a'..'z' }) return w
-        val sb = StringBuilder(w.length)
-        for (c in w) sb.append(when (c) { '0' -> 'o'; '1' -> 'i'; '3' -> 'e'; '4' -> 'a'; '5' -> 's'; else -> c })
-        return sb.toString()
+        if (w.length < 3 || w.length > 48) return w
+        val hasLeet = w.any { it in "0134578@$" } && w.any { it in 'a'..'z' }
+        var s = if (!hasLeet) w else buildString(w.length) {
+            for (c in w) append(when (c) {
+                '0' -> 'o'; '1' -> 'i'; '3' -> 'e'; '4', '@' -> 'a'; '5', '$' -> 's'; '7' -> 't'; '8' -> 'b'; else -> c
+            })
+        }
+        // Collapse 3+ identical consecutive chars (e.g. "pooorrrnn" -> "poorrnn" -> checked cleanly; keep "xxx" intact!)
+        if (s.length >= 5 && !s.contains("xxx")) {
+            var runs = false
+            for (i in 2 until s.length) {
+                if (s[i] == s[i - 1] && s[i] == s[i - 2]) { runs = true; break }
+            }
+            if (runs) {
+                val out = StringBuilder(s.length)
+                for (c in s) {
+                    if (out.isEmpty() || out[out.length - 1] != c) out.append(c)
+                }
+                s = out.toString()
+            }
+        }
+        return s
     }
 
     private fun isMixedPlatform(host: String): Boolean {
@@ -261,7 +286,9 @@ object AdultFilter {
         if (host.isBlank()) return false
         if (isAdultHost(host)) return true
         if (isAllowlisted(host) || isUserAllowed(host)) return false
-        if (textIsAdult(uri.path.orEmpty())) return true
+        val path = uri.path.orEmpty()
+        if (isExplicitSubpath(host, path)) return true
+        if (textIsAdult(path)) return true
         return runCatching {
             uri.queryParameterNames.any { name ->
                 name.lowercase() in QUERY_PARAMS && textIsAdult(uri.getQueryParameter(name).orEmpty())
@@ -305,7 +332,27 @@ object AdultFilter {
                 "call" -> if (next == "girl" || next == "girls") return true
                 "deepfake", "deepfakes" -> if (next in DEEPFAKE_NEXT) return true
                 "undress" -> if (next in UNDRESS_NEXT) return true
+                "bhabhi", "aunty", "devar", "indian" -> if (next in DESI_PAIR_NEXT) return true
+                "hot" -> if (next in HOT_NEXT) return true
+                "gandi", "suhagrat", "nangi" -> if (next in GANDI_NEXT) return true
+                "savita" -> if (next == "bhabhi") return true
+                "rule" -> if (next == "34") return true
             }
+        }
+        return false
+    }
+
+    /** Catches explicit NSFW subreddits / feeds on mixed platforms without touching normal subreddits. */
+    private fun isExplicitSubpath(host: String, path: String): Boolean {
+        if (path.length < 4) return false
+        val low = path.lowercase()
+        if (host == "reddit.com" || host.endsWith(".reddit.com")) {
+            val m = REDDIT_SUB_RE.find(low) ?: return false
+            val sub = m.groupValues[1]
+            if (sub in NSFW_SUBS) return true
+            if (sub.contains("nsfw") || sub.contains("gonewild") || sub.contains("porn") ||
+                sub.contains("hentai") || sub.contains("rule34") || sub.contains("onlyfans")
+            ) return true
         }
         return false
     }
@@ -322,12 +369,16 @@ object AdultFilter {
         val name: String
         val value: String
         when {
-            isGoogle(host) && path == "/search" -> { name = "safe"; value = "active" }
+            isGoogle(host) && (path == "/search" || path == "/m/search") -> { name = "safe"; value = "active" }
             (host == "bing.com" || host.endsWith(".bing.com")) &&
                 (path == "/search" || path == "/images/search" || path == "/videos/search") -> { name = "adlt"; value = "strict" }
             (host == "duckduckgo.com" || host.endsWith(".duckduckgo.com")) &&
                 uri.getQueryParameter("q") != null -> { name = "kp"; value = "1" }
             host.endsWith("search.yahoo.com") && path == "/search" -> { name = "vm"; value = "r" }
+            host == "search.brave.com" && (path == "/search" || path == "/images" || path == "/videos") -> { name = "safesearch"; value = "strict" }
+            (host == "ecosia.org" || host.endsWith(".ecosia.org")) && path == "/search" -> { name = "safeSearch"; value = "strict" }
+            (host.startsWith("yandex.") || host.contains(".yandex.")) && path.startsWith("/search") -> { name = "fyandex"; value = "1" }
+            (host == "qwant.com" || host.endsWith(".qwant.com")) && uri.getQueryParameter("q") != null -> { name = "safesearch"; value = "2" }
             else -> return null
         }
         if (uri.getQueryParameter(name) == value) return null
@@ -361,7 +412,13 @@ object AdultFilter {
         "fapello", "rule34", "nhentai", "tsumino", "hanime", "thisav", "onlyfans", "fansly", "chaturbate",
         "myfreecams", "stripchat", "bongacams", "livejasmin", "camsoda", "camwhores", "cam4", "flirt4free",
         "brazzers", "bangbros", "realitykings", "spankbang", "pornmd", "hentaigene", "naughtyamerica",
-        "bellesa", "realteens", "teamskeet", "xxnx", "txxx", "hqporner"
+        "bellesa", "realteens", "teamskeet", "xxnx", "txxx", "hqporner", "missav", "jable", "javhd",
+        "supjav", "javbus", "javmost", "njav", "porntrex", "tnaflix", "empflix", "drtuber", "sunporno",
+        "thumbzilla", "pornone", "upornia", "hclips", "hotmovs", "voyeurhit", "beeg", "efukt", "daftsex",
+        "ixxx", "fuq", "youjizz", "jizzbunker", "vporn", "gotporn", "porn300", "fapvid", "okxxx",
+        "sxyprn", "yourporn", "yespornplease", "desipapa", "antarvasna", "savitabhabhi", "velamma",
+        "desixnxx", "indianporn", "xhamsterdesi", "fsiblog", "kamababa", "masalaseen", "phncdn",
+        "xhcdn", "rdtcdn", "ypncdn", "t8cdn", "strpst", "bngpt"
     )
 
     private val LABEL_PREFIXES = listOf(
@@ -419,7 +476,18 @@ object AdultFilter {
     private val SOLO_WORDS = setOf(
         "porn", "porno", "pornos", "pornstar", "pornstars", "xxx", "hentai", "nsfw", "blowjob", "handjob",
         "bukkake", "creampie", "gangbang", "milf", "camgirl", "camgirls", "onlyfans", "chudai", "chudayi",
-        "nudify", "deepnude", "upskirt", "creepshot", "creepshots", "callgirl", "callgirls"
+        "nudify", "deepnude", "upskirt", "creepshot", "creepshots", "callgirl", "callgirls",
+        "desisex", "desiporn", "indiansex", "indianporn", "antarvasna", "savitabhabhi", "velamma",
+        "redgifs", "fapello", "stripchat", "chaturbate", "bongacams", "xvideos", "xnxx", "xhamster",
+        "pornhub", "spankbang", "nhentai", "hanime", "rule34", "deepfakes", "undressai"
+    )
+    private val DESI_PAIR_NEXT = setOf("sex", "porn", "xxx", "chudai", "mms", "nude", "nudes", "bf")
+    private val HOT_NEXT = setOf("bhabhi", "aunty", "sex", "porn", "xxx", "mms", "nude", "nudes")
+    private val GANDI_NEXT = setOf("video", "videos", "film", "films", "baat", "chudai", "sex", "tasveer", "photo", "photos")
+    private val REDDIT_SUB_RE = Regex("^/r/([a-z0-9_]+)")
+    private val NSFW_SUBS = setOf(
+        "nsfw", "gonewild", "realgirls", "nsfwhardcore", "nsfw_gif", "nsfw_gifs", "boobs", "ass", "pawg",
+        "milf", "hentai", "rule34", "ecchi", "nudes", "onlyfans101", "indianbabes", "desibabes", "indiansgonewild"
     )
 
     private val SEX_NEXT = setOf(
@@ -455,17 +523,30 @@ object AdultFilter {
      * Health / news hosts and big mixed platforms are exempted on the app side ([skipsPageScan]).
      */
     const val SCAN_JS = """(function(){try{
-if(window.__aurexAdult||!window.AurexAdult)return;window.__aurexAdult=1;
+if(!window.AurexAdult)return;
+var curUrl=location.href.split('#')[0];
+if(window.__aurexAdultUrl===curUrl)return;
+window.__aurexAdultUrl=curUrl;
 function meta(a,n){try{var m=document.querySelector('meta['+a+'="'+n+'" i]');return m?String(m.getAttribute('content')||''):'';}catch(e){return '';}}
-var rt=(meta('name','rating')+' '+meta('name','classification')).toLowerCase();
-if(rt.indexOf('rta-5042-1996-1400-1577-rta')>=0||(/\badult\b/.test(rt)&&!/\bnot adult\b|\bgeneral\b/.test(rt))){window.AurexAdult.flag('rating');return;}
-var h1='';try{var e1=document.querySelector('h1');if(e1)h1=String(e1.textContent||'').slice(0,160);}catch(e){}
+var rt=(meta('name','rating')+' '+meta('name','classification')+' '+meta('name','rta')).toLowerCase();
+if(rt.indexOf('rta-5042-1996-1400-1577-rta')>=0||(/\badult\b|\bmature\b|\brestricted\b/.test(rt)&&!/\bnot adult\b|\bgeneral\b|\bsafe\b/.test(rt))){window.AurexAdult.flag('rating');return;}
+try{
+ var lds=document.querySelectorAll('script[type="application/ld+json"]');
+ for(var li=0;li<lds.length&&li<6;li++){
+  var lt=(lds[li].textContent||'').toLowerCase();
+  if(/"isfamilyfriendly"\s*:\s*(false|"false")/.test(lt)){window.AurexAdult.flag('ldjson');return;}
+ }
+}catch(e){}
+var h1='';try{var e1=document.querySelector('h1');if(e1)h1=String(e1.textContent||'').slice(0,180);}catch(e){}
+var bodyPeek='';try{if(document.body)bodyPeek=String(document.body.innerText||'').slice(0,600);}catch(e){}
 var t=[document.title,meta('name','description'),meta('name','keywords'),meta('property','og:title'),meta('property','og:description'),h1].join(' ').toLowerCase();
-var S=/\b(porn|porno|pornstars?|xxx|hentai|blowjob|handjob|bukkake|creampie|gangbang|camgirls?|live sex|sex videos?|sex tube|adult videos?|leaked mms|desi mms|mms scandal|nudify|deepnude|upskirt|onlyfans leaks?)\b/g;
-var M=/\b(nsfw|milf|nudes?|naked|fetish|erotic|free sex|hot sex|sex chat|sexcam|underage|leaked nudes?)\b/g;
-var K=/\b(hardcore|escorts?|call girls?|sexy)\b/g;
-function sc(re,w){var seen={},s=0,m;re.lastIndex=0;while((m=re.exec(t))!==null){var k=m[1];if(!seen[k]){seen[k]=1;s+=w;}}return s;}
-var a=sc(S,3),b=sc(M,2),c=sc(K,1);
+var S=/\b(porn|porno|pornstars?|xxx|hentai|blowjob|handjob|bukkake|creampie|gangbang|camgirls?|live sex|sex videos?|sex tube|adult videos?|leaked mms|desi mms|mms scandal|nudify|deepnude|upskirt|onlyfans leaks?|chudai|desi sex|indian porn|free porn)\b/g;
+var M=/\b(nsfw|milf|nudes?|naked|fetish|erotic|free sex|hot sex|sex chat|sexcam|underage|leaked nudes?|adult content|sexually explicit|18\+ only|must be 18)\b/g;
+var K=/\b(hardcore|escorts?|call girls?|sexy|adult entertainment|mature audience)\b/g;
+function sc(re,w,src){var seen={},s=0,m;re.lastIndex=0;while((m=re.exec(src))!==null){var k=m[1];if(!seen[k]){seen[k]=1;s+=w;}}return s;}
+var a=sc(S,3,t),b=sc(M,2,t),c=sc(K,1,t);
+var gate=/(18\+|18 years|age verification|i am 18|enter only if you are 18)/i.test(bodyPeek)&&/(porn|adult|explicit|xxx|sexual|nsfw)/i.test(bodyPeek);
+if(gate){window.AurexAdult.flag('agegate');return;}
 if(a<3)return;
 var sf=t.match(/\b(health|education|educational|news|research|study|doctor|medical|policy|law|legal|court|police|report|awareness|prevention|addiction|recovery|therapy|parental|block|blocker|filter|safety|victims?|survivors?|abuse|trafficking|rights|consent|museum|history)\b/g)||[];
 var sd={},n=0;for(var i=0;i<sf.length;i++){if(!sd[sf[i]]){sd[sf[i]]=1;n++;}}

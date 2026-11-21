@@ -2,21 +2,15 @@ package com.aurex.browser
 
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.graphics.TransformOrigin
@@ -33,18 +27,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.MusicNote
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
@@ -52,6 +41,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.foundation.border
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -238,170 +230,463 @@ private fun qualityBadge(label: String): androidx.compose.ui.graphics.vector.Ima
     return if (h >= 720) AppleIcons.HighQuality else AppleIcons.QualitySD
 }
 
-private fun qualityNote(label: String, best: Boolean): String {
+private fun qualityTierTag(label: String): String {
     val base = label.trim().substringBefore(' ')
-    val h = base.removeSuffix("p").toIntOrNull() ?: when { base.equals("8K", true) -> 4320; base.equals("4K", true) -> 2160; base.equals("2K", true) -> 1440; else -> 0 }
-    val hdrTag = if (label.contains("HDR", true)) " · HDR" else ""
-    val cls = when {
-        h >= 4320 -> "8K Ultra HD$hdrTag"
-        h >= 2160 -> "Ultra HD$hdrTag"
-        h >= 1440 -> "Quad HD"
-        h >= 1080 -> "Full HD"
+    val h = base.removeSuffix("p").toIntOrNull() ?: when {
+        base.equals("8K", true) -> 4320
+        base.equals("4K", true) -> 2160
+        base.equals("2K", true) -> 1440
+        else -> 0
+    }
+    val hdr = if (label.contains("HDR", true)) " HDR" else ""
+    return when {
+        h >= 4320 -> "8K$hdr"
+        h >= 2160 -> "UHD$hdr"
+        h >= 1440 -> "QHD$hdr"
+        h >= 1080 -> "FHD$hdr"
         h >= 720 -> "HD"
-        h >= 480 -> "Standard"
-        h > 0 -> "Data saver"
+        h >= 480 -> "SD"
+        h > 0 -> "Low"
         else -> ""
     }
-    return if (best) "Best quality" + (if (cls.isNotEmpty()) " · $cls" else "") else cls
 }
 
-/** Keeps the last prompt alive while the sheet plays its exit animation (the state itself is already null by then). */
-private class LastPrompt { var value: QualityPrompt? = null }
+private class LastPrompt { var value by androidx.compose.runtime.mutableStateOf<QualityPrompt?>(null) }
 
-private val SheetShape = RoundedCornerShape(22.dp)
+private val SheetShape = FloatingPopoverShape
 private val SheetOrigin = TransformOrigin(1f, 1f)
 
 /**
- * Compact quality sheet. It sits right above the toolbar (never on top of it), on the right where the
- * floating media / download buttons were - those buttons hide while the sheet is open. Video qualities
- * scroll; the MP3 / M4A buttons are the last item of that scroll list; "Always best quality" stays
- * pinned underneath. Enter / exit are animated (scrim fade, spring rise + scale from the bottom-right corner).
+ * Redesigned Apple iOS 27 Liquid Glass Download Quality Sheet:
+ *  - Compact floating frosted + liquid glass card anchored cleanly above the toolbar.
+ *  - Instant Video / Audio liquid pill switcher when both formats are available.
+ *  - Highlighted 1-tap "Best Quality" hero card + compact 2-column resolution chip grid
+ *    so all video qualities fit at a single glance without tedious scrolling.
+ *  - Slim pinned "Always best" toggle footer + liquid drag-down dismiss.
  */
 @Composable
 fun QualitySheetHost(s: BrowserState) {
     val current = s.qualityPrompt
     val holder = remember { LastPrompt() }
     if (current != null) holder.value = current
+    LaunchedEffect(current) {
+        if (current == null && holder.value != null) {
+            delay(105)
+            holder.value = null
+        }
+    }
     val prompt = holder.value ?: return
     val visible = current != null
     val style = LocalGlassStyle.current
-    // Same bottom edge as the floating buttons: just above the toolbar (or near the edge when the bar is on top).
-    val bottomGap = if (s.barTop || s.bare) 14.dp else toolbarFootprint(s.toolbarRows) + 12.dp
-    val spec = spring<Float>(dampingRatio = 0.82f, stiffness = 420f)
-    val slideSpec = spring<androidx.compose.ui.unit.IntOffset>(dampingRatio = 0.82f, stiffness = 420f)
+    val dark = LocalPalette.current.dark
+    val view = LocalView.current
+    val bottomGap = if (s.barTop || s.bare) 12.dp else toolbarFootprint(s.toolbarRows) + 10.dp
 
-    Box(Modifier.fillMaxSize()) {
-        // light scrim, tap to dismiss
-        AnimatedVisibility(visible, enter = fadeIn(tween(220)), exit = fadeOut(tween(180))) {
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.24f))
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null
-                    ) { s.qualityPrompt = null }
-            )
-        }
-        AnimatedVisibility(
-            visible,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .navigationBarsPadding()
-                .padding(end = 14.dp, bottom = bottomGap),
-            enter = fadeIn(tween(180)) +
-                slideInVertically(slideSpec) { it / 4 } +
-                scaleIn(spec, initialScale = 0.88f, transformOrigin = SheetOrigin),
-            exit = fadeOut(tween(120)) +
-                slideOutVertically(tween(170, easing = FastOutSlowInEasing)) { it / 6 } +
-                scaleOut(tween(170, easing = FastOutSlowInEasing), targetScale = 0.92f, transformOrigin = SheetOrigin)
-        ) {
-            Column(
-                Modifier
-                    .fillMaxWidth(0.56f)
-                    .widthIn(min = 208.dp, max = 232.dp)
-                    .liquidGlass(SheetShape, 1.15f)
-                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {}
-                    .padding(9.dp)
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+    // 0 = Video, 1 = Audio
+    var tabMode by remember(prompt) { mutableIntStateOf(0) }
+
+    LiquidFloatingWindow(
+        visible = visible,
+        onDismiss = { s.qualityPrompt = null },
+        fromTop = false,
+        anchorOffset = bottomGap,
+        sheenKey = prompt
+    ) {
+
+                // ── Compact Header: Glossy Download Orb + Title + Close Pill ──
+                Row(
+                    Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val headerTint = if (tabMode == 1) MusicRed else style.accent
                     Box(
-                        Modifier.size(26.dp).clip(RoundedCornerShape(9.dp))
-                            .background(Brush.verticalGradient(listOf(style.accent.copy(alpha = 0.95f), style.accent.copy(alpha = 0.6f)))),
+                        Modifier
+                            .size(25.dp)
+                            .tintedGlass(CircleShape, headerTint, swell = 0.06f),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(AppleIcons.Download, null, tint = Color.White, modifier = Modifier.size(14.dp))
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text("Download quality", color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                        Text(
-                            prompt.title.ifBlank { "Choose a resolution" },
-                            color = TextTertiary, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                        Icon(
+                            if (tabMode == 1) AppleIcons.MusicNote else AppleIcons.Download,
+                            null, tint = Color.White, modifier = Modifier.size(13.5.dp)
                         )
                     }
+                    Spacer(Modifier.width(7.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "Download",
+                            color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                            letterSpacing = (-0.2).sp
+                        )
+                        Text(
+                            prompt.title.ifBlank { "Select quality" },
+                            color = TextSecondary, fontSize = 10.sp,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Spacer(Modifier.width(5.dp))
+                    GlassIconButton(
+                        AppleIcons.Close, "Close",
+                        onClick = { s.qualityPrompt = null },
+                        size = 24.dp, iconSize = 12.dp
+                    )
                 }
-                Spacer(Modifier.height(6.dp))
-                // loading -> list: cross-fade, and the sheet grows / shrinks smoothly to the new height
+
+                // ── Loading / Redesigned Content ──
                 AnimatedContent(
                     targetState = prompt.loading,
                     transitionSpec = {
-                        (fadeIn(tween(220, delayMillis = 60)) togetherWith fadeOut(tween(110)))
-                            .using(SizeTransform(clip = true) { _, _ -> spring(dampingRatio = 0.9f, stiffness = 500f) })
+                        (fadeIn(tween(200, delayMillis = 50)) togetherWith fadeOut(tween(100)))
+                            .using(SizeTransform(clip = true) { _, _ -> spring(dampingRatio = 0.86f, stiffness = 500f) })
                     },
                     label = "qualityContent"
                 ) { loading ->
                     if (loading) {
                         Row(
-                            Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                            Modifier
+                                .fillMaxWidth()
+                                .glassTile(RoundedCornerShape(16.dp), 0.09f)
+                                .padding(vertical = 16.dp, horizontal = 12.dp),
                             horizontalArrangement = Arrangement.Center,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            CircularProgressIndicator(color = style.accent, strokeWidth = 2.dp, modifier = Modifier.size(15.dp))
-                            Spacer(Modifier.width(9.dp))
-                            Text("Checking qualities…", color = TextSecondary, fontSize = 11.5.sp)
+                            CircularProgressIndicator(
+                                color = style.accent, strokeWidth = 2.dp,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text("Finding best qualities…", color = TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
                         }
                     } else {
-                        // Biggest file first; sizes that are still unknown go last (highest resolution first among them).
+                        val byHeight = compareByDescending<QualityOption> { MediaTools.plainHeight(it.height) }
+                            .thenByDescending { it.bytes }
                         val bySize = compareByDescending<QualityOption> { it.bytes > 0 }
                             .thenByDescending { it.bytes }
-                            .thenByDescending { MediaTools.plainHeight(it.height) }
-                        val videos = prompt.options.filter { it.audioQuality == null }.sortedWith(bySize)
+                        val videos = prompt.options.filter { it.audioQuality == null }.sortedWith(byHeight)
                         val audios = prompt.options.filter { it.audioQuality != null }.sortedWith(bySize)
-                        // "Best" stays the sharpest picture, whatever its size ends up being
-                        val bestVideo = videos.maxWithOrNull(
-                            compareBy<QualityOption>({ MediaTools.plainHeight(it.height) }, { it.bytes })
-                        )
-                        Column(
-                            Modifier.fillMaxWidth().heightIn(max = 236.dp).verticalScroll(rememberScrollState()),
-                            verticalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            if (videos.isNotEmpty()) SectionLabel("Video", "largest first")
-                            videos.forEachIndexed { i, o ->
-                                StaggerIn(i) { QualityRow(o, o === bestVideo, style.accent) { prompt.onPick(o) } }
+                        val hasBoth = videos.isNotEmpty() && audios.isNotEmpty()
+                        val effectiveMode = when {
+                            videos.isEmpty() && audios.isNotEmpty() -> 1
+                            !hasBoth -> 0
+                            else -> tabMode.coerceIn(0, 1)
+                        }
+
+                        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                            // Compact Liquid Video / Audio Mode Switcher
+                            if (hasBoth) {
+                                QualityModeBar(
+                                    mode = effectiveMode,
+                                    videoCount = videos.size,
+                                    audioCount = audios.size,
+                                    accent = style.accent,
+                                    onSelect = { next ->
+                                        if (next != tabMode) {
+                                            Haptics.fire(view, Hx.TAP)
+                                            tabMode = next
+                                        }
+                                    }
+                                )
                             }
-                            // music options: one under the other, last items of the scroll list
-                            if (audios.isNotEmpty()) {
-                                Spacer(Modifier.height(2.dp))
-                                SectionLabel("Audio only", "largest first")
-                                audios.forEachIndexed { i, o ->
-                                    StaggerIn(videos.size + i) { AudioRow(o) { prompt.onPick(o) } }
+
+                            AnimatedContent(
+                                targetState = effectiveMode,
+                                transitionSpec = {
+                                    (fadeIn(tween(160)) + scaleIn(tween(160), initialScale = 0.96f)) togetherWith
+                                        (fadeOut(tween(100)) + scaleOut(tween(100), targetScale = 0.96f))
+                                },
+                                label = "qualityModeSwitch"
+                            ) { m ->
+                                Column(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = 174.dp)
+                                        .verticalScroll(rememberScrollState()),
+                                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                                ) {
+                                    if (m == 0) {
+                                        val best = videos.firstOrNull()
+                                        val rest = if (videos.size > 1) videos.drop(1) else emptyList()
+                                        if (best != null) {
+                                            StaggerIn(0) {
+                                                HeroQualityCard(best, style.accent, dark) { if (s.qualityPrompt != null) prompt.onPick(best) }
+                                            }
+                                        }
+                                        if (rest.isNotEmpty()) {
+                                            rest.chunked(2).forEachIndexed { rowIdx, pair ->
+                                                StaggerIn(rowIdx + 1) {
+                                                    Row(
+                                                        Modifier.fillMaxWidth(),
+                                                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                                    ) {
+                                                        pair.forEach { opt ->
+                                                            QualityGridChip(
+                                                                o = opt,
+                                                                accent = style.accent,
+                                                                modifier = Modifier.weight(1f),
+                                                                onPick = { if (s.qualityPrompt != null) prompt.onPick(opt) }
+                                                            )
+                                                        }
+                                                        if (pair.size == 1) Spacer(Modifier.weight(1f))
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        audios.forEachIndexed { idx, opt ->
+                                            StaggerIn(idx) {
+                                                AudioQualityCard(opt, dark) { if (s.qualityPrompt != null) prompt.onPick(opt) }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
+
+                // ── Slim Pinned Footer ──
                 if (!prompt.loading) {
-                    Spacer(Modifier.height(2.dp))
-                    CompactToggleRow("Always best quality", s.alwaysBestQuality) { s.alwaysBestQuality = it; s.save() }
+                    Spacer(Modifier.height(5.dp))
+                    Box(Modifier.fillMaxWidth().height(0.5.dp).background(Separator))
+                    Spacer(Modifier.height(3.dp))
+                    CompactToggleRow("Always best", s.alwaysBestQuality) { s.alwaysBestQuality = it; s.save() }
                 }
+    }
+}
+
+@Composable
+private fun QualityModeBar(
+    mode: Int,
+    videoCount: Int,
+    audioCount: Int,
+    accent: Color,
+    onSelect: (Int) -> Unit
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(28.dp)
+            .glassTile(Capsule, 0.12f)
+            .padding(2.5.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        val items = listOf(
+            Triple(0, "Video ($videoCount)", accent),
+            Triple(1, "Audio ($audioCount)", MusicRed)
+        )
+        items.forEach { (idx, label, col) ->
+            val selected = mode == idx
+            GlowPress(
+                onClick = { onSelect(idx) },
+                shape = Capsule,
+                haptic = false,
+                glassBody = selected,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxSize()
+                    .then(
+                        if (selected) Modifier.tintedGlass(Capsule, col, swell = 0.03f)
+                        else Modifier
+                    )
+            ) {
+                Text(
+                    label,
+                    color = if (selected) Color.White else TextPrimary.copy(alpha = 0.86f),
+                    fontSize = 11.sp,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                    maxLines = 1
+                )
             }
         }
     }
 }
 
-/** Each row fades and rises a few dp into place, one after the other. */
+/** Highlighted 1-tap Best Quality Liquid Glass hero card. */
+@Composable
+private fun HeroQualityCard(o: QualityOption, accent: Color, dark: Boolean, onPick: () -> Unit) {
+    val shape = RoundedCornerShape(16.dp)
+    val rim = Brush.verticalGradient(
+        0f to accent.copy(alpha = if (dark) 0.65f else 0.55f),
+        1f to accent.copy(alpha = 0.18f)
+    )
+    val lightAccent = if (dark) androidx.compose.ui.graphics.lerp(accent, Color.White, 0.36f) else accent
+    GlowPress(
+        onClick = onPick,
+        shape = shape,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .then(if (dark) Modifier.background(Color(0xFF0A0D16).copy(alpha = 0.48f), shape) else Modifier)
+            .background(
+                Brush.linearGradient(
+                    listOf(
+                        accent.copy(alpha = if (dark) 0.30f else 0.18f),
+                        accent.copy(alpha = if (dark) 0.14f else 0.08f)
+                    )
+                ),
+                shape
+            )
+            .border(0.9.dp, rim, shape)
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier
+                    .size(28.dp)
+                    .tintedGlass(RoundedCornerShape(9.dp), accent, swell = 0.05f),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(qualityBadge(o.label), null, tint = Color.White, modifier = Modifier.size(16.dp))
+            }
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    GoldQualityText(o.label, fontSize = 13.5f)
+                    Box(
+                        Modifier
+                            .clip(Capsule)
+                            .background(accent, Capsule)
+                            .padding(horizontal = 5.dp, vertical = 1.dp)
+                    ) {
+                        Text("BEST", color = onAccent(accent), fontSize = 8.5.sp, fontWeight = FontWeight.Black, letterSpacing = 0.4.sp)
+                    }
+                }
+                val tag = qualityTierTag(o.label)
+                Text(
+                    if (tag.isNotEmpty()) "$tag · ${sizeText(o)}" else sizeText(o),
+                    color = TextPrimary.copy(alpha = 0.86f),
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    style = TextStyle(fontFeatureSettings = "tnum"),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(Modifier.width(4.dp))
+            Box(
+                Modifier
+                    .size(26.dp)
+                    .glassTile(CircleShape, 0.18f, accent),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(AppleIcons.Download, null, tint = lightAccent, modifier = Modifier.size(14.dp))
+            }
+        }
+    }
+}
+
+/** Compact 2-column Liquid Glass chip for secondary video resolutions. */
+@Composable
+private fun QualityGridChip(o: QualityOption, accent: Color, modifier: Modifier = Modifier, onPick: () -> Unit) {
+    val dark = LocalPalette.current.dark
+    val tagTint = if (dark) androidx.compose.ui.graphics.lerp(accent, Color.White, 0.38f) else accent
+    val shape = RoundedCornerShape(13.dp)
+    GlowPress(
+        onClick = onPick,
+        shape = shape,
+        modifier = modifier.glassTile(shape, 0.11f)
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 5.5.dp),
+            verticalArrangement = Arrangement.spacedBy(1.5.dp)
+        ) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                GoldQualityText(o.label, fontSize = 12.5f)
+                val tag = qualityTierTag(o.label)
+                if (tag.isNotEmpty()) {
+                    Text(
+                        tag.substringBefore(' '),
+                        color = tagTint, fontSize = 9.5.sp, fontWeight = FontWeight.Bold, maxLines = 1
+                    )
+                }
+            }
+            Text(
+                sizeText(o),
+                color = if (o.bytes > 0) TextPrimary.copy(alpha = 0.88f) else TextSecondary,
+                fontSize = 10.5.sp,
+                fontWeight = FontWeight.Medium,
+                style = TextStyle(fontFeatureSettings = "tnum"),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+/** Apple Music Red frosted glass card for MP3 / M4A audio downloads. */
+@Composable
+private fun AudioQualityCard(o: QualityOption, dark: Boolean, onPick: () -> Unit) {
+    val shape = RoundedCornerShape(15.dp)
+    val rim = Brush.verticalGradient(
+        0f to MusicRed.copy(alpha = if (dark) 0.50f else 0.42f),
+        1f to MusicRed.copy(alpha = 0.14f)
+    )
+    GlowPress(
+        onClick = onPick,
+        shape = shape,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .then(if (dark) Modifier.background(Color(0xFF0A0D16).copy(alpha = 0.50f), shape) else Modifier)
+            .background(MusicRed.copy(alpha = if (dark) 0.22f else 0.12f), shape)
+            .border(0.8.dp, rim, shape)
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.5.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier
+                    .size(30.dp)
+                    .tintedGlass(RoundedCornerShape(9.dp), MusicRed, swell = 0.05f),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(AppleIcons.MusicNote, null, tint = Color.White, modifier = Modifier.size(16.dp))
+            }
+            Spacer(Modifier.width(9.dp))
+            Column(Modifier.weight(1f)) {
+                GoldQualityText(o.label, fontSize = 13.5f, color = TextPrimary)
+                Text(
+                    o.detail.ifBlank { "Audio track" },
+                    color = TextSecondary, fontSize = 10.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(Modifier.width(6.dp))
+            Box(
+                Modifier
+                    .clip(Capsule)
+                    .background(MusicRed.copy(alpha = 0.18f), Capsule)
+                    .padding(horizontal = 7.dp, vertical = 3.dp)
+            ) {
+                Text(
+                    sizeText(o),
+                    color = MusicRed,
+                    fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold,
+                    style = TextStyle(fontFeatureSettings = "tnum"), maxLines = 1
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun StaggerIn(index: Int, content: @Composable () -> Unit) {
+    if (PerfTier.low) { content(); return }
     val p = remember { Animatable(0f) }
     LaunchedEffect(Unit) {
-        delay((index.coerceAtMost(7) * 30L))
-        p.animateTo(1f, spring(dampingRatio = 0.85f, stiffness = 520f))
+        delay((index.coerceAtMost(6) * 12L))
+        p.animateTo(1f, spring(dampingRatio = 0.84f, stiffness = 680f))
     }
     Box(
         Modifier.graphicsLayer {
             alpha = p.value.coerceIn(0f, 1f)
-            translationY = (1f - p.value) * 10.dp.toPx()
+            translationY = (1f - p.value) * 8.dp.toPx()
         }
     ) { content() }
 }
@@ -413,13 +698,12 @@ private fun CompactToggleRow(title: String, checked: Boolean, onChange: (Boolean
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .clickableHaptic(kind = if (checked) Hx.TOGGLE_OFF else Hx.TOGGLE_ON) { onChange(!checked) }
-            .padding(horizontal = 6.dp, vertical = 2.dp),
+            .padding(horizontal = 4.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(title, color = TextPrimary, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
-        // iOS switch drawn at 80 % so the row stays slim
-        Box(Modifier.size(width = 41.dp, height = 25.dp), contentAlignment = Alignment.Center) {
-            Box(Modifier.requiredSize(width = 51.dp, height = 31.dp).graphicsLayer { scaleX = 0.8f; scaleY = 0.8f }) {
+        Text(title, color = TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+        Box(Modifier.size(width = 38.dp, height = 23.dp), contentAlignment = Alignment.Center) {
+            Box(Modifier.requiredSize(width = 51.dp, height = 31.dp).graphicsLayer { scaleX = 0.74f; scaleY = 0.74f }) {
                 GlassToggle(checked)
             }
         }
@@ -428,88 +712,3 @@ private fun CompactToggleRow(title: String, checked: Boolean, onChange: (Boolean
 
 private fun sizeText(o: QualityOption): String =
     if (o.bytes > 0) (if (o.guess) "≈ " else "") + formatBytes(o.bytes) else "Size unknown"
-
-@Composable
-private fun QualityRow(o: QualityOption, best: Boolean, accent: Color, onPick: () -> Unit) {
-    val shape = RoundedCornerShape(12.dp)
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clip(shape)
-            .background(if (best) accent.copy(alpha = 0.16f) else TextPrimary.copy(alpha = 0.06f), shape)
-            .clickableHaptic { onPick() }
-            .padding(horizontal = 8.dp, vertical = 5.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Box(
-            Modifier.size(24.dp).clip(RoundedCornerShape(8.dp))
-                .background(Brush.verticalGradient(listOf(accent.copy(alpha = 0.30f), accent.copy(alpha = 0.12f)))),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(qualityBadge(o.label), null, tint = accent, modifier = Modifier.size(14.dp))
-        }
-        Spacer(Modifier.width(8.dp))
-        Column(Modifier.weight(1f)) {
-            GoldQualityText(o.label, fontSize = 13.5f)
-            val note = qualityNote(o.label, best)
-            if (note.isNotEmpty()) {
-                Text(
-                    note, color = if (best) accent else TextTertiary, fontSize = 9.sp,
-                    fontWeight = if (best) FontWeight.SemiBold else FontWeight.Normal,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis
-                )
-            }
-        }
-        Spacer(Modifier.width(4.dp))
-        Text(
-            sizeText(o),
-            color = if (o.bytes > 0) TextPrimary else TextTertiary,
-            fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold,
-            style = TextStyle(fontFeatureSettings = "tnum"), maxLines = 1, softWrap = false
-        )
-    }
-}
-
-/** Small caption above a group of rows ("Video" / "Audio only") with a quiet note on the right. */
-@Composable
-private fun SectionLabel(title: String, note: String) {
-    Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 1.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            title.uppercase(), color = TextSecondary, fontSize = 9.sp, fontWeight = FontWeight.Bold,
-            style = TextStyle(letterSpacing = 0.8.sp), modifier = Modifier.weight(1f), maxLines = 1
-        )
-        Text(note, color = TextTertiary, fontSize = 9.sp, maxLines = 1)
-    }
-}
-
-/** MP3 / M4A: same row shape as the video rows (one per line), in the music colour. */
-@Composable
-private fun AudioRow(o: QualityOption, onPick: () -> Unit) {
-    val shape = RoundedCornerShape(12.dp)
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clip(shape)
-            .background(MusicRed.copy(alpha = 0.12f), shape)
-            .clickableHaptic { onPick() }
-            .padding(horizontal = 8.dp, vertical = 5.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Box(
-            Modifier.size(24.dp).clip(RoundedCornerShape(8.dp))
-                .background(Brush.verticalGradient(listOf(MusicRed.copy(alpha = 0.30f), MusicRed.copy(alpha = 0.12f)))),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(AppleIcons.MusicNote, null, tint = MusicRed, modifier = Modifier.size(14.dp))
-        }
-        Spacer(Modifier.width(8.dp))
-        GoldQualityText(o.label, modifier = Modifier.weight(1f), fontSize = 13.5f, color = MusicRed)
-        Spacer(Modifier.width(4.dp))
-        Text(
-            sizeText(o),
-            color = if (o.bytes > 0) TextPrimary else TextTertiary,
-            fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold,
-            style = TextStyle(fontFeatureSettings = "tnum"), maxLines = 1, softWrap = false
-        )
-    }
-}

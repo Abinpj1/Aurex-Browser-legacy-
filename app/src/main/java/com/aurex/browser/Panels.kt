@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -46,24 +47,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Android
-import androidx.compose.material.icons.filled.Bookmark
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.DeleteSweep
-import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.FolderZip
-import androidx.compose.material.icons.filled.History
-import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.Movie
-import androidx.compose.material.icons.filled.MusicNote
-import androidx.compose.material.icons.automirrored.filled.Article
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Icon
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.runtime.Composable
@@ -77,9 +60,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -88,16 +75,19 @@ import androidx.compose.ui.unit.sp
 
 @Composable
 fun PanelHost(s: BrowserState, panel: Panel, onClose: () -> Unit, onPanel: (Panel) -> Unit = {}) {
-    Box(Modifier.fillMaxSize()) {
+    val bgBackdrop = remember { GlassBackdrop() }
+    Box(Modifier.fillMaxSize().edgeSwipeBack(enabled = s.swipeEdgeBack && panel != Panel.Settings, onBack = onClose)) {
         AppBackground()
-        Box(Modifier.fillMaxSize().statusBarsPadding()) {
-            when (panel) {
-                Panel.Tabs -> TabsPanel(s, onClose)
-                Panel.Bookmarks -> LibraryPanel(s, Panel.Bookmarks, onClose)
-                Panel.History -> LibraryPanel(s, Panel.History, onClose)
-                Panel.Downloads -> LibraryPanel(s, Panel.Downloads, onClose)
-                Panel.Media -> MediaDockPanel(s, onClose, onPanel)
-                Panel.Settings -> SettingsPage(s, onClose)
+        androidx.compose.runtime.CompositionLocalProvider(LocalGlassBackdrop provides bgBackdrop) {
+            Box(Modifier.fillMaxSize().statusBarsPadding()) {
+                when (panel) {
+                    Panel.Tabs -> TabsPanel(s, onClose)
+                    Panel.Bookmarks -> LibraryPanel(s, Panel.Bookmarks, onClose)
+                    Panel.History -> LibraryPanel(s, Panel.History, onClose)
+                    Panel.Downloads -> LibraryPanel(s, Panel.Downloads, onClose)
+                    Panel.Media -> MediaDockPanel(s, onClose, onPanel)
+                    Panel.Settings -> SettingsPage(s, onClose)
+                }
             }
         }
     }
@@ -105,14 +95,16 @@ fun PanelHost(s: BrowserState, panel: Panel, onClose: () -> Unit, onPanel: (Pane
 
 // ── Tabs (compact cards) ─────────────────────────────────────────────────────
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun TabsPanel(s: BrowserState, onClose: () -> Unit) {
+private fun TabsPanel(s: BrowserState, onClose: () -> Unit, onPrivateChanged: (Boolean) -> Unit = {}) {
     val style = LocalGlassStyle.current
     var confirmCloseAll by remember { mutableStateOf(false) }
     var tabMode by remember { mutableIntStateOf(if (s.tabs.getOrNull(s.current)?.incognito == true) 1 else 0) }
     // Whatever the slider reports, only 0 (Normal) and 1 (Private) are ever acted on.
     val mode = tabMode.coerceIn(0, 1)
     val showPrivate = mode == 1
+    LaunchedEffect(showPrivate) { onPrivateChanged(showPrivate) }
 
     // Closing the tab list without ending up on a private tab puts the private lock back.
     androidx.compose.runtime.DisposableEffect(Unit) {
@@ -139,80 +131,79 @@ private fun TabsPanel(s: BrowserState, onClose: () -> Unit) {
         k to tab
     }
 
+    val parentBackdrop = LocalGlassBackdrop.current
+    val tabsBackdrop = remember(parentBackdrop) { GlassBackdrop(parent = parentBackdrop) }
+    val liquidScroll = rememberGlassScrollState()
+    val density = LocalDensity.current
+    var headerPx by remember { mutableIntStateOf(0) }
+    val headerDp = if (headerPx > 0) with(density) { headerPx.toDp() } else 182.dp
+    var scrolledTop by remember { mutableStateOf(false) }
+    LaunchedEffect(mode, currentTabs.isEmpty()) { if (currentTabs.isEmpty()) scrolledTop = false }
+
     Box(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize()) {
-            ScreenHeader(
-                "Tabs",
-                "${allTabs.size} open · $normalCount normal · $privateCount private",
-                onClose
-            ) {
-                GlassIconButton(
-                    AppleIcons.DeleteSweep, "Close all tabs",
-                    onClick = { confirmCloseAll = true },
-                    size = 44.dp, iconSize = 19.dp, filled = false
-                )
-            }
-
-            // Adaptive liquid slider — Normal ↔ Private switcher.
-            // The pill is now a full liquidGlass surface (via updated GlassSegmented)
-            // that springs in together with the ScreenHeader above it.
-            GlassSegmented(
-                options = listOf("Normal  $normalCount", "Private  $privateCount"),
-                selected = mode,
-                onSelect = { sel ->
-                    // Normal -> Private asks for the phone lock (when the private tab lock is on).
-                    if (sel == 1 && !showPrivate) {
-                        s.requirePrivate { tabMode = 1 }
-                    } else {
-                        tabMode = sel
-                    }
-                },
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-            )
-
+        // Layer 1: Full-bleed scrolling tab grid captured into GPU RenderNode so BOTH the top
+        // floating header and bottom glass pill live-blur & refract tab cards gliding underneath!
+        GlassBackdropHost(tabsBackdrop, Modifier.fillMaxSize()) {
             if (currentTabs.isEmpty()) {
-                EmptyState(
-                    if (!showPrivate) AppleIcons.Add else AppleIcons.Incognito,
-                    if (!showPrivate) "No normal tabs" else "No private tabs",
-                    if (!showPrivate) "Tap + to open a new normal tab." else "Tap + to open a new private tab."
-                )
+                Box(Modifier.fillMaxSize().padding(top = headerDp)) {
+                    EmptyState(
+                        if (!showPrivate) AppleIcons.Add else AppleIcons.Incognito,
+                        if (!showPrivate) "No normal tabs" else "No private tabs",
+                        if (!showPrivate) "Tap + to open a new normal tab." else "Tap + to open a new private tab."
+                    )
+                }
             } else {
-                // Each list gets its own grid and scroll state. Flipping Normal <-> Private used to reuse
-                // one grid state while the list underneath was swapped, so a first-visible index that only
-                // made sense for the old list could point past the end of the new, shorter one.
                 key(mode) {
                     val gridState = rememberLazyGridState()
+                    val canBack by remember { derivedStateOf { gridState.canScrollBackward } }
+                    LaunchedEffect(canBack) { scrolledTop = canBack }
                     LazyVerticalGrid(
                         columns = GridCells.Fixed(2),
                         state = gridState,
-                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 110.dp),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                        modifier = Modifier.fillMaxSize()
+                        contentPadding = PaddingValues(
+                            start = 16.dp, end = 16.dp,
+                            top = headerDp + 8.dp, bottom = 114.dp
+                        ),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier.fillMaxSize().liquidOverscrollJelly().liquidScrollTrack(liquidScroll)
                     ) {
-                        items(keyedTabs, key = { it.first }) { entry ->
+                        items(keyedTabs, key = { it.first }, contentType = { "tabCard" }) { entry ->
                             val tab = entry.second
                             val isCurrent = s.tabs.indexOf(tab) == s.current
-                            // iOS 27 tab card: concentric radii (26 outer / 18 inner), page preview, selection ring.
                             val inner = RoundedCornerShape(18.dp)
                             val ink = if (tab.incognito) Color(0xFFBF5AF2) else style.accent
+                            SwipeTabCard(
+                                enabled = s.swipeTabCardClose,
+                                onClose = {
+                                    val idx = s.tabs.indexOf(tab)
+                                    if (idx >= 0) s.closeTab(idx)
+                                },
+                                modifier = Modifier
+                                    .animateItem(placementSpec = spring(dampingRatio = 0.82f, stiffness = 440f))
+                                    .liquidScrollCard(liquidScroll)
+                            ) {
                             Column(
                                 Modifier
                                     .fillMaxWidth()
-                                    .height(172.dp)
-                                    .liquidGlass(CardShape, 0.92f)
+                                    .height(158.dp)
+                                    .liquidGlass(CardShape, 0.95f, 0.04f, reactive = true, optical = false)
                                     .then(if (isCurrent) Modifier.border(2.dp, ink, CardShape) else Modifier)
                                     .clickableHaptic { s.selectTab(tab); onClose() }
-                                    .padding(8.dp)
+                                    .padding(9.dp)
                             ) {
                                 Row(
-                                    Modifier.fillMaxWidth().height(30.dp).padding(start = 4.dp),
+                                    Modifier.fillMaxWidth().height(30.dp).padding(start = 5.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
+                                    if (isCurrent) {
+                                        Box(Modifier.size(7.dp).background(ink, CircleShape))
+                                        Spacer(Modifier.width(6.dp))
+                                    }
                                     Text(
                                         if (tab.isHome) "New tab" else tab.title,
                                         color = TextPrimary,
-                                        fontSize = 14.sp,
+                                        fontSize = 14.5.sp,
                                         fontWeight = FontWeight.SemiBold,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
@@ -222,11 +213,10 @@ private fun TabsPanel(s: BrowserState, onClose: () -> Unit) {
                                     GlassIconButton(
                                         AppleIcons.Close, "Close tab",
                                         onClick = {
-                                            // indexOf is -1 once the tab is already gone (quick double tap); closeTab(-1) would throw.
                                             val idx = s.tabs.indexOf(tab)
                                             if (idx >= 0) s.closeTab(idx)
                                         },
-                                        size = 26.dp, iconSize = 13.dp
+                                        size = 28.dp, iconSize = 14.dp
                                     )
                                 }
                                 Spacer(Modifier.height(6.dp))
@@ -268,9 +258,82 @@ private fun TabsPanel(s: BrowserState, onClose: () -> Unit) {
                                     }
                                 }
                             }
+                            }
                         }
                     }
                 }
+            }
+        }
+
+        // Layer 2: Floating Apple Liquid Glass header + bottom toolbar + soft progressive ScrollEdgeBlurs.
+        androidx.compose.runtime.CompositionLocalProvider(LocalGlassBackdrop provides tabsBackdrop) {
+            ScrollEdgeBlur(
+                isTop = true,
+                active = scrolledTop,
+                height = headerDp + 18.dp,
+                strength = 0.94f,
+                modifier = Modifier.align(Alignment.TopCenter)
+            )
+            Column(
+                Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .onSizeChanged { headerPx = it.height }
+            ) {
+                ScreenHeader(
+                    "Tabs",
+                    "${allTabs.size} open · $normalCount normal · $privateCount private",
+                    onClose
+                ) {
+                    GlassIconButton(
+                        AppleIcons.DeleteSweep, "Close all tabs",
+                        onClick = { confirmCloseAll = true },
+                        size = 44.dp, iconSize = 19.dp, filled = false
+                    )
+                }
+                GlassSegmented(
+                    options = listOf("Normal  $normalCount", "Private  $privateCount"),
+                    selected = mode,
+                    onSelect = { sel ->
+                        if (sel == 1 && !showPrivate) {
+                            s.requirePrivate { tabMode = 1 }
+                        } else {
+                            tabMode = sel
+                        }
+                    },
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+            }
+
+            ScrollEdgeBlur(
+                isTop = false,
+                active = currentTabs.isNotEmpty(),
+                height = 96.dp,
+                strength = 0.85f,
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
+            Row(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(start = 16.dp, end = 16.dp, bottom = 10.dp)
+                    .fillMaxWidth()
+                    .liquidWindowDrag(
+                        maxPullDp = 34.dp,
+                        dismissDir = LiquidDismissDir.DOWN,
+                        dismissThresholdDp = 48.dp,
+                        onDismiss = onClose
+                    )
+                    .liquidGlass(Capsule, 1.18f, 0.04f, reactive = true)
+                    .padding(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                GlassPillButton(
+                    "New tab", onClick = { s.newTab("", showPrivate); onClose() },
+                    icon = AppleIcons.Add, accent = true
+                )
+                GlassPillButton("Done", onClick = onClose)
             }
             if (confirmCloseAll) {
                 GlassConfirmDialog(
@@ -282,24 +345,6 @@ private fun TabsPanel(s: BrowserState, onClose: () -> Unit) {
                     onDismiss = { confirmCloseAll = false }
                 )
             }
-        }
-        // iOS 27 floating glass toolbar.
-        Row(
-            Modifier
-                .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
-                .padding(start = 16.dp, end = 16.dp, bottom = 10.dp)
-                .fillMaxWidth()
-                .liquidGlass(Capsule, 1.1f, 0.04f)
-                .padding(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            GlassPillButton(
-                "New tab", onClick = { s.newTab("", showPrivate); onClose() },
-                icon = AppleIcons.Add, accent = true
-            )
-            GlassPillButton("Done", onClick = onClose)
         }
     }
 }
@@ -321,8 +366,18 @@ private fun LibraryPanel(s: BrowserState, panel: Panel, onClose: () -> Unit) {
     // Hold + drag over the cards selects a range; the list scrolls by itself near the top / bottom edge.
     val dlListState = androidx.compose.foundation.lazy.rememberLazyListState()
     val dragSel = remember { DragSelect() }
-    val dlList = s.downloads.items.filter { query.isBlank() || it.name.contains(query, true) }
-    val selItems = if (panel == Panel.Downloads) s.downloads.items.filter { it.id in selected } else emptyList()
+    val dlList by remember(panel) {
+        derivedStateOf {
+            if (panel != Panel.Downloads) emptyList()
+            else s.downloads.items.filter { query.isBlank() || it.name.contains(query, true) }
+        }
+    }
+    val selItems by remember(panel) {
+        derivedStateOf {
+            if (panel != Panel.Downloads || selected.isEmpty()) emptyList()
+            else s.downloads.items.filter { it.id in selected }
+        }
+    }
     val selecting = selItems.isNotEmpty()
     fun toggleSel(id: Int) { selected = if (id in selected) selected - id else selected + id }
     androidx.activity.compose.BackHandler(enabled = selecting) { selected = emptySet() }
@@ -344,101 +399,87 @@ private fun LibraryPanel(s: BrowserState, panel: Panel, onClose: () -> Unit) {
     }
 
     val searchState = rememberSearchFabState()
+    val parentBackdrop = LocalGlassBackdrop.current
+    val libBackdrop = remember(parentBackdrop) { GlassBackdrop(parent = parentBackdrop) }
+    val liquidScroll = rememberGlassScrollState()
+    val density = LocalDensity.current
+    var headerPx by remember { mutableIntStateOf(0) }
+    val headerDp = if (headerPx > 0) with(density) { headerPx.toDp() } else (if (panel == Panel.Downloads) 96.dp else 132.dp)
+    val bmListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val hiListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val scrolledTop by remember(panel) {
+        derivedStateOf {
+            when (panel) {
+                Panel.Bookmarks -> bmListState.canScrollBackward
+                Panel.History -> hiListState.canScrollBackward
+                else -> dlListState.canScrollBackward
+            }
+        }
+    }
+
     Box(Modifier.fillMaxSize().closeSearchOnEmptyTap(searchState)) {
-    Column(Modifier.fillMaxSize().imePadding()) {
-        val bs = 44.dp
-        val headerActions: @Composable RowScope.() -> Unit = {
-            if (panel == Panel.Downloads && s.downloads.items.any { it.status == DlStatus.RUNNING }) {
-                GlassIconButton(
-                    AppleIcons.Pause, "Pause all",
-                    onClick = { s.downloads.pauseAll() },
-                    size = bs, iconSize = 20.dp, filled = false
-                )
-                Spacer(Modifier.width(2.dp))
-            }
-            if (panel != Panel.Bookmarks) {
-                GlassIconButton(
-                    AppleIcons.DeleteSweep,
-                    if (panel == Panel.History) "Clear history" else "Clear finished",
-                    onClick = {
-                        if (panel == Panel.History) confirmClear = true
-                        else s.downloads.clearFinished()
-                    },
-                    size = bs, iconSize = 20.dp, filled = false
-                )
-            }
-        }
-        if (panel == Panel.Downloads) {
-            val run = s.downloads.items.filter { it.status == DlStatus.RUNNING }
-            androidx.compose.animation.AnimatedContent(
-                targetState = selecting,
-                transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(120)) },
-                label = "dlHeader"
-            ) { sel ->
-                if (sel) {
-                    SelectionHeader(
-                        count = selItems.size,
-                        total = dlList.size,
-                        allSelected = dlList.isNotEmpty() && dlList.all { it.id in selected },
-                        canShare = selItems.any { it.status == DlStatus.DONE },
-                        onClose = { selected = emptySet() },
-                        onSelectAll = {
-                            selected = if (dlList.isNotEmpty() && dlList.all { it.id in selected }) emptySet()
-                            else dlList.map { it.id }.toSet()
-                        },
-                        onShare = {
-                            val ready = selItems.filter { it.status == DlStatus.DONE && it.file.exists() }
-                            if (ready.isEmpty()) s.notify("Only finished downloads can be shared")
-                            else DownloadManager.shareMany(ctx, ready)
-                        },
-                        onDelete = { confirmBulkDelete = true }
-                    )
-                } else {
-                    DownloadsHeader(title, run.size, run.sumOf { it.speed }, s.downloads.items.size, onClose, headerActions)
-                }
-            }
-        }
-        else ScreenHeader(title, subtitle, onClose, headerActions)
-
-        Spacer(Modifier.height(if (panel == Panel.Downloads) 10.dp else 6.dp))
-
+    // Layer 1: Full-bleed scrolling list captured into GPU RenderNode for floating header + search FAB blur.
+    GlassBackdropHost(libBackdrop, Modifier.fillMaxSize().imePadding()) {
+    androidx.compose.runtime.CompositionLocalProvider(LocalLiquidScroll provides liquidScroll) {
         when (panel) {
             Panel.Bookmarks -> {
-                val list = s.bookmarks.filter {
-                    query.isBlank() || it.title.contains(query, true) || it.url.contains(query, true)
+                val list by remember {
+                    derivedStateOf {
+                        s.bookmarks.filter {
+                            query.isBlank() || it.title.contains(query, true) || it.url.contains(query, true)
+                        }
+                    }
                 }
                 if (list.isEmpty()) {
-                    EmptyState(
-                        AppleIcons.Bookmark,
-                        if (query.isBlank()) "No bookmarks yet" else "No matches",
-                        if (query.isBlank()) "Long-press a page or use the menu to save it."
-                        else "Try a different search."
-                    )
+                    Box(Modifier.fillMaxSize().padding(top = headerDp)) {
+                        EmptyState(
+                            AppleIcons.Bookmark,
+                            if (query.isBlank()) "No bookmarks yet" else "No matches",
+                            if (query.isBlank()) "Long-press a page or use the menu to save it."
+                            else "Try a different search."
+                        )
+                    }
                 } else {
-                    LazyColumn(contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 100.dp)) {
-                        itemsIndexed(list, key = { _, it -> it.url }) { i, bm ->
-                            GroupedRow(i, list.size, onClick = {
-                                tab?.let { s.load(it, bm.url) }
-                                onClose()
-                            }) {
-                                SiteBadge(hostOf(bm.url), 38.dp)
-                                Spacer(Modifier.width(12.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text(
-                                        bm.title.ifBlank { hostOf(bm.url) },
-                                        color = TextPrimary, fontSize = 17.sp, letterSpacing = (-0.41).sp,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis
-                                    )
-                                    Text(
-                                        bm.url, color = TextSecondary, fontSize = 13.sp,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis
+                    LazyColumn(
+                        state = bmListState,
+                        modifier = Modifier.fillMaxSize().liquidOverscrollJelly().liquidScrollTrack(liquidScroll),
+                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = headerDp + 6.dp, bottom = 104.dp)
+                    ) {
+                        itemsIndexed(list, key = { _, it -> it.url }, contentType = { _, _ -> "bmRow" }) { i, bm ->
+                            SwipeActionRow(
+                                enabled = s.swipeLibraryActions,
+                                deleteOn = true,
+                                shareOn = true,
+                                canShare = bm.url.isNotBlank(),
+                                onDelete = { s.removeBookmark(bm) },
+                                onShare = { s.share(bm.url) },
+                                onShareBlocked = {},
+                                cornerDp = 20.dp,
+                                modifier = Modifier.animateItem(placementSpec = spring(dampingRatio = 0.85f, stiffness = 440f))
+                            ) {
+                                GroupedRow(i, list.size, onClick = {
+                                    tab?.let { s.load(it, bm.url) }
+                                    onClose()
+                                }) {
+                                    SiteBadge(hostOf(bm.url), 38.dp)
+                                    Spacer(Modifier.width(12.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            bm.title.ifBlank { hostOf(bm.url) },
+                                            color = TextPrimary, fontSize = 16.5.sp, letterSpacing = (-0.35).sp,
+                                            maxLines = 1, overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            bm.url, color = TextSecondary, fontSize = 12.5.sp,
+                                            maxLines = 1, overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    GlassIconButton(
+                                        AppleIcons.Delete, "Remove bookmark",
+                                        onClick = { s.removeBookmark(bm) },
+                                        size = 34.dp, iconSize = 16.dp, filled = false
                                     )
                                 }
-                                GlassIconButton(
-                                    AppleIcons.Delete, "Remove bookmark",
-                                    onClick = { s.bookmarks.remove(bm); s.save() },
-                                    size = 34.dp, iconSize = 16.dp, filled = false
-                                )
                             }
                         }
                     }
@@ -446,42 +487,64 @@ private fun LibraryPanel(s: BrowserState, panel: Panel, onClose: () -> Unit) {
             }
 
             Panel.History -> {
-                val list = s.history.filter {
-                    query.isBlank() || it.title.contains(query, true) || it.url.contains(query, true)
+                val list by remember {
+                    derivedStateOf {
+                        s.history.filter {
+                            query.isBlank() || it.title.contains(query, true) || it.url.contains(query, true)
+                        }
+                    }
                 }
                 if (list.isEmpty()) {
-                    EmptyState(
-                        AppleIcons.History,
-                        if (query.isBlank()) "History is empty" else "No matches",
-                        if (query.isBlank()) "Pages you visit will appear here. Private tabs never save history."
-                        else "Try a different search."
-                    )
+                    Box(Modifier.fillMaxSize().padding(top = headerDp)) {
+                        EmptyState(
+                            AppleIcons.History,
+                            if (query.isBlank()) "History is empty" else "No matches",
+                            if (query.isBlank()) "Pages you visit will appear here. Private tabs never save history."
+                            else "Try a different search."
+                        )
+                    }
                 } else {
-                    LazyColumn(contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 100.dp)) {
-                        itemsIndexed(list, key = { _, it -> it.url + it.time }) { i, h ->
-                            GroupedRow(i, list.size, dividerInset = 58.dp, onClick = {
-                                tab?.let { s.load(it, h.url) }
-                                onClose()
-                            }) {
-                                SiteBadge(hostOf(h.url), 34.dp)
-                                Spacer(Modifier.width(12.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text(
-                                        h.title.ifBlank { hostOf(h.url) },
-                                        color = TextPrimary, fontSize = 17.sp, letterSpacing = (-0.41).sp,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis
-                                    )
-                                    Row {
-                                        Text(hostOf(h.url), color = TextSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                        Spacer(Modifier.width(8.dp))
-                                        Text(timeAgo(h.time), color = TextTertiary, fontSize = 13.sp)
+                    LazyColumn(
+                        state = hiListState,
+                        modifier = Modifier.fillMaxSize().liquidOverscrollJelly().liquidScrollTrack(liquidScroll),
+                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = headerDp + 6.dp, bottom = 104.dp)
+                    ) {
+                        itemsIndexed(list, key = { _, it -> it.url + it.time }, contentType = { _, _ -> "hiRow" }) { i, h ->
+                            SwipeActionRow(
+                                enabled = s.swipeLibraryActions,
+                                deleteOn = true,
+                                shareOn = true,
+                                canShare = h.url.isNotBlank(),
+                                onDelete = { s.deleteHistory(h) },
+                                onShare = { s.share(h.url) },
+                                onShareBlocked = {},
+                                cornerDp = 20.dp,
+                                modifier = Modifier.animateItem(placementSpec = spring(dampingRatio = 0.85f, stiffness = 440f))
+                            ) {
+                                GroupedRow(i, list.size, dividerInset = 58.dp, onClick = {
+                                    tab?.let { s.load(it, h.url) }
+                                    onClose()
+                                }) {
+                                    SiteBadge(hostOf(h.url), 34.dp)
+                                    Spacer(Modifier.width(12.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            h.title.ifBlank { hostOf(h.url) },
+                                            color = TextPrimary, fontSize = 16.5.sp, letterSpacing = (-0.35).sp,
+                                            maxLines = 1, overflow = TextOverflow.Ellipsis
+                                        )
+                                        Row {
+                                            Text(hostOf(h.url), color = TextSecondary, fontSize = 12.5.sp, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            Spacer(Modifier.width(8.dp))
+                                            Text(timeAgo(h.time), color = TextTertiary, fontSize = 12.5.sp)
+                                        }
                                     }
+                                    GlassIconButton(
+                                        AppleIcons.Close, "Remove",
+                                        onClick = { s.deleteHistory(h) },
+                                        size = 32.dp, iconSize = 15.dp, filled = false
+                                    )
                                 }
-                                GlassIconButton(
-                                    AppleIcons.Close, "Remove",
-                                    onClick = { s.deleteHistory(h) },
-                                    size = 32.dp, iconSize = 15.dp, filled = false
-                                )
                             }
                         }
                     }
@@ -491,32 +554,38 @@ private fun LibraryPanel(s: BrowserState, panel: Panel, onClose: () -> Unit) {
             else -> {
                 val list = dlList
                 if (list.isEmpty()) {
-                    EmptyState(
-                        AppleIcons.Download,
-                        if (query.isBlank()) "No downloads" else "No matches",
-                        if (query.isBlank()) "Fast parallel downloads with a built-in HLS downloader. Start from any link, video or audio."
-                        else "Try a different search."
-                    )
+                    Box(Modifier.fillMaxSize().padding(top = headerDp)) {
+                        EmptyState(
+                            AppleIcons.Download,
+                            if (query.isBlank()) "No downloads" else "No matches",
+                            if (query.isBlank()) "Fast parallel downloads with a built-in HLS downloader. Start from any link, video or audio."
+                            else "Try a different search."
+                        )
+                    }
                 } else {
                     LazyColumn(
                         state = dlListState,
-                        modifier = Modifier.dragSelect(
-                            ds = dragSel,
-                            listState = dlListState,
-                            ids = { list.map { it.id } },
-                            selection = { selected },
-                            onSelection = { selected = it }
-                        ),
-                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 100.dp)
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .liquidOverscrollJelly()
+                            .liquidScrollTrack(liquidScroll)
+                            .dragSelect(
+                                ds = dragSel,
+                                listState = dlListState,
+                                ids = { list.map { it.id } },
+                                selection = { selected },
+                                onSelection = { selected = it }
+                            ),
+                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = headerDp + 8.dp, bottom = 108.dp)
                     ) {
-                        items(list, key = { it.id }) { d ->
+                        items(list, key = { it.id }, contentType = { "dlCard" }) { d ->
                             Box(
                                 Modifier
-                                    .animateItemPlacement(spring(dampingRatio = 0.85f, stiffness = 420f))
+                                    .animateItem(placementSpec = spring(dampingRatio = 0.85f, stiffness = 420f))
                                     .trackRow(d.id, dragSel)
+                                    .liquidScrollCard(liquidScroll, edgeScale = 0.028f, edgeTilt = 2.0f)
                                     .padding(bottom = 12.dp)
                             ) {
-                                // swipe right = delete (no confirmation), swipe left = share; both can be switched off in Settings
                                 SwipeActionRow(
                                     enabled = !selecting,
                                     deleteOn = s.swipeDlRightDelete,
@@ -544,15 +613,96 @@ private fun LibraryPanel(s: BrowserState, panel: Panel, onClose: () -> Unit) {
             }
         }
     }
-    // search lives bottom-right and morphs into a bar on tap
-    StandardSearchFab(
-        query = query,
-        onQuery = { query = it },
-        placeholder = "Search $title",
-        state = searchState
-    )
     }
 
+    // Layer 2: Floating Apple Liquid Glass header + bottom SearchFab + progressive ScrollEdgeBlurs.
+    androidx.compose.runtime.CompositionLocalProvider(LocalGlassBackdrop provides libBackdrop) {
+        ScrollEdgeBlur(
+            isTop = true,
+            active = scrolledTop,
+            height = headerDp + 16.dp,
+            strength = 0.94f,
+            modifier = Modifier.align(Alignment.TopCenter)
+        )
+        Box(
+            Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .onSizeChanged { headerPx = it.height }
+        ) {
+            val bs = 44.dp
+            val headerActions: @Composable RowScope.() -> Unit = {
+                if (panel == Panel.Downloads && s.downloads.items.any { it.status == DlStatus.RUNNING }) {
+                    GlassIconButton(
+                        AppleIcons.Pause, "Pause all",
+                        onClick = { s.downloads.pauseAll() },
+                        size = bs, iconSize = 20.dp, filled = false
+                    )
+                    Spacer(Modifier.width(2.dp))
+                }
+                if (panel != Panel.Bookmarks) {
+                    GlassIconButton(
+                        AppleIcons.DeleteSweep,
+                        if (panel == Panel.History) "Clear history" else "Clear finished",
+                        onClick = {
+                            if (panel == Panel.History) confirmClear = true
+                            else s.downloads.clearFinished()
+                        },
+                        size = bs, iconSize = 20.dp, filled = false
+                    )
+                }
+            }
+            if (panel == Panel.Downloads) {
+                val run = s.downloads.items.filter { it.status == DlStatus.RUNNING }
+                androidx.compose.animation.AnimatedContent(
+                    targetState = selecting,
+                    transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(120)) },
+                    label = "dlHeader"
+                ) { sel ->
+                    if (sel) {
+                        SelectionHeader(
+                            count = selItems.size,
+                            total = dlList.size,
+                            allSelected = dlList.isNotEmpty() && dlList.all { it.id in selected },
+                            canShare = selItems.any { it.status == DlStatus.DONE },
+                            onClose = { selected = emptySet() },
+                            onSelectAll = {
+                                selected = if (dlList.isNotEmpty() && dlList.all { it.id in selected }) emptySet()
+                                else dlList.map { it.id }.toSet()
+                            },
+                            onShare = {
+                                val ready = selItems.filter { it.status == DlStatus.DONE && it.file.exists() }
+                                if (ready.isEmpty()) s.notify("Only finished downloads can be shared")
+                                else DownloadManager.shareMany(ctx, ready)
+                            },
+                            onDelete = { confirmBulkDelete = true }
+                        )
+                    } else {
+                        DownloadsHeader(title, run.size, run.sumOf { it.speed }, s.downloads.items.size, onClose, headerActions)
+                    }
+                }
+            } else {
+                ScreenHeader(title, subtitle, onClose, headerActions)
+            }
+        }
+
+        ScrollEdgeBlur(
+            isTop = false,
+            active = true,
+            height = 74.dp,
+            strength = 0.65f,
+            modifier = Modifier.align(Alignment.BottomCenter)
+        )
+        StandardSearchFab(
+            query = query,
+            onQuery = { query = it },
+            placeholder = "Search $title",
+            state = searchState
+        )
+    }
+    }
+
+    androidx.compose.runtime.CompositionLocalProvider(LocalGlassBackdrop provides libBackdrop) {
     if (confirmClear) {
         GlassConfirmDialog(
             "Clear history?",
@@ -589,6 +739,7 @@ private fun LibraryPanel(s: BrowserState, panel: Panel, onClose: () -> Unit) {
             onConfirm = { deleteTarget = null; s.downloads.deleteWithFile(target) },
             onDismiss = { deleteTarget = null }
         )
+    }
     }
 }
 
@@ -652,7 +803,7 @@ private fun DownloadsHeader(
             .padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Box(Modifier.liquidGlass(CircleShape, 0.9f, 0.04f)) {
+        Box(Modifier.liquidGlass(CircleShape, 1.02f, 0f, reactive = false)) {
             GlassIconButton(AppleIcons.ArrowBack, "Back", onClick = onClose, size = 44.dp, iconSize = 20.dp, filled = false)
         }
         Spacer(Modifier.width(14.dp))
@@ -694,7 +845,7 @@ private fun DownloadsHeader(
             Row(
                 Modifier
                     .animateContentSize(spring(dampingRatio = 0.80f, stiffness = 440f))
-                    .liquidGlass(Capsule, 0.9f, 0.04f)
+                    .liquidGlass(Capsule, 1.02f, 0f, reactive = false)
                     .padding(horizontal = 2.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) { trailing() }
@@ -719,13 +870,13 @@ private fun ProgressRing(progress: Float, color: Color, icon: ImageVector, desc:
 
 @Composable
 private fun StatusDot(color: Color, pulsing: Boolean) {
-    val a = if (pulsing) {
+    val aState = if (pulsing && !PerfTier.low) {
         rememberInfiniteTransition(label = "dot").animateFloat(
             initialValue = 0.35f, targetValue = 1f,
             animationSpec = infiniteRepeatable(tween(800), RepeatMode.Reverse), label = "dotA"
-        ).value
-    } else 1f
-    Box(Modifier.size(6.dp).graphicsLayer { alpha = a }.background(color, CircleShape))
+        )
+    } else null
+    Box(Modifier.size(6.dp).graphicsLayer { alpha = aState?.value?.coerceIn(0f, 1f) ?: 1f }.background(color, CircleShape))
 }
 
 /** True only when this download really is divided into parts (or HLS segments). A single stream has nothing to show. */
@@ -796,16 +947,21 @@ private fun PartsBlock(d: DlItem, color: Color) {
 
 @Composable
 private fun PartCell(p: Float, color: Color, modifier: Modifier) {
-    val fill by animateFloatAsState(p.coerceIn(0f, 1f), tween(350), label = "partFill")
-    val tint by animateColorAsState(if (p >= 0.999f) Good else color, tween(250), label = "partTint")
+    val fillState = animateFloatAsState(p.coerceIn(0f, 1f), tween(350), label = "partFill")
+    val tintState = animateColorAsState(if (p >= 0.999f) Good else color, tween(250), label = "partTint")
+    val track = TextPrimary.copy(alpha = 0.10f)
     Box(
         modifier
             .height(8.dp)
             .clip(RoundedCornerShape(3.dp))
-            .background(TextPrimary.copy(alpha = 0.10f))
-    ) {
-        Box(Modifier.fillMaxWidth(fill).fillMaxHeight().background(tint))
-    }
+            .drawBehind {
+                drawRect(track)
+                val f = fillState.value.coerceIn(0f, 1f)
+                if (f > 0.002f) {
+                    drawRect(tintState.value, size = androidx.compose.ui.geometry.Size(size.width * f, size.height))
+                }
+            }
+    )
 }
 
 @Composable
@@ -852,7 +1008,7 @@ private fun DownloadCard(
         tween(250), label = "dlStatus"
     )
     val progress by animateFloatAsState(d.progress.coerceIn(0f, 1f), tween(450), label = "dlProgress")
-    val chevron by animateFloatAsState(if (expanded) 180f else 0f, spring(dampingRatio = 0.8f, stiffness = 500f), label = "dlChevron")
+    val chevronState = animateFloatAsState(if (expanded) 180f else 0f, spring(dampingRatio = 0.8f, stiffness = 500f), label = "dlChevron")
     val selA by animateFloatAsState(if (selected) 1f else 0f, tween(180), label = "dlSel")
 
     // entrance: rises and fades in once
@@ -883,9 +1039,9 @@ private fun DownloadCard(
                 scaleX = (0.97f + 0.03f * e) * pop.value
                 scaleY = (0.97f + 0.03f * e) * pop.value
             }
-            .groupedSurface(TileShape)
-            .background(style.accent.copy(alpha = 0.14f * selA), TileShape)
-            .border(1.5.dp, style.accent.copy(alpha = selA), TileShape)
+            .groupedSurface(TileShape, reactive = true)
+            .background(style.accent.copy(alpha = (0.14f * selA).coerceIn(0f, 1f)), TileShape)
+            .border(1.5.dp, style.accent.copy(alpha = selA.coerceIn(0f, 1f)), TileShape)
             .animateContentSize(spring(dampingRatio = 0.85f, stiffness = 500f))
             .tapOrHold(
                 onHold = {},
@@ -1022,12 +1178,12 @@ private fun DownloadCard(
                 }
             }
             Box(
-                Modifier.size(36.dp).clickableHaptic(haptic = false) { expanded = !expanded },
+                Modifier.size(36.dp).clickableHaptic { expanded = !expanded },
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     AppleIcons.KeyboardArrowDown, "Details", tint = TextTertiary,
-                    modifier = Modifier.size(20.dp).graphicsLayer { rotationZ = chevron }
+                    modifier = Modifier.size(20.dp).graphicsLayer { rotationZ = chevronState.value }
                 )
             }
         }
@@ -1103,7 +1259,7 @@ internal fun UniversalDownloadCard(s: BrowserState, tab: Tab?) {
         Modifier
             .fillMaxWidth()
             .padding(bottom = 8.dp)
-            .liquidGlass(TileShape, 0.9f)
+            .liquidGlass(CardShape, 1.0f, reactive = true)
             .padding(12.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {

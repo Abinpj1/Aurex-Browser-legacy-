@@ -21,6 +21,10 @@ import android.webkit.ValueCallback
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import androidx.webkit.UserAgentMetadata
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewFeature
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import okhttp3.OkHttpClient
@@ -103,6 +107,22 @@ class AurexWebView(context: Context) : WebView(context) {
     @Volatile
     var backgroundMediaActive: Boolean = false
 
+    /** Called on webpage scroll/load; `settleOnly = true` during active scroll for zero main-thread stutter. */
+    @Volatile
+    var onBackdropDirty: ((settleOnly: Boolean) -> Unit)? = null
+
+    fun notifyBackdropDirty() {
+        if (!GlassBackdrop.isRecordingNow) onBackdropDirty?.invoke(false)
+    }
+
+    override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
+        super.onScrollChanged(l, t, oldl, oldt)
+        if (!GlassBackdrop.isRecordingNow && (t != oldt || l != oldl)) {
+            onBackdropDirty?.invoke(true)
+        }
+    }
+
+
     // ------------------------------------------------------------------------------------
     // Stream sniffer state (declared before the init blocks that use it)
     // ------------------------------------------------------------------------------------
@@ -140,20 +160,67 @@ class AurexWebView(context: Context) : WebView(context) {
     // that kind of mismatch on a signed-in account. So Instagram always gets the phone's own WebView agent;
     // every other site gets what the user chose. Synced together with the bridges, before each navigation.
     // ------------------------------------------------------------------------------------
+    /** True native mobile Android WebView UA string, captured eagerly before any desktop override. */
+    private val defaultMobileUa: String =
+        runCatching { WebSettings.getDefaultUserAgent(context) }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: runCatching { settings.userAgentString }.getOrNull().orEmpty()
+
+    /** Original mobile Chromium Client Hints (Sec-CH-UA-Mobile: ?1, Platform: Android), captured eagerly. */
+    private val defaultMobileMeta: UserAgentMetadata? =
+        runCatching {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.USER_AGENT_METADATA)) {
+                WebSettingsCompat.getUserAgentMetadata(settings)
+            } else null
+        }.getOrNull()
+
+    /** Desktop Chromium Client Hints (Sec-CH-UA-Mobile: ?0, Platform: Linux x86_64). */
+    private val desktopUaMeta: UserAgentMetadata? by lazy {
+        runCatching {
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.USER_AGENT_METADATA)) return@runCatching null
+            val base = defaultMobileMeta
+            val b = if (base != null) UserAgentMetadata.Builder(base) else UserAgentMetadata.Builder()
+            b.setMobile(false)
+                .setPlatform("Linux")
+                .setPlatformVersion("6.6.0")
+                .setArchitecture("x86_64")
+                .setModel("")
+                .setBitness(64)
+                .setWow64(false)
+                .build()
+        }.getOrNull()
+    }
+
     @Volatile private var wantedUa: String? = null
-    private var appliedUa: String? = null
+    private var appliedDesktop: Boolean? = null
 
     /** The user agent the user asked for on ordinary sites (null = the phone's own). Main thread. */
     fun setPreferredUa(ua: String?) {
         wantedUa = ua
-        applyUaFor(runCatching { url }.getOrNull())
+        applyUaFor(runCatching { url }.getOrNull(), force = true)
     }
 
-    private fun applyUaFor(target: String?) {
-        val want = if (isHandsOffHost(target)) null else wantedUa
-        if (want == appliedUa) return
-        appliedUa = want
-        runCatching { settings.userAgentString = want }
+    private fun applyUaFor(target: String?, force: Boolean = false) {
+        val wantDesktop = wantedUa != null && !isHandsOffHost(target)
+        if (!force && wantDesktop == appliedDesktop) return
+        appliedDesktop = wantDesktop
+        runCatching {
+            // Explicitly set the real native mobile UA string when turning Desktop OFF
+            // (setting `null` is ignored or delayed on several Chromium WebView builds).
+            val nextUa = if (wantDesktop) wantedUa else defaultMobileUa
+            if (!nextUa.isNullOrBlank()) {
+                settings.userAgentString = nextUa
+                cachedUa = nextUa
+            }
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.USER_AGENT_METADATA)) {
+                val meta = if (wantDesktop) desktopUaMeta else defaultMobileMeta
+                if (meta != null) WebSettingsCompat.setUserAgentMetadata(settings, meta)
+            }
+            settings.useWideViewPort = true
+            settings.loadWithOverviewMode = true
+            // Clear any saved zoomed-out desktop scale so Mobile mode renders at exact 100% phone width!
+            if (!wantDesktop) setInitialScale(0)
+        }
     }
 
     /** Back / forward never call loadUrl: the page they go to is looked up in the history list first. */
@@ -327,6 +394,10 @@ class AurexWebView(context: Context) : WebView(context) {
     @Volatile
     var onMediaStateChanged: ((Boolean, Boolean, Boolean) -> Unit)? = null
 
+    /** Last known bounding rect of the active <video> inside the window (for smooth Android 12+ PiP zoom). */
+    @Volatile var videoRectInWindow: android.graphics.Rect? = null
+    private val winLoc = IntArray(2)
+
     /** Called by the page (JS) on every video / YouTube player event; forwards the state at once. */
     inner class PipBridge {
         @JavascriptInterface
@@ -339,6 +410,25 @@ class AurexWebView(context: Context) : WebView(context) {
                 val act = hostActivity() ?: return@post
                 if (act.isFinishing || act.isDestroyed) return@post
                 PipSupport.updatePipState(act, isPlaying, isMuted, hasNext)
+            }
+        }
+
+        @JavascriptInterface
+        fun onVideoBounds(leftPx: Float, topPx: Float, rightPx: Float, bottomPx: Float) {
+            post {
+                if (!isAttachedToWindow || !isShown) return@post
+                val w = (rightPx - leftPx).toInt()
+                val h = (bottomPx - topPx).toInt()
+                if (w < 64 || h < 64) {
+                    videoRectInWindow = null
+                    return@post
+                }
+                getLocationInWindow(winLoc)
+                val l = (winLoc[0] + leftPx.toInt()).coerceAtLeast(0)
+                val t = (winLoc[1] + topPx.toInt()).coerceAtLeast(0)
+                val r = (winLoc[0] + rightPx.toInt()).coerceAtLeast(l + 1)
+                val b = (winLoc[1] + bottomPx.toInt()).coerceAtLeast(t + 1)
+                videoRectInWindow = android.graphics.Rect(l, t, r, b)
             }
         }
     }
@@ -512,7 +602,7 @@ class AurexWebView(context: Context) : WebView(context) {
         val sizeHint: Long
     )
 
-    private class Probe(val size: Long, val reject: Boolean)
+    private class Probe(val size: Long, val reject: Boolean, val overrideKind: AurexStreamKind? = null)
 
     /** Called by the page's DOM observer (JavaBridge thread). Input is untrusted and validated. */
     inner class SniffBridge {
@@ -566,22 +656,37 @@ class AurexWebView(context: Context) : WebView(context) {
     private fun isHttp(u: String): Boolean =
         u.startsWith("http://", ignoreCase = true) || u.startsWith("https://", ignoreCase = true)
 
-    /** Pure string test: extension of the path (query and fragment ignored). */
+    /** Classifies media URLs by path extension OR standard query parameters while filtering out individual TS/M4S chunks. */
     private fun classify(url: String): AurexStreamKind? {
         if (!isHttp(url)) return null
-        var end = url.indexOfAny(charArrayOf('?', '#'))
-        if (end < 0) end = url.length
-        if (end < 2) return null
-        val dot = url.lastIndexOf('.', end - 1)
-        if (dot < 0 || end - dot > 6) return null
-        return when (url.substring(dot + 1, end).lowercase()) {
-            "mp4" -> AurexStreamKind.MP4
-            "m4v" -> AurexStreamKind.M4V
-            "webm" -> AurexStreamKind.WEBM
-            "m3u8" -> AurexStreamKind.HLS
-            "mpd" -> AurexStreamKind.DASH
-            else -> null
+        val low = url.lowercase()
+        var end = low.indexOfAny(charArrayOf('?', '#'))
+        if (end < 0) end = low.length
+        if (end >= 2) {
+            val dot = low.lastIndexOf('.', end - 1)
+            if (dot >= 0 && end - dot <= 6) {
+                when (low.substring(dot + 1, end)) {
+                    "ts", "m4s", "cmfv", "cmfa", "vtt", "srt", "key", "jpg", "jpeg", "png", "webp", "gif", "svg", "woff", "woff2", "css", "js" -> return null
+                    "mp4", "mov", "mkv", "flv" -> return AurexStreamKind.MP4
+                    "m4v" -> return AurexStreamKind.M4V
+                    "webm" -> return AurexStreamKind.WEBM
+                    "m3u8" -> return AurexStreamKind.HLS
+                    "mpd" -> return AurexStreamKind.DASH
+                }
+            }
         }
+        // Standard query-param hints used by CDNs without file extensions in the path
+        if (low.contains(".m3u8") || low.contains("format=m3u8") || low.contains("type=m3u8") ||
+            low.contains("mpegurl") || low.contains("manifest(format=m3u8") || low.contains("/playlist.m3u8")
+        ) {
+            return AurexStreamKind.HLS
+        }
+        if (low.contains(".mpd?") || low.contains("format=mpd") || low.contains("type=mpd") || low.contains("dash+xml")) {
+            return AurexStreamKind.DASH
+        }
+        if (low.contains("mime=video%2fmp4") || low.contains("mime=video/mp4")) return AurexStreamKind.MP4
+        if (low.contains("mime=video%2fwebm") || low.contains("mime=video/webm")) return AurexStreamKind.WEBM
+        return null
     }
 
     private fun isAdUrl(url: String): Boolean {
@@ -630,12 +735,18 @@ class AurexWebView(context: Context) : WebView(context) {
             val ua = c.ua.ifBlank { cachedUa }
             var size = c.sizeHint
 
+            var kind = c.kind
             when (c.kind) {
                 AurexStreamKind.MP4, AurexStreamKind.M4V, AurexStreamKind.WEBM, AurexStreamKind.FILE -> {
                     val p = probeSize(c.url, ua, cookie, referer)
                     if (p.reject) return
-                    size = p.size
-                    if (size in 0 until MIN_STREAM_BYTES) return      // tiny ad / tracker clip
+                    if (p.overrideKind != null) {
+                        kind = p.overrideKind
+                        size = -1L
+                    } else {
+                        size = p.size
+                        if (size in 0 until MIN_STREAM_BYTES) return      // tiny ad / tracker clip
+                    }
                 }
                 AurexStreamKind.BLOB -> {
                     if (size in 0 until MIN_STREAM_BYTES) return
@@ -647,7 +758,7 @@ class AurexWebView(context: Context) : WebView(context) {
             val title = c.title.ifBlank { cachedTitle }.ifBlank { host }.ifBlank { "video" }
             val stream = AurexDetectedStream(
                 url = c.url,
-                kind = c.kind,
+                kind = kind,
                 pageUrl = c.pageUrl.ifBlank { c.url },
                 title = title,
                 cookie = cookie,
@@ -655,9 +766,17 @@ class AurexWebView(context: Context) : WebView(context) {
                 referer = referer,
                 sizeBytes = size
             )
+            fun streamRank(s: AurexDetectedStream): Long = when (s.kind) {
+                AurexStreamKind.HLS -> 5_000_000_000L
+                AurexStreamKind.DASH -> 4_500_000_000L
+                AurexStreamKind.MP4, AurexStreamKind.M4V, AurexStreamKind.WEBM -> 3_000_000_000L + s.sizeBytes.coerceAtLeast(0L)
+                AurexStreamKind.FILE -> 2_000_000_000L + s.sizeBytes.coerceAtLeast(0L)
+                AurexStreamKind.BLOB -> 1_000_000_000L + s.sizeBytes.coerceAtLeast(0L)
+            }
             synchronized(detected) {
                 detected.removeAll { it.url == stream.url && it.pageUrl == stream.pageUrl }
                 detected.add(0, stream)
+                detected.sortByDescending { streamRank(it) }
                 while (detected.size > MAX_KEEP) detected.removeAt(detected.size - 1)
             }
             post { onStreamDetected?.invoke(stream) }
@@ -678,19 +797,40 @@ class AurexWebView(context: Context) : WebView(context) {
                 rb.header("Cookie", cookie)
                 rb.tag(CookieHome::class.java, CookieHome.of(url))
             }
-            if (referer.isNotBlank()) rb.header("Referer", referer)
+            if (referer.isNotBlank()) {
+                rb.header("Referer", referer)
+                runCatching {
+                    val ru = Uri.parse(referer)
+                    if (!ru.scheme.isNullOrBlank() && !ru.host.isNullOrBlank()) {
+                        rb.header("Origin", "${ru.scheme}://${ru.host}")
+                    }
+                }
+            }
             sniffHttp.newCall(rb.build()).execute().use { r ->
                 if (r.code == 404 || r.code == 410) return Probe(-1L, true)
                 val type = r.header("Content-Type").orEmpty().lowercase()
+                if (type.contains("mpegurl")) return Probe(-1L, false, AurexStreamKind.HLS)
+                if (type.contains("dash+xml")) return Probe(-1L, false, AurexStreamKind.DASH)
                 if (type.startsWith("text/") || type.startsWith("image/") ||
                     type.contains("json") || type.contains("xml")
                 ) {
                     return Probe(-1L, true)
                 }
-                val total = when (r.code) {
+                var total = when (r.code) {
                     206 -> r.header("Content-Range")?.substringAfterLast('/')?.toLongOrNull() ?: -1L
                     200 -> r.header("Content-Length")?.toLongOrNull() ?: -1L
                     else -> -1L
+                }
+                if (total < 0L && (r.code == 416 || r.code == 405)) {
+                    val headReq = rb.removeHeader("Range").head().build()
+                    runCatching {
+                        sniffHttp.newCall(headReq).execute().use { hr ->
+                            val ht = hr.header("Content-Type").orEmpty().lowercase()
+                            if (ht.contains("mpegurl")) return Probe(-1L, false, AurexStreamKind.HLS)
+                            if (ht.contains("dash+xml")) return Probe(-1L, false, AurexStreamKind.DASH)
+                            total = hr.header("Content-Length")?.toLongOrNull() ?: -1L
+                        }
+                    }
                 }
                 Probe(total, false)
             }
@@ -887,7 +1027,7 @@ class AurexWebView(context: Context) : WebView(context) {
         }
 
         val sniffHttp: OkHttpClient by lazy {
-            OkHttpClient.Builder()
+            AurexHttp.shared.newBuilder()
                 .connectTimeout(5, TimeUnit.SECONDS)
                 .readTimeout(6, TimeUnit.SECONDS)
                 .callTimeout(8, TimeUnit.SECONDS)
@@ -947,15 +1087,47 @@ class AurexWebView(context: Context) : WebView(context) {
             (function(){
               window.__aurexBgTransitionUntil = 0;
               window.__aurexExplicitUserPause = false;
-              const mp = document.getElementById('movie_player');
-              if (mp && mp.nextVideo) { mp.nextVideo(); }
-              else {
-                const b = document.querySelector('.ytp-next-button, button[aria-label*="Next"], a.ytp-next-button');
-                if (b) b.click();
+              var curHref = location.href;
+              var curVid = '';
+              try { curVid = new URL(curHref).searchParams.get('v') || ''; } catch (e) {}
+              function findUpNextLink(){
+                var sels = [
+                  'ytm-video-with-context-renderer a[href*="/watch?v="]',
+                  'ytm-compact-video-renderer a[href*="/watch?v="]',
+                  'a.compact-media-item-image[href*="/watch?v="]',
+                  'ytd-compact-video-renderer a#thumbnail[href*="/watch?v="]'
+                ];
+                for (var i = 0; i < sels.length; i++) {
+                  var list = document.querySelectorAll(sels[i]);
+                  for (var j = 0; j < list.length; j++) {
+                    var a = list[j];
+                    var h = a.getAttribute('href') || '';
+                    if (h && (!curVid || h.indexOf('v=' + curVid) < 0)) return a;
+                  }
+                }
+                return null;
               }
-              var rep = function(){ try { window.__aurexReport && window.__aurexReport(); } catch (e) {} };
-              setTimeout(rep, 300);
-              setTimeout(rep, 900);
+              var mp = document.getElementById('movie_player');
+              var b = document.querySelector('.ytp-next-button:not([aria-disabled="true"]), a.ytp-next-button, button[aria-label*="Next"]:not([disabled])');
+              if (mp && typeof mp.nextVideo === 'function') {
+                try { mp.nextVideo(); } catch (e) {}
+              } else if (b) {
+                try { b.click(); } catch (e) {}
+              }
+              setTimeout(function(){
+                try {
+                  if (location.href === curHref) {
+                    var nb = document.querySelector('.ytp-next-button:not([aria-disabled="true"]), a.ytp-next-button, button[aria-label*="Next"]:not([disabled])');
+                    if (nb) { nb.click(); }
+                    else {
+                      var up = findUpNextLink();
+                      if (up) up.click();
+                    }
+                  }
+                } catch (e) {}
+                try { window.__aurexReport && window.__aurexReport(); } catch (e) {}
+              }, 260);
+              setTimeout(function(){ try { window.__aurexReport && window.__aurexReport(); } catch (e) {} }, 900);
             })();
         """.trimIndent()
 
@@ -997,10 +1169,16 @@ class AurexWebView(context: Context) : WebView(context) {
                 return mv || v || document.querySelector('video');
               }
               function nextAvailable(){
-                var b = document.querySelector('.ytp-next-button:not([aria-disabled="true"]), button[aria-label*="Next"]:not([disabled])');
-                if (!b) return false;
-                try { var cs = getComputedStyle(b); if (cs.display === 'none' || cs.visibility === 'hidden') return false; } catch (e) {}
-                return true;
+                var mp = ytPlayer();
+                if (mp && typeof mp.nextVideo === 'function') return true;
+                var b = document.querySelector('.ytp-next-button:not([aria-disabled="true"]), a.ytp-next-button, button[aria-label*="Next"]:not([disabled])');
+                if (b) {
+                  try { var cs = getComputedStyle(b); if (cs.display !== 'none' && cs.visibility !== 'hidden') return true; } catch (e) { return true; }
+                }
+                if (location.hostname.indexOf('youtube.com') >= 0 && location.pathname.indexOf('/watch') === 0) {
+                  return !!document.querySelector('ytm-video-with-context-renderer a[href*="/watch?v="], ytm-compact-video-renderer a[href*="/watch?v="], a.compact-media-item-image[href*="/watch?v="]');
+                }
+                return false;
               }
               function isPlayingNow(v){
                 // The <video> element is the truth (like the native player's getPlayWhenReady()).
@@ -1033,6 +1211,15 @@ class AurexWebView(context: Context) : WebView(context) {
                   if (!force && key === last) return;
                   last = key;
                   window.AurexPipBridge.onState(playing, muted, next);
+                  try {
+                    if (v && v.getBoundingClientRect && window.AurexPipBridge.onVideoBounds) {
+                      var rc = v.getBoundingClientRect();
+                      var dpr = window.devicePixelRatio || 1;
+                      if (rc.width >= 60 && rc.height >= 60) {
+                        window.AurexPipBridge.onVideoBounds(rc.left * dpr, rc.top * dpr, rc.right * dpr, rc.bottom * dpr);
+                      }
+                    }
+                  } catch (e) {}
                 } catch (e) {}
               }
               function hookYt(){
@@ -1125,22 +1312,39 @@ class AurexWebView(context: Context) : WebView(context) {
                 } catch (e) { return location.href; }
               }
               function kindOf(u){
-                var p = u.split('#')[0].split('?')[0].toLowerCase();
+                var low = String(u || '').toLowerCase();
+                var p = low.split('#')[0].split('?')[0];
                 var i = p.lastIndexOf('.');
-                if (i < 0) return '';
-                var e = p.substring(i + 1);
-                return (e === 'mp4' || e === 'm4v' || e === 'webm' || e === 'm3u8' || e === 'mpd') ? e : '';
+                if (i >= 0) {
+                  var e = p.substring(i + 1);
+                  if (e === 'ts' || e === 'm4s' || e === 'vtt' || e === 'srt') return '';
+                  if (e === 'mp4' || e === 'mov' || e === 'mkv') return 'mp4';
+                  if (e === 'm4v' || e === 'webm' || e === 'm3u8' || e === 'mpd') return e;
+                }
+                if (low.indexOf('.m3u8') >= 0 || low.indexOf('format=m3u8') >= 0 || low.indexOf('mpegurl') >= 0) return 'm3u8';
+                if (low.indexOf('.mpd?') >= 0 || low.indexOf('format=mpd') >= 0 || low.indexOf('dash+xml') >= 0) return 'mpd';
+                if (low.indexOf('mime=video%2fmp4') >= 0 || low.indexOf('mime=video/mp4') >= 0) return 'mp4';
+                return '';
+              }
+              function kindFromMime(ct){
+                if (!ct) return '';
+                var c = String(ct).toLowerCase();
+                if (c.indexOf('mpegurl') >= 0) return 'm3u8';
+                if (c.indexOf('dash+xml') >= 0) return 'mpd';
+                if (c.indexOf('video/mp4') >= 0 || c.indexOf('video/quicktime') >= 0) return 'mp4';
+                if (c.indexOf('video/webm') >= 0) return 'webm';
+                return '';
               }
               function send(u, kind, size){
                 var key = (kind === 'blob') ? ('blob|' + pageUrl()) : u;
-                if (seen[key] || count > 200) return;
+                if (seen[key] || count > 240) return;
                 seen[key] = 1;
                 count++;
                 try {
                   B.onVideo(u, kind, pageUrl(), document.title || '', navigator.userAgent || '', size);
                 } catch (e) {}
               }
-              function handle(raw, v){
+              function handle(raw, v, forceKind){
                 if (!raw) return;
                 var u = absUrl(String(raw));
                 if (u.indexOf('blob:') === 0) {
@@ -1150,7 +1354,7 @@ class AurexWebView(context: Context) : WebView(context) {
                   return;
                 }
                 if (u.indexOf('http') !== 0) return;
-                var k = kindOf(u);
+                var k = forceKind || kindOf(u);
                 if (k) send(u, k, -1);
                 else if (v) send(u, 'file', -1);
               }
@@ -1163,6 +1367,68 @@ class AurexWebView(context: Context) : WebView(context) {
                   for (var i = 0; i < s.length; i++) handle(s[i].src || s[i].getAttribute('src'), v);
                 } catch (e) {}
               }
+              // Recursive open Shadow DOM walker (captures Reddit, Lit & modern Web Component players)
+              function scanRoot(root, depth){
+                if (!root || depth > 5) return;
+                try {
+                  var vs = root.querySelectorAll ? root.querySelectorAll('video') : [];
+                  for (var i = 0; i < vs.length; i++) scanVideo(vs[i]);
+                  var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                  var lim = Math.min(all.length, 320);
+                  for (var j = 0; j < lim; j++) {
+                    if (all[j].shadowRoot) scanRoot(all[j].shadowRoot, depth + 1);
+                  }
+                } catch (e) {}
+              }
+              // Non-intrusive fetch() & XHR inspector for dynamic HLS/DASH manifests (HLS.js, Dash.js, Shaka, Plyr)
+              try {
+                if (window.fetch && !window.fetch.__aurexSniff) {
+                  var origFetch = window.fetch;
+                  var wrappedFetch = function(input, init){
+                    var reqUrl = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
+                    if (reqUrl && kindOf(reqUrl)) handle(reqUrl, null);
+                    var p = origFetch.apply(this, arguments);
+                    if (p && p.then) {
+                      p.then(function(resp){
+                        try {
+                          if (!resp || !resp.url) return;
+                          var mk = kindFromMime(resp.headers && resp.headers.get && resp.headers.get('content-type'));
+                          if (mk) handle(resp.url, null, mk);
+                        } catch (e) {}
+                      }).catch(function(){});
+                    }
+                    return p;
+                  };
+                  wrappedFetch.__aurexSniff = true;
+                  window.fetch = wrappedFetch;
+                }
+                if (window.XMLHttpRequest && XMLHttpRequest.prototype && !XMLHttpRequest.prototype.open.__aurexSniff) {
+                  var origOpen = XMLHttpRequest.prototype.open;
+                  var origSend = XMLHttpRequest.prototype.send;
+                  XMLHttpRequest.prototype.open = function(m, u){
+                    try {
+                      this.__aurexUrl = u ? absUrl(String(u)) : '';
+                      if (this.__aurexUrl && kindOf(this.__aurexUrl)) handle(this.__aurexUrl, null);
+                    } catch (e) {}
+                    return origOpen.apply(this, arguments);
+                  };
+                  XMLHttpRequest.prototype.open.__aurexSniff = true;
+                  XMLHttpRequest.prototype.send = function(){
+                    try {
+                      var xhr = this;
+                      xhr.addEventListener('readystatechange', function(){
+                        if (xhr.readyState === 2) {
+                          try {
+                            var mk = kindFromMime(xhr.getResponseHeader && xhr.getResponseHeader('content-type'));
+                            if (mk) handle(xhr.responseURL || xhr.__aurexUrl, null, mk);
+                          } catch (e) {}
+                        }
+                      });
+                    } catch (e) {}
+                    return origSend.apply(this, arguments);
+                  };
+                }
+              } catch (e) {}
               var resSeen = 0;
               function scanResources(){
                 try {
@@ -1173,10 +1439,57 @@ class AurexWebView(context: Context) : WebView(context) {
                   }
                 } catch (e) {}
               }
+              var metaScanned = false;
+              function scanMetadata(){
+                if (metaScanned) return;
+                metaScanned = true;
+                try {
+                  var metas = document.querySelectorAll('meta[property="og:video"],meta[property="og:video:url"],meta[property="og:video:secure_url"],meta[name="twitter:player:stream"]');
+                  for (var i = 0; i < metas.length; i++) {
+                    var c = metas[i].getAttribute('content');
+                    if (c && kindOf(c)) handle(c, null);
+                  }
+                  var scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                  for (var j = 0; j < scripts.length && j < 8; j++) {
+                    var txt = scripts[j].textContent || '';
+                    if (txt.indexOf('contentUrl') < 0) continue;
+                    var ms = txt.match(/https?:\/\/[^"'\s<>]+/g);
+                    if (ms) {
+                      for (var k = 0; k < ms.length; k++) {
+                        if (kindOf(ms[k])) handle(ms[k], null);
+                      }
+                    }
+                  }
+                  // Popular embedded web players (JWPlayer, Video.js, Plyr/DPlayer/Artplayer)
+                  if (typeof window.jwplayer === 'function') {
+                    try {
+                      var jp = window.jwplayer();
+                      var item = jp && jp.getPlaylistItem ? jp.getPlaylistItem() : null;
+                      if (item) {
+                        if (item.file) handle(item.file, null);
+                        if (item.sources && item.sources.length) {
+                          for (var s = 0; s < item.sources.length; s++) {
+                            if (item.sources[s] && item.sources[s].file) handle(item.sources[s].file, null);
+                          }
+                        }
+                      }
+                    } catch (e) {}
+                  }
+                  if (window.videojs && window.videojs.players) {
+                    try {
+                      var ps = window.videojs.players;
+                      for (var pk in ps) {
+                        var pl = ps[pk];
+                        if (pl && pl.currentSrc) handle(pl.currentSrc(), null);
+                      }
+                    } catch (e) {}
+                  }
+                } catch (e) {}
+              }
               function scanAll(){
-                var vs = document.getElementsByTagName('video');
-                for (var i = 0; i < vs.length; i++) scanVideo(vs[i]);
+                scanRoot(document, 0);
                 scanResources();
+                scanMetadata();
               }
               var pending = false;
               function schedule(){

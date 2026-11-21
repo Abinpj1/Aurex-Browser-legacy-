@@ -30,11 +30,22 @@ android {
         applicationId = "com.aurex.browser"
         minSdk = 24
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.1.1"
-        // The bundled downloader engine (Python + yt-dlp + ffmpeg) is large per ABI.
-        // These cover virtually every phone plus the emulator.
-        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+        versionCode = 4
+        versionName = "2.0.0"
+        // Strip ~70 unused library locales (Aurex translates all 36 app languages on-device via MLKit).
+        resourceConfigurations += listOf("en")
+        manifestPlaceholders["appLabel"] = "Aurex Browser"
+    }
+
+    // Per-ABI splits cut the APK size by ~60-65% (no x86_64 emulator bloat, no dual-ABI fat APK).
+    // Builds lean arm64-v8a (modern phones + Apple Silicon emulator) and armeabi-v7a (legacy 32-bit).
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a")
+            isUniversalApk = false
+        }
     }
 
     // Use one fixed signing key for every official build (v1 + v2 + v3). An APK that is unsigned, or
@@ -56,7 +67,9 @@ android {
     val buildSigning = if (hasAurexSigning) signingConfigs.getByName("aurex") else signingConfigs.getByName("debug")
     buildTypes {
         debug {
+            applicationIdSuffix = ".debug"
             signingConfig = buildSigning
+            manifestPlaceholders["appLabel"] = "aurex debug"
         }
         release {
             isMinifyEnabled = true
@@ -65,19 +78,84 @@ android {
             signingConfig = buildSigning
         }
     }
+    
+    // Rename split release APKs to aurex-browser-v[versionName]-[abi].apk
+    applicationVariants.all {
+        if (buildType.name == "release") {
+            outputs.all {
+                val outputImpl = this as com.android.build.gradle.internal.api.ApkVariantOutputImpl
+                val abi = outputImpl.filters.find { it.filterType == "ABI" }?.identifier
+                outputImpl.outputFileName = if (abi.isNullOrBlank()) {
+                    "aurex-browser-v${defaultConfig.versionName}.apk"
+                } else {
+                    "aurex-browser-v${defaultConfig.versionName}-$abi.apk"
+                }
+            }
+        }
+    }
+
     // A lint finding must never stop the APK from being produced.
     lint {
         abortOnError = false
         checkReleaseBuilds = false
     }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = false
+        resValues = false
+        aidl = false
+        renderScript = false
+        shaders = false
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
+    kotlinOptions {
+        jvmTarget = "17"
+        freeCompilerArgs += listOf(
+            "-Xno-param-assertions",
+            "-Xno-call-assertions",
+            "-Xno-receiver-assertions"
+        )
+    }
+    // Omit Google Play encrypted dependency signing block from APK
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
+    }
+
     packaging {
-        resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        resources.excludes += setOf(
+            "/META-INF/{AL2.0,LGPL2.1}",
+            "/META-INF/LICENSE*",
+            "/META-INF/NOTICE*",
+            "/META-INF/DEPENDENCIES",
+            "/META-INF/INDEX.LIST",
+            "/META-INF/CHANGES",
+            "/META-INF/README*",
+            "/META-INF/*.version",
+            "/META-INF/*.kotlin_module",
+            "/META-INF/*.DSA",
+            "/META-INF/*.RSA",
+            "/META-INF/*.SF",
+            "/META-INF/versions/**",
+            "/META-INF/maven/**",
+            "/META-INF/proguard/**",
+            "/META-INF/com.android.tools/**",
+            "/META-INF/com/android/build/gradle/**",
+            "DebugProbesKt.bin",
+            "kotlin-tooling-metadata.json",
+            "jsr305_annotations/**",
+            "error_prone/**",
+            "third_party/**",
+            "google/protobuf/**",
+            "**/*.proto",
+            "play-services-*.properties",
+            "firebase-*.properties",
+            "transport-*.properties",
+            "okhttp3/internal/publicsuffix/NOTICE"
+        )
         // The engine runs bundled executables from the native lib dir, so the libs must be
         // extracted to disk instead of being mmapped from the APK.
         jniLibs { useLegacyPackaging = true }
@@ -88,18 +166,16 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.webkit:webkit:1.10.0")
     implementation("androidx.activity:activity-compose:1.9.0")
-    implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+    implementation(platform("androidx.compose:compose-bom:2024.09.03"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.animation:animation")
     implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.media3:media3-exoplayer:1.3.1")
     implementation("androidx.media3:media3-exoplayer-hls:1.3.1")
     implementation("androidx.media3:media3-exoplayer-dash:1.3.1")
     implementation("androidx.media3:media3-ui:1.3.1")
-    implementation("androidx.media3:media3-session:1.3.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // Universal downloader engine (yt-dlp + Python + ffmpeg), used internally.
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")

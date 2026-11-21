@@ -10,6 +10,7 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -33,21 +34,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.DeleteSweep
-import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.Palette
-import androidx.compose.material.icons.filled.PlayCircle
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.Shield
-import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -76,8 +62,6 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material.icons.filled.Add
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 import androidx.activity.compose.BackHandler
@@ -202,7 +186,16 @@ private fun SGroup(header: String? = null, footer: String? = null, build: SBuild
                 modifier = Modifier.padding(start = 16.dp, bottom = 6.dp)
             )
         }
-        Column(Modifier.fillMaxWidth().groupedSurface(RoundedCornerShape(20.dp))) {
+        val liquidScroll = LocalLiquidScroll.current
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .then(
+                    if (liquidScroll != null) Modifier.liquidScrollCard(liquidScroll, edgeScale = 0.032f, edgeTilt = 2.4f)
+                    else Modifier
+                )
+                .groupedSurface(RoundedCornerShape(22.dp), reactive = true)
+        ) {
             shown.forEachIndexed { n, i ->
                 val (inset, content) = b.items[i]
                 content()
@@ -228,15 +221,22 @@ private fun SGroup(header: String? = null, footer: String? = null, build: SBuild
 
 /** iOS app-icon style rounded tile with a white glyph. */
 @Composable
-private fun Squircle(icon: ImageVector, color: Color, size: Dp = 29.dp) {
+private fun Squircle(icon: ImageVector, color: Color, size: Dp = 27.dp) {
+    val shape = RoundedCornerShape(size * 0.28f)
+    val lit = androidx.compose.ui.graphics.lerp(color, Color.White, 0.22f)
     Box(
         Modifier
             .size(size)
-            .clip(RoundedCornerShape(size * 0.27f))
-            .background(Brush.verticalGradient(listOf(color.copy(alpha = 0.82f), color))),
+            .clip(shape)
+            .background(Brush.verticalGradient(listOf(lit, color)))
+            .border(
+                0.6.dp,
+                Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.45f), Color.White.copy(alpha = 0.06f))),
+                shape
+            ),
         contentAlignment = Alignment.Center
     ) {
-        Icon(icon, null, tint = Color.White, modifier = Modifier.size(size * 0.6f))
+        Icon(icon, null, tint = Color.White, modifier = Modifier.size(size * 0.58f))
     }
 }
 
@@ -255,8 +255,8 @@ private fun SRow(
         Modifier
             .fillMaxWidth()
             .then(if (onClick != null) Modifier.clickableHaptic(onClick = onClick) else Modifier)
-            .heightIn(min = 46.dp)
-            .padding(horizontal = 16.dp, vertical = 7.dp),
+            .heightIn(min = 42.dp)
+            .padding(horizontal = 14.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (icon != null) {
@@ -291,13 +291,13 @@ private fun SSwitch(title: String, checked: Boolean, onChange: (Boolean) -> Unit
         Modifier
             .fillMaxWidth()
             .clickableHaptic(kind = if (checked) Hx.TOGGLE_OFF else Hx.TOGGLE_ON) { onChange(!checked) }
-            .heightIn(min = 46.dp)
-            .padding(horizontal = 16.dp, vertical = 7.dp),
+            .heightIn(min = 42.dp)
+            .padding(horizontal = 14.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(Modifier.weight(1f)) {
             Text(title, color = TextPrimary, fontSize = 16.sp, letterSpacing = (-0.3).sp)
-            if (sub != null) Text(sub, color = TextSecondary, fontSize = 12.sp, lineHeight = 15.sp)
+            if (sub != null) Text(sub, color = TextSecondary, fontSize = 12.5.sp, lineHeight = 16.5.sp)
         }
         Spacer(Modifier.width(12.dp))
         GlassToggle(checked)
@@ -321,7 +321,7 @@ private fun SearchButton(onSearch: (() -> Unit)?) {
         Spacer(Modifier.size(40.dp))
         return
     }
-    Box(Modifier.liquidGlass(CircleShape, 0.9f, 0.04f)) {
+    Box(Modifier.liquidGlass(CircleShape, 1.02f, 0f, reactive = false)) {
         GlassIconButton(
             AppleIcons.Search, "Search settings", onSearch,
             size = 40.dp, iconSize = 19.dp, filled = false
@@ -334,7 +334,7 @@ private fun SearchButton(onSearch: (() -> Unit)?) {
 private fun SHeader(title: String, root: Boolean, onBack: () -> Unit, onSearch: (() -> Unit)? = null) {
     Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp)) {
         Row(Modifier.fillMaxWidth().height(48.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.liquidGlass(CircleShape, 0.9f, 0.04f)) {
+            Box(Modifier.liquidGlass(CircleShape, 1.02f, 0f, reactive = false)) {
                 GlassIconButton(
                     AppleIcons.ArrowBack, "Back", onBack,
                     size = 40.dp, iconSize = 19.dp, filled = false
@@ -369,15 +369,31 @@ private fun SettingsScroll(content: @Composable ColumnScope.() -> Unit) {
         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(16.dp), content = content)
         return
     }
-    Column(
-        Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp)
-            .padding(top = 4.dp, bottom = 100.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-        content = content
-    )
+    val scroll = rememberScrollState()
+    val liquidScroll = rememberGlassScrollState()
+    val scrolled by remember { androidx.compose.runtime.derivedStateOf { scroll.value > 8 } }
+    CompositionLocalProvider(LocalLiquidScroll provides liquidScroll) {
+    Box(Modifier.fillMaxSize()) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .liquidOverscrollJelly()
+                .liquidScrollTrack(liquidScroll)
+                .verticalScroll(scroll)
+                .padding(horizontal = 16.dp)
+                .padding(top = 6.dp, bottom = 108.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            content = content
+        )
+        ScrollEdgeBlur(
+            isTop = true,
+            active = scrolled,
+            height = 28.dp,
+            strength = 0.80f,
+            modifier = Modifier.align(Alignment.TopCenter)
+        )
+    }
+    }
 }
 
 @Composable
@@ -407,15 +423,29 @@ fun SettingsPage(s: BrowserState, onClose: () -> Unit) {
     val searchState = rememberSearchFabState()
     val searching = query.isNotBlank()
 
+    val spView = androidx.compose.ui.platform.LocalView.current
     fun go(p: Int) {
+        if (p != page) {
+            Haptics.fire(spView, if (p < page) Hx.WINDOW_CLOSE else Hx.TICK)
+        }
         page = p
         s.settingsTab = if (p < 0) 0 else p
     }
     fun endSearch() { query = ""; searchState.expanded = false; fabKey++ }
     BackHandler(enabled = page >= 0) { go(backOf(page)) }
 
-    Box(Modifier.fillMaxSize().closeSearchOnEmptyTap(searchState)) {
-        Column(Modifier.fillMaxSize().imePadding()) {
+    val parentBackdrop = LocalGlassBackdrop.current
+    val settingsBackdrop = remember(parentBackdrop) { GlassBackdrop(parent = parentBackdrop) }
+    Box(
+        Modifier
+            .fillMaxSize()
+            .edgeSwipeBack(enabled = s.swipeEdgeBack && !searching) {
+                if (page >= 0) go(backOf(page)) else onClose()
+            }
+            .closeSearchOnEmptyTap(searchState)
+    ) {
+        GlassBackdropHost(settingsBackdrop, Modifier.fillMaxSize().imePadding()) {
+        Column(Modifier.fillMaxSize()) {
             if (searching) {
                 SettingsSearchView(
                     s = s,
@@ -429,15 +459,18 @@ fun SettingsPage(s: BrowserState, onClose: () -> Unit) {
                 targetState = page,
                 modifier = Modifier.fillMaxSize(),
                 transitionSpec = {
-                    // iOS push / pop: the new page slides in, the old one drifts back a little.
-                    val push = targetState > initialState
-                    val ease = androidx.compose.animation.core.FastOutSlowInEasing
-                    if (push) {
-                        (slideInHorizontally(tween(320, easing = ease)) { it } + fadeIn(tween(220))) togetherWith
-                            (slideOutHorizontally(tween(320, easing = ease)) { -it / 4 } + fadeOut(tween(220)))
+                    if (PerfTier.low) {
+                        fadeIn(tween(130)) togetherWith fadeOut(tween(100))
                     } else {
-                        (slideInHorizontally(tween(320, easing = ease)) { -it / 4 } + fadeIn(tween(220))) togetherWith
-                            (slideOutHorizontally(tween(320, easing = ease)) { it } + fadeOut(tween(220)))
+                        val push = targetState > initialState
+                        val ease = androidx.compose.animation.core.CubicBezierEasing(0.22f, 1f, 0.36f, 1f)
+                        if (push) {
+                            (slideInHorizontally(tween(175, easing = ease)) { it } + fadeIn(tween(110))) togetherWith
+                                (slideOutHorizontally(tween(175, easing = ease)) { -it / 5 } + fadeOut(tween(95)))
+                        } else {
+                            (slideInHorizontally(tween(175, easing = ease)) { -it / 5 } + fadeIn(tween(110))) togetherWith
+                                (slideOutHorizontally(tween(175, easing = ease)) { it } + fadeOut(tween(95)))
+                        }
                     }
                 },
                 label = "settingsPage"
@@ -468,17 +501,28 @@ fun SettingsPage(s: BrowserState, onClose: () -> Unit) {
                 }
             }
         }
+        }
         // Registered after the page BackHandler on purpose: back folds the search first, then leaves the page.
-        key(fabKey) {
-            StandardSearchFab(
-                query = query,
-                onQuery = { query = it },
-                placeholder = "Search settings",
-                state = searchState
+        CompositionLocalProvider(LocalGlassBackdrop provides settingsBackdrop) {
+            ScrollEdgeBlur(
+                isTop = false,
+                active = true,
+                height = 72.dp,
+                strength = 0.62f,
+                modifier = Modifier.align(Alignment.BottomCenter)
             )
+            key(fabKey) {
+                StandardSearchFab(
+                    query = query,
+                    onQuery = { query = it },
+                    placeholder = "Search settings",
+                    state = searchState
+                )
+            }
         }
     }
 
+    CompositionLocalProvider(LocalGlassBackdrop provides settingsBackdrop) {
     if (confirmClear) {
         GlassConfirmDialog(
             "Clear browsing data?",
@@ -499,6 +543,7 @@ fun SettingsPage(s: BrowserState, onClose: () -> Unit) {
             onDismiss = { confirmReset = false }
         )
     }
+    }
 }
 
 // ── Settings search ──────────────────────────────────────────────────────────
@@ -518,14 +563,17 @@ private fun SettingsSearchView(
     val q = query.trim()
     Column(Modifier.fillMaxSize()) {
         SHeader(title = "Search", root = false, onBack = onBack)
+        val searchLiquid = rememberGlassScrollState()
         Column(
             Modifier
                 .fillMaxSize()
+                .liquidOverscrollJelly()
+                .liquidScrollTrack(searchLiquid)
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp)
-                .padding(top = 12.dp, bottom = 100.dp)
+                .padding(top = 12.dp, bottom = 108.dp)
         ) {
-            CompositionLocalProvider(LocalSettingsQuery provides q) {
+            CompositionLocalProvider(LocalSettingsQuery provides q, LocalLiquidScroll provides searchLiquid) {
                 SearchResultsHost(q) {
                     SearchSection(null, null) { SettingsRoot(s) { open(it) } }
                     SEARCH_PAGES.forEach { p ->
@@ -613,6 +661,7 @@ private fun SettingsRoot(s: BrowserState, open: (Int) -> Unit) {
     val engineName = ENGINES[s.engine.coerceIn(0, ENGINES.lastIndex)].name
     val swipesOn = listOf(
         s.swipeLinkTabSwitch, s.swipeTabClose, s.swipeDownloadDelete,
+        s.swipeTabCardClose, s.swipeEdgeBack, s.swipeLibraryActions,
         s.swipeDlRightDelete, s.swipeDlLeftShare, s.holdTabsNewTab, s.holdMenuSettings
     ).count { it }
 
@@ -810,19 +859,22 @@ private fun AboutSettings(s: BrowserState, onClose: () -> Unit, openCredits: () 
 private class Credit(val name: String, val what: String, val license: String, val url: String)
 
 private val CREDIT_ENGINES = listOf(
-    Credit("yt-dlp", "Video & audio extraction engine", "Unlicense", "https://github.com/yt-dlp/yt-dlp"),
+    Credit("Ghost-Downloader-3", "Multi-thread dynamic chunk splitting, stall-watchdog & checkpoint resume design", "GPL-3.0", "https://github.com/XiaoYouChR/Ghost-Downloader-3"),
+    Credit("Super-Video-Downloader", "HLS/DASH stream extraction, website video sniffing & remux architecture", "MIT", "https://github.com/alexch33/super-video-downloader"),
+    Credit("yt-dlp", "Universal video & audio extraction engine", "Unlicense", "https://github.com/yt-dlp/yt-dlp"),
     Credit("youtubedl-android", "Runs yt-dlp inside Android (JunkFood02, yausername)", "GPL-3.0", "https://github.com/JunkFood02/youtubedl-android"),
-    Credit("FFmpeg", "Merging, converting and HDR handling", "LGPL / GPL", "https://ffmpeg.org"),
-    Credit("Python", "Runtime that yt-dlp runs on", "PSF", "https://www.python.org"),
-    Credit("Chromium", "The web engine behind Android System WebView", "BSD-3-Clause", "https://www.chromium.org")
+    Credit("FFmpeg", "HDR merging, MP3/audio conversion and codec remuxing", "LGPL / GPL", "https://ffmpeg.org"),
+    Credit("Python", "Runtime that powers yt-dlp", "PSF", "https://www.python.org"),
+    Credit("Chromium", "Web rendering engine behind Android System WebView", "BSD-3-Clause", "https://www.chromium.org")
 )
 
 private val CREDIT_LIBS = listOf(
-    Credit("AndroidX Media3 (ExoPlayer)", "Built-in video player", "Apache-2.0", "https://github.com/androidx/media"),
-    Credit("Jetpack Compose & AndroidX", "The whole interface, activities, WebKit", "Apache-2.0", "https://developer.android.com/jetpack"),
-    Credit("Material Icons", "Part of the icon set", "Apache-2.0", "https://github.com/google/material-design-icons"),
-    Credit("OkHttp", "Networking, list and thumbnail downloads", "Apache-2.0", "https://github.com/square/okhttp"),
-    Credit("Kotlin & Coroutines", "Language and async runtime", "Apache-2.0", "https://github.com/Kotlin/kotlinx.coroutines")
+    Credit("AndroidX Media3 (ExoPlayer)", "Built-in adaptive video player & Picture-in-Picture engine", "Apache-2.0", "https://github.com/androidx/media"),
+    Credit("Jetpack Compose & AndroidX", "Liquid Glass UI, activities, WebKit and lifecycle", "Apache-2.0", "https://developer.android.com/jetpack"),
+    Credit("OkHttp", "HTTP/2 video streaming pool, multi-thread downloader & sniffer", "Apache-2.0", "https://github.com/square/okhttp"),
+    Credit("Google ML Kit Translate", "On-device offline translation for 36 app languages", "Google APIs ToS", "https://developers.google.com/ml-kit/language/translation"),
+    Credit("Apache Commons Compress", "Archive extraction for bundled downloader packages", "Apache-2.0", "https://commons.apache.org/proper/commons-compress/"),
+    Credit("Kotlin & Coroutines", "Language and structured async concurrency", "Apache-2.0", "https://github.com/Kotlin/kotlinx.coroutines")
 )
 
 private val CREDIT_LISTS = listOf(
@@ -885,14 +937,15 @@ private fun CreditsSettings(s: BrowserState, onClose: () -> Unit) {
 
 @Composable
 private fun AppearanceSettings(s: BrowserState) {
+    val appCtx = androidx.compose.ui.platform.LocalContext.current
     SettingsScroll {
         SGroup {
             seg("Theme", listOf("Auto", "Light", "Dark"), s.themeMode) { s.themeMode = it; s.save() }
             seg("Dark websites", listOf("Auto", "Always", "Off"), s.darkWeb) { s.setDarkWebMode(it) }
         }
-        SGroup(footer = "Clear to tinted glass.") {
+        SGroup {
             slider(
-                "Transparency", "${((1f - s.glass) * 100).toInt()}%",
+                "Glass tint", "${((1f - s.glass) * 100).toInt()}%",
                 s.glass, 0.35f..1f,
                 onChange = { s.glass = it }, onFinish = { s.save() }
             )
@@ -906,9 +959,19 @@ private fun AppearanceSettings(s: BrowserState) {
             sw("Favorites", s.showHomeSites) { s.showHomeSites = it; s.save() }
             sw("Recent sites", s.showRecent) { s.showRecent = it; s.save() }
         }
-        SGroup {
+        SGroup(footer = "Live status-bar Dynamic Island pill for active downloads and media playback.") {
+            sw("Dynamic Island", s.dynamicIsland) { on ->
+                s.dynamicIsland = on
+                NotifIsland.enabled = on
+                s.save()
+                runCatching { DownloadService.update(appCtx, s.downloads.items.toList()) }
+            }
+            if (s.dynamicIsland && NotifIsland.supportsAndroid16LiveUpdates && !NotifIsland.canPostLiveUpdates(appCtx)) {
+                act("Allow Live Updates", AppleIcons.Bolt, cBlue, value = "Enable") {
+                    NotifIsland.openLiveUpdatesSettings(appCtx)
+                }
+            }
             sw("Haptic feedback", s.haptics) { s.haptics = it; s.save() }
-            if (s.haptics) seg("Haptic strength", listOf("Light", "Medium", "Strong"), s.hapticLevel) { s.updateHapticLevel(it) }
         }
     }
 }
@@ -1059,12 +1122,12 @@ private fun ToolbarTrayControl(
     val latestDrop by rememberUpdatedState(onDrop)
     val dragging = edit.dragId == id
 
-    val lift by animateFloatAsState(
+    val liftState = animateFloatAsState(
         if (dragging) -6f else 0f,
         spring(dampingRatio = 0.75f, stiffness = 700f),
         label = "trayLift"
     )
-    val scale by animateFloatAsState(
+    val scaleState = animateFloatAsState(
         if (dragging) 0.94f else 1f,
         spring(dampingRatio = 0.8f, stiffness = 600f),
         label = "trayScale"
@@ -1078,9 +1141,10 @@ private fun ToolbarTrayControl(
                 edit.trayOrigins[id] = Rect(p.x, p.y, p.x + it.size.width, p.y + it.size.height)
             }
             .graphicsLayer {
-                translationY = lift
-                scaleX = scale
-                scaleY = scale
+                translationY = liftState.value
+                val sc = scaleState.value
+                scaleX = sc
+                scaleY = sc
                 alpha = if (dragging) 0.3f else 1f
                 shadowElevation = if (dragging) 14.dp.toPx() else 0f
             }
@@ -1332,6 +1396,19 @@ private fun SwipeSettings(s: BrowserState) {
                 s.holdMenuSettings = it; s.save()
             }
         }
+        SGroup(header = "Tabs & panels", footer = "Fluid swipe gestures inside Tabs, Settings, and side panels.") {
+            sw("Swipe tab card to close", s.swipeTabCardClose, "Swipe left or right on any tab in Tabs") {
+                s.swipeTabCardClose = it; s.save()
+            }
+            sw("Swipe from left edge", s.swipeEdgeBack, "Closes panels and goes back in Settings") {
+                s.swipeEdgeBack = it; s.save()
+            }
+        }
+        SGroup(header = "Bookmarks & history", footer = "Swipe right to remove, or swipe left to share any link.") {
+            sw("Swipe to delete & share", s.swipeLibraryActions, "Works in Bookmarks and History lists") {
+                s.swipeLibraryActions = it; s.save()
+            }
+        }
         SGroup(header = "Downloads list", footer = "Swipe a download in the Downloads list. Delete also removes the file, with no confirmation.") {
             sw("Swipe right to delete", s.swipeDlRightDelete, "Deletes the download and its file") {
                 s.swipeDlRightDelete = it; s.save()
@@ -1348,42 +1425,140 @@ private fun SwipeSettings(s: BrowserState) {
 @Composable
 private fun MenuSettings(s: BrowserState) {
     val style = LocalGlassStyle.current
+    val dark = LocalPalette.current.dark
     val pinned = s.menuPinned.mapNotNull { MenuAction.byId(it) }
     val rest = MenuAction.values().filter { it !in pinned }
     val reorder = remember { ReorderState() }
     val ids = pinned.map { it.id }
 
     SettingsScroll {
-        SGroup(header = "In menu", footer = "Long-press a row to reorder.") {
+        Column(Modifier.fillMaxWidth()) {
+            Text(
+                "IN MENU",
+                color = TextSecondary, fontSize = 12.sp,
+                fontWeight = FontWeight.Medium, letterSpacing = 0.3.sp,
+                modifier = Modifier.padding(start = 16.dp, bottom = 6.dp)
+            )
             if (pinned.isEmpty()) {
-                row { Text("Nothing here yet.", color = TextTertiary, fontSize = 15.sp, modifier = Modifier.padding(16.dp)) }
-            }
-            pinned.forEachIndexed { index, action ->
-                row(INSET_ICON) {
-                    DragReorderRow(
-                        item = action.id,
-                        index = index,
-                        items = ids,
-                        state = reorder,
-                        onReorder = { from, to -> s.movePinned(pinned[from], to - from) },
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 7.dp),
-                        content = { _: String, _: Boolean ->
-                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                Squircle(menuActionIcon(action), style.accent)
-                                Spacer(Modifier.width(12.dp))
-                                Text(
-                                    action.label, color = TextPrimary, fontSize = 16.sp,
-                                    letterSpacing = (-0.3).sp, modifier = Modifier.weight(1f)
-                                )
-                                GlassIconButton(
-                                    AppleIcons.VisibilityOff, "Hide", { s.togglePinned(action) },
-                                    size = 32.dp, iconSize = 17.dp, filled = false
-                                )
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .groupedSurface(RoundedCornerShape(22.dp))
+                        .padding(16.dp)
+                ) {
+                    Text("Nothing here yet.", color = TextTertiary, fontSize = 15.sp)
+                }
+            } else {
+                // Unclipped floating glass card stack: lifted item floats freely above neighbors with zero shadow clip!
+                Column(
+                    Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    pinned.forEachIndexed { index, action ->
+                        key(action.id) {
+                            DragReorderRow(
+                                item = action.id,
+                                index = index,
+                                items = ids,
+                                state = reorder,
+                                itemSpacing = 6.dp,
+                                onReorder = { from, to -> s.movePinned(pinned[from], to - from) },
+                                modifier = Modifier.fillMaxWidth()
+                            ) { _, dragging, handleMod ->
+                                val cardShape = RoundedCornerShape(18.dp)
+                                SwipeActionRow(
+                                    enabled = reorder.activeIndex < 0,
+                                    deleteOn = true,
+                                    shareOn = false,
+                                    canShare = false,
+                                    onDelete = { s.togglePinned(action) },
+                                    onShare = {},
+                                    onShareBlocked = {},
+                                    cornerDp = 18.dp,
+                                    deleteIcon = AppleIcons.VisibilityOff,
+                                    deleteDesc = "Hide"
+                                ) {
+                                    Row(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .groupedSurface(cardShape, reactive = false)
+                                            .then(
+                                                if (dragging) Modifier
+                                                    .background(style.accent.copy(alpha = if (dark) 0.16f else 0.10f), cardShape)
+                                                    .border(1.4.dp, style.accent.copy(alpha = 0.78f), cardShape)
+                                                else Modifier
+                                            )
+                                            .padding(start = 12.dp, end = 6.dp, top = 7.dp, bottom = 7.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        // Crisp slot position badge
+                                        Box(
+                                            Modifier
+                                                .size(22.dp)
+                                                .clip(CircleShape)
+                                                .background(
+                                                    if (dragging) style.accent
+                                                    else TextPrimary.copy(alpha = if (dark) 0.10f else 0.08f)
+                                                ),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Text(
+                                                "${index + 1}",
+                                                color = if (dragging) Color.White else TextSecondary,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                        Spacer(Modifier.width(10.dp))
+                                        Squircle(menuActionIcon(action), style.accent)
+                                        Spacer(Modifier.width(11.dp))
+                                        Text(
+                                            action.label,
+                                            color = TextPrimary,
+                                            fontSize = 15.5.sp,
+                                            fontWeight = if (dragging) FontWeight.SemiBold else FontWeight.Medium,
+                                            letterSpacing = (-0.25).sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        // Quick 1-tap hide button
+                                        GlassIconButton(
+                                            AppleIcons.VisibilityOff, "Hide", { s.togglePinned(action) },
+                                            size = 32.dp, iconSize = 16.dp, filled = false
+                                        )
+                                        Spacer(Modifier.width(2.dp))
+                                        // Instant Apple SF Symbol `≡` drag handle (zero long-press delay!)
+                                        Box(
+                                            Modifier
+                                                .size(width = 38.dp, height = 36.dp)
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .then(
+                                                    if (dragging) Modifier.background(style.accent.copy(alpha = 0.22f))
+                                                    else Modifier
+                                                )
+                                                .then(handleMod),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                AppleIcons.DragHandle,
+                                                contentDescription = "Drag to reorder",
+                                                tint = if (dragging) style.accent else TextSecondary,
+                                                modifier = Modifier.size(19.dp)
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
-                    )
+                    }
                 }
             }
+            Text(
+                "Drag ≡ to reorder instantly, or swipe right to hide.",
+                color = TextTertiary, fontSize = 12.sp, lineHeight = 16.sp,
+                modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 7.dp)
+            )
         }
 
         if (rest.isNotEmpty()) {

@@ -25,7 +25,7 @@ private class IconB(val b: ImageVector.Builder) {
     fun s(vararg d: String) = d.forEach {
         b.addPath(
             PathParser().parsePathString(it).toNodes(),
-            stroke = SolidColor(Color.Black), strokeLineWidth = 1.7f,
+            stroke = SolidColor(Color.Black), strokeLineWidth = 2.05f,
             strokeLineCap = StrokeCap.Round, strokeLineJoin = StrokeJoin.Round
         )
     }
@@ -57,7 +57,7 @@ object AppleIcons {
     val PlayArrow = icon("PlayArrow") { f("M7 4.8v14.4a.8.8 0 0 0 1.2.7l11.4-7.2a.8.8 0 0 0 0-1.4L8.2 4.1A.8.8 0 0 0 7 4.8z") }
     val Pause = icon("Pause") { f(rr(6.5f, 4.5f, 4f, 15f, 1.4f), rr(13.5f, 4.5f, 4f, 15f, 1.4f)) }
     val PictureInPictureAlt = icon("Pip") { s(rr(3f, 5f, 18f, 14f, 3f)); f(rr(12f, 12f, 6.5f, 4.5f, 1.2f)) }
-    val MoreVert = icon("Ellipsis") { f(circ(5.5f, 12f, 1.7f), circ(12f, 12f, 1.7f), circ(18.5f, 12f, 1.7f)) }
+    val MoreVert = icon("Ellipsis") { f(circ(5.2f, 12f, 1.95f), circ(12f, 12f, 1.95f), circ(18.8f, 12f, 1.95f)) }
     val Close = icon("Close") { s("M6 6l12 12M18 6L6 18") }
     val Bolt = icon("Bolt") { s("M13 2.5L5 13.5h6l-1 8 8-11h-6z") }
     val Share = icon("Share") { s("M8.5 10H7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2h-1.5", "M12 14.5V3M8.5 6.5L12 3l3.5 3.5") }
@@ -85,8 +85,8 @@ object AppleIcons {
         f("M12 3.4l2.6 5.5 6 .8-4.4 4.2 1.1 6-5.3-2.9-5.3 2.9 1.1-6-4.4-4.2 6-.8z")
         s("M12 3.4l2.6 5.5 6 .8-4.4 4.2 1.1 6-5.3-2.9-5.3 2.9 1.1-6-4.4-4.2 6-.8z")
     }
-    val Info = icon("Info") { s(circ(12f, 12f, 9f), "M12 11v5.5"); f(circ(12f, 7.9f, 1.1f)) }
-    val ErrorOutline = icon("Exclaim") { s(circ(12f, 12f, 9f), "M12 7.5v5.5"); f(circ(12f, 16.4f, 1.1f)) }
+    val Info = icon("Info") { s(circ(12f, 12f, 9f), "M12 11v5.5"); f(circ(12f, 7.7f, 1.3f)) }
+    val ErrorOutline = icon("Exclaim") { s(circ(12f, 12f, 9f), "M12 7.5v5.5"); f(circ(12f, 16.5f, 1.3f)) }
     val DesktopWindows = icon("Desktop") { s(rr(3f, 4f, 18f, 12.5f, 2.2f), "M9 20.5h6M12 16.5v4") }
     val DarkMode = icon("Moon") { s("M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5z") }
     val Bedtime = icon("Sleep") { s("M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5z", "M14.5 3.5h4l-4 4.5h4") }
@@ -95,7 +95,7 @@ object AppleIcons {
     val ArrowBack = icon("ChevronLeft") { s("M15 5l-7 7 7 7") }
     val ArrowForward = icon("ChevronRight") { s("M9 5l7 7-7 7") }
     val ChevronRight = ArrowForward
-    val Speed = icon("Gauge") { s("M4.5 18a8.5 8.5 0 1 1 15 0", "M12 14.5l4-4.5"); f(circ(12f, 14.5f, 1.2f)) }
+    val Speed = icon("Gauge") { s("M4.5 18a8.5 8.5 0 1 1 15 0", "M12 14.5l4-4.5"); f(circ(12f, 14.5f, 1.45f)) }
     val Palette = icon("Palette") {
         s("M12 3a9 9 0 0 0 0 18c1.5 0 2.2-1 2.2-2.1 0-1.7-1.8-1.7-1.8-3.2 0-1 .8-1.7 1.9-1.7H18a3 3 0 0 0 3-3C21 6.6 17 3 12 3z")
         f(circ(7.6f, 11f, 1.15f), circ(9.8f, 7.2f, 1.15f), circ(14.6f, 7.2f, 1.15f))
@@ -150,7 +150,7 @@ object AppleIcons {
     /** Tabs: a page with another one stacked behind it. */
     val Tabs = icon("Tabs") { s(rr(3f, 7.5f, 18f, 12.5f, 3f), "M6.5 4h11") }
     /** Toolbar settings: a screen with a bar of buttons along the bottom. */
-    val ToolbarBar = icon("ToolbarBar") { s(rr(3.5f, 3.5f, 17f, 17f, 3f), "M3.5 15.5h17"); f(circ(8f, 18f, 0.9f), circ(12f, 18f, 0.9f), circ(16f, 18f, 0.9f)) }
+    val ToolbarBar = icon("ToolbarBar") { s(rr(3.5f, 3.5f, 17f, 17f, 3f), "M3.5 15.5h17"); f(circ(8f, 18f, 1.15f), circ(12f, 18f, 1.15f), circ(16f, 18f, 1.15f)) }
     /** Gestures: a touch point swiping to the side. */
     val Swipe = icon("Swipe") {
         s("M13 12h8", "M17.5 8.5L21 12l-3.5 3.5", "M3 9.5a5 5 0 0 0 0 5")
@@ -180,4 +180,8 @@ object AppleIcons {
     val Archive = icon("Archive") { s(rr(4f, 3.5f, 16f, 17f, 2.5f), "M12 3.5v8", "M10 6.5h4M10 9h4"); f(rr(10f, 12.5f, 4f, 4.5f, 1.2f)) }
     val Code = icon("Code") { s("M8.5 7.5L4 12l4.5 4.5", "M15.5 7.5L20 12l-4.5 4.5", "M13.2 5.5l-2.4 13") }
     val Book = icon("Book") { s("M12 6.5C10 5 7 4.5 4.5 5v13c2.5-.5 5.5 0 7.5 1.5 2-1.5 5-2 7.5-1.5V5C17 4.5 14 5 12 6.5z", "M12 6.5v13") }
+    /** Apple SF Symbol reorder grip (three horizontal rounded bars). */
+    val DragHandle = icon("DragHandle") { s("M5 8h14", "M5 12h14", "M5 16h14") }
+    val ChevronUp = icon("ChevronUp") { s("M6.5 14.5L12 9l5.5 5.5") }
+    val ChevronDown = icon("ChevronDown") { s("M6.5 9.5L12 15l5.5-5.5") }
 }

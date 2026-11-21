@@ -32,21 +32,22 @@ class MainActivity : ComponentActivity() {
             when (intent?.action) {
                 ACTION_PIP_PLAY_PAUSE -> {
                     if (!PipSupport.acceptTap(ACTION_PIP_PLAY_PAUSE)) return
+                    Haptics.fireDetached(Hx.TAP)
                     val wasPlaying = state.tabs.getOrNull(state.current)?.videoPlaying == true
                     aurexWeb()?.togglePlayPauseFromPip()
-                    // Optimistic icon flip at once; the page's own <video> events confirm or correct it.
                     pushPipState(playing = !wasPlaying)
-                    schedulePipReconcile(450L)
+                    schedulePipReconcile(420L)
                 }
                 ACTION_PIP_AUDIO -> {
                     if (!PipSupport.acceptTap(ACTION_PIP_AUDIO)) return
+                    Haptics.fireDetached(Hx.TAP)
                     enterAudioMode()
                 }
                 ACTION_PIP_NEXT -> {
                     if (!PipSupport.acceptTap(ACTION_PIP_NEXT)) return
-                    if (!PipSupport.hasNextOr(pipHasNext)) return   // greyed out: nothing to skip to
+                    if (!PipSupport.hasNextOr(pipHasNext)) return
+                    Haptics.fireDetached(Hx.TAP)
                     aurexWeb()?.playNextFromPip()
-                    // A new video starts: show "pause" (it will autoplay); the page reports the truth right after.
                     pushPipState(playing = true)
                     schedulePipReconcile(900L)
                 }
@@ -228,8 +229,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 MainScreen(state)
-                // Update dialog: optional when one release behind, blocking from two releases behind.
-                UpdatePrompt(state.update)
                 // Language change veil + start-up language setup page (LangUi.kt)
                 LangOverlayHost()
             }
@@ -353,15 +352,14 @@ class MainActivity : ComponentActivity() {
         val builder  = PictureInPictureParams.Builder()
             .setAspectRatio(PipSupport.aspect(current?.videoWidth ?: 0, current?.videoHeight ?: 0))
             .setActions(pipActions(isPlaying))
-        // Built-in player open: the video fills the window, so the system can animate it straight into the
-        // PiP window (smooth hand-over, also for the automatic Home / gesture entry on Android 12+).
-        if (state.inlinePlayer) inlineVideoRect(current)?.let { builder.setSourceRectHint(it) }
+        // Smooth Android 12+ zoom-into-PiP source rect for BOTH InlinePlayer AND normal web videos!
+        val srcRect = if (state.inlinePlayer) inlineVideoRect(current) else aurexWeb()?.videoRectInWindow
+        srcRect?.let { builder.setSourceRectHint(it) }
+        PipSupport.applyMeta(builder, current?.title, current?.url?.let { hostOf(it) })
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // The system enters PiP by itself when the user leaves the app (Home / gesture / recents),
-            // but only if "Auto picture-in-picture" is on and a video has been playing stably.
             builder.setAutoEnterEnabled(current != null && autoPipReady(current))
-            builder.setSeamlessResizeEnabled(false)   // video content: system cross-fades the resize
+            builder.setSeamlessResizeEnabled(state.inlinePlayer)
         }
         return builder.build()
     }
@@ -440,17 +438,31 @@ class MainActivity : ComponentActivity() {
      * Android 12+: fired the moment the system starts animating into PiP, also for the automatic
      * Home / gesture entry. Hides the player controls at once so they do not get shrunk into the window.
      */
+    private var pipWasStashed = false
+
     @android.annotation.TargetApi(31)
     override fun onPictureInPictureUiStateChanged(uiState: android.app.PictureInPictureUiState) {
         super.onPictureInPictureUiStateChanged(uiState)
         if (!::state.isInitialized) return
         if (uiState.isTransitioningToPip) {
+            // Arm media + reduce page to video BEFORE the Home-swipe PiP animation begins (zero pause / zero chrome flash!)
             state.pipEntering = true
-            // If the system backs out of the transition, bring the controls back.
+            state.allowMediaResume()
+            aurexWeb()?.armBackgroundTransition()
+            if (!state.inlinePlayer) state.pipCommand("enter()")
             window?.decorView?.postDelayed({
-                if (!isInPictureInPictureMode) state.pipEntering = false
-            }, 1500L)
+                if (!isInPictureInPictureMode) {
+                    state.pipEntering = false
+                    if (!state.inlinePlayer) state.pipCommand("exit()")
+                }
+            }, 1400L)
         }
+        val stashedNow = uiState.isStashed
+        if (pipWasStashed && !stashedNow && isInPictureInPictureMode) {
+            // Waking PiP from screen-edge stash: nudge video frames cleanly so picture never freezes
+            state.pipCommand("revive()")
+        }
+        pipWasStashed = stashedNow
     }
 
     /** A video has been playing stably for >= [AUTO_PIP_STABLE_MS] and auto PiP is on: leaving the app keeps it alive. */
@@ -505,7 +517,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         /** A video must play this long before leaving the app auto-enters PiP (skips ads / previews). */
-        const val AUTO_PIP_STABLE_MS = 3_000L
+        const val AUTO_PIP_STABLE_MS = 1_800L
         /** String extra of a notification tap: "downloads" (download card) or "media" (player card). */
         const val EXTRA_OPEN = "aurex_open"
         const val ACTION_PIP_PLAY_PAUSE = "com.aurex.browser.BROWSER_PIP_PLAY_PAUSE"
@@ -614,6 +626,7 @@ class MainActivity : ComponentActivity() {
         if (::state.isInitialized) {
             BrowserState.markLive(state)
             state.pipMode = isInPictureInPictureMode
+            state.syncTabActivity()
         }
     }
 

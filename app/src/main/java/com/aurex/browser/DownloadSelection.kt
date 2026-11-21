@@ -51,13 +51,13 @@ fun Modifier.tapOrHold(
     val tap by rememberUpdatedState(onTap)
     val hold by rememberUpdatedState(onHold)
     var pressed by remember { mutableStateOf(false) }
-    val sc by animateFloatAsState(
+    val scState = animateFloatAsState(
         if (pressed) 0.985f else 1f,
         spring(dampingRatio = 0.65f, stiffness = 1200f),
         label = "holdScale"
     )
     this
-        .graphicsLayer { scaleX = sc; scaleY = sc }
+        .graphicsLayer { val s = scState.value; scaleX = s; scaleY = s }
         .pointerInput(tapKind, holdEnabled) {
             detectTapGestures(
                 onPress = {
@@ -82,7 +82,7 @@ fun Modifier.tapOrHold(
 fun SelectDot(selected: Boolean, accent: Color) {
     val fill by animateColorAsState(if (selected) accent else Color.Transparent, tween(180), label = "dotFill")
     val ring by animateColorAsState(if (selected) accent else TextTertiary, tween(180), label = "dotRing")
-    val tick by animateFloatAsState(
+    val tickState = animateFloatAsState(
         if (selected) 1f else 0f, spring(dampingRatio = 0.55f, stiffness = 600f), label = "dotTick"
     )
     Box(
@@ -95,7 +95,8 @@ fun SelectDot(selected: Boolean, accent: Color) {
         Icon(
             AppleIcons.Check, null, tint = Color.White,
             modifier = Modifier.size(14.dp).graphicsLayer {
-                scaleX = tick; scaleY = tick; alpha = tick.coerceIn(0f, 1f)
+                val t = tickState.value
+                scaleX = t; scaleY = t; alpha = t.coerceIn(0f, 1f)
             }
         )
     }
@@ -120,7 +121,7 @@ fun SelectionHeader(
             .padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Box(Modifier.liquidGlass(CircleShape, 0.9f, 0.04f)) {
+        Box(Modifier.liquidGlass(CircleShape, 1.02f, 0f, reactive = false)) {
             GlassIconButton(AppleIcons.Close, "Cancel selection", onClick = onClose, size = 44.dp, iconSize = 20.dp, filled = false)
         }
         Spacer(Modifier.width(14.dp))
@@ -146,7 +147,7 @@ fun SelectionHeader(
         }
         Spacer(Modifier.width(10.dp))
         Row(
-            Modifier.liquidGlass(Capsule, 0.9f, 0.04f).padding(horizontal = 2.dp),
+            Modifier.liquidGlass(Capsule, 1.02f, 0f, reactive = false).padding(horizontal = 2.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             GlassIconButton(

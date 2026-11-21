@@ -159,10 +159,14 @@ object MediaNotif {
         val n = Snap(posMs, durMs, playing, live, hasNext)
         val old = snap
         snap = n
-        if (old == null || old.playing != n.playing || old.live != n.live || old.hasNext != n.hasNext ||
-            old.durMs != n.durMs || old.posMs / 1000 != n.posMs / 1000
-        ) {
+        val stateChanged = old == null || old.playing != n.playing || old.live != n.live ||
+            old.hasNext != n.hasNext || old.durMs != n.durMs
+        val expectedPos = if (old != null && old.playing) old.posMs + 1000L else (old?.posMs ?: 0L)
+        val drifted = old != null && kotlin.math.abs(n.posMs - expectedPos) > 2_500L
+        if (stateChanged) {
             BrowserMediaService.live?.refresh()
+        } else if (drifted) {
+            BrowserMediaService.live?.syncPositionOnly()
         }
     }
 

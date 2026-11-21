@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Collapsed card: rounded 16:9 thumbnail, title, one grey line, thin progress, round action. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/root"
     android:layout_width="match_parent"
@@ -9,9 +8,9 @@
 
     <ImageView
         android:id="@+id/thumb"
-        android:layout_width="64dp"
-        android:layout_height="36dp"
-        android:layout_marginEnd="12dp"
+        android:layout_width="56dp"
+        android:layout_height="32dp"
+        android:layout_marginEnd="10dp"
         android:scaleType="fitXY" />
 
     <LinearLayout
@@ -26,27 +25,30 @@
             android:layout_height="wrap_content"
             android:ellipsize="end"
             android:fontFamily="sans-serif-medium"
+            android:includeFontPadding="false"
             android:maxLines="1"
             android:singleLine="true"
-            android:textAppearance="@android:style/TextAppearance.Material.Notification.Title"
-            android:textSize="15sp" />
+            android:textColor="@color/notif_title"
+            android:textSize="14sp" />
 
         <TextView
             android:id="@+id/sub"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
             android:ellipsize="end"
             android:fontFeatureSettings="tnum"
+            android:includeFontPadding="false"
             android:maxLines="1"
             android:singleLine="true"
-            android:textAppearance="@android:style/TextAppearance.Material.Notification.Line2"
-            android:textSize="13sp" />
+            android:textColor="@color/notif_sub"
+            android:textSize="12sp" />
 
         <ProgressBar
             android:id="@+id/progress"
             style="?android:attr/progressBarStyleHorizontal"
             android:layout_width="match_parent"
-            android:layout_height="4dp"
+            android:layout_height="3.5dp"
             android:layout_marginTop="4dp"
             android:max="100"
             android:progress="0"
@@ -55,10 +57,10 @@
 
     <ImageView
         android:id="@+id/btn"
-        android:layout_width="34dp"
-        android:layout_height="34dp"
-        android:layout_marginStart="12dp"
+        android:layout_width="32dp"
+        android:layout_height="32dp"
+        android:layout_marginStart="10dp"
         android:background="@drawable/notif_btn_round"
-        android:padding="8dp"
+        android:padding="7.5dp"
         android:scaleType="fitCenter" />
 </LinearLayout>

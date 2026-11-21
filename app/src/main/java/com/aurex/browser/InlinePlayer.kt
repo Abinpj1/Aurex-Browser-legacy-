@@ -162,12 +162,13 @@ fun InlinePlayerHost(s: BrowserState) {
             }
             if (!YtDlpEngine.isQualitySite(page)) return@resolve
             fun take(m: YtDlpEngine.ResolvedMedia) {
-                val hs = (m.heights + m.choices.map { it.height }).filter { it > 0 }.distinct().sortedDescending()
+                val hs = (m.heights + m.choices.map { DeviceCaps.tier(it) })
+                    .filter { it > 0 && DeviceCaps.supportsHeight(it) }.distinct().sortedDescending()
                 if (hs.size > 1) {
                     engineH = hs
                     engineUrls = m.choices
                         .filter { it.height > 0 && it.video.isNotBlank() && it.audio == null && !it.video.startsWith("blob:") }
-                        .groupBy { it.height }.mapValues { (_, l) -> l.first().video }
+                        .groupBy { DeviceCaps.tier(it) }.mapValues { (_, l) -> l.first().video }
                 }
             }
             val cached = YtDlpEngine.peekCached(page)
@@ -184,7 +185,10 @@ fun InlinePlayerHost(s: BrowserState) {
         }
     }
     val fallbackRows: List<YtDlpEngine.StreamChoice> =
-        if (hlsQ.size > 1) hlsQ.filter { !MediaTools.tooSharp(it.width, it.height) && DeviceCaps.supportsHeight(it.height) }.map { YtDlpEngine.StreamChoice(MediaTools.qualityLabel(it.width, it.height), it.height, it.url, null, hls = true) }
+        if (hlsQ.size > 1) hlsQ.filter { !MediaTools.tooSharp(it.width, it.height) && DeviceCaps.supportsHeight(DeviceCaps.tierOf(it.width, it.height)) }.map {
+            val t = DeviceCaps.tierOf(it.width, it.height)
+            YtDlpEngine.StreamChoice(MediaTools.heightText(t), it.height, it.url, null, hls = true, width = it.width)
+        }
         else engineH.map { h -> YtDlpEngine.StreamChoice(MediaTools.labelForHeight(h), h, engineUrls[h].orEmpty(), null) }
     val usingHls = pageQ == null && hlsQ.size > 1
     // 1440p / 4K / 8K that the video has but the page's own player does not offer (YouTube in a WebView):
@@ -193,7 +197,7 @@ fun InlinePlayerHost(s: BrowserState) {
     val pageMaxH = pageNow?.choices?.maxOfOrNull { it.height } ?: 0
     val extraHigh: List<YtDlpEngine.StreamChoice> =
         if (pageNow != null && pageMaxH > 0 && YtDlpEngine.isYoutubeUrl(tab?.url))
-            (pageNow.extra + engineH).filter { it > pageMaxH && it >= 1440 }.distinct().sortedDescending()
+            (pageNow.extra + engineH).filter { it > pageMaxH && it >= 1440 && DeviceCaps.supportsHeight(it) }.distinct().sortedDescending()
                 .map { YtDlpEngine.StreamChoice(MediaTools.labelForHeight(it), it, "", null) }
         else emptyList()
     val qRows = if (pageNow != null) {
@@ -204,7 +208,7 @@ fun InlinePlayerHost(s: BrowserState) {
         if (pageNow.index > 0) pageNow.index + extraHigh.size else pageNow.index
     } else {
         pickedIdx
-            ?: fallbackRows.indexOfFirst { it.height > 0 && it.height == (tab?.videoHeight ?: 0) }
+            ?: fallbackRows.indexOfFirst { it.height > 0 && DeviceCaps.tier(it) == DeviceCaps.tierOf(tab?.videoWidth ?: 0, tab?.videoHeight ?: 0) }
     }
 
     // Live state of the page video, 4x a second. The page / video gone -> close by itself.

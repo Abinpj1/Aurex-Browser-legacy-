@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="notif_title">#F5F7FC</color>
+    <color name="notif_sub">#B8BECA</color>
+    <color name="notif_detail">#8E96A8</color>
+    <color name="notif_accent">#0A84FF</color>
+    <color name="notif_btn_sec_bg">#22FFFFFF</color>
+    <color name="notif_btn_sec_fg">#EEF1F8</color>
+    <color name="notif_track">#2EFFFFFF</color>
+</resources>

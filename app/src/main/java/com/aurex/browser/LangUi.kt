@@ -90,26 +90,29 @@ import kotlinx.coroutines.delay
 @Composable
 private fun LangRing(phase: LangPhase, progress: Float, color: Color, stroke: Dp, modifier: Modifier = Modifier) {
     val spin = rememberInfiniteTransition(label = "langSpin")
-    val angle by spin.animateFloat(
+    val angleState = spin.animateFloat(
         initialValue = 0f, targetValue = 360f,
         animationSpec = infiniteRepeatable(tween(if (phase == LangPhase.QUEUED) 2400 else 1000, easing = LinearEasing)),
         label = "langAngle"
     )
-    val p by animateFloatAsState(progress.coerceIn(0f, 1f), tween(380, easing = FastOutSlowInEasing), label = "langP")
+    val pState = animateFloatAsState(progress.coerceIn(0f, 1f), tween(380, easing = FastOutSlowInEasing), label = "langP")
     Canvas(modifier) {
+        val angle = angleState.value
+        val p = pState.value
         val sw = stroke.toPx()
         val tl = Offset(sw / 2f, sw / 2f)
         val sz = Size(size.width - sw, size.height - sw)
+        val roundStroke = Stroke(sw, cap = StrokeCap.Round)
         drawArc(color.copy(alpha = 0.18f), 0f, 360f, false, tl, sz, style = Stroke(sw))
         when (phase) {
             LangPhase.TRANSLATING ->
-                drawArc(color, -90f, 360f * p.coerceAtLeast(0.03f), false, tl, sz, style = Stroke(sw, cap = StrokeCap.Round))
+                drawArc(color, -90f, 360f * p.coerceAtLeast(0.03f), false, tl, sz, style = roundStroke)
             LangPhase.READY ->
-                drawArc(color, -90f, 360f, false, tl, sz, style = Stroke(sw, cap = StrokeCap.Round))
+                drawArc(color, -90f, 360f, false, tl, sz, style = roundStroke)
             LangPhase.DOWNLOADING ->
-                drawArc(color, angle - 90f, 100f, false, tl, sz, style = Stroke(sw, cap = StrokeCap.Round))
+                drawArc(color, angle - 90f, 100f, false, tl, sz, style = roundStroke)
             LangPhase.QUEUED ->
-                drawArc(color.copy(alpha = 0.5f), angle - 90f, 60f, false, tl, sz, style = Stroke(sw, cap = StrokeCap.Round))
+                drawArc(color.copy(alpha = 0.5f), angle - 90f, 60f, false, tl, sz, style = roundStroke)
             else -> Unit
         }
     }
@@ -133,14 +136,14 @@ private fun Modifier.pressButton(kind: Hx, onClick: () -> Unit): Modifier = comp
     val view = LocalView.current
     var pressed by remember { mutableStateOf(false) }
     val currentOnClick by rememberUpdatedState(onClick)
-    val sc by animateFloatAsState(
+    val scState = animateFloatAsState(
         targetValue = if (pressed) 0.84f else 1f,
         animationSpec = if (pressed) spring<Float>(dampingRatio = 0.9f, stiffness = 1100f)
         else spring<Float>(dampingRatio = 0.42f, stiffness = 480f),
         label = "langBtnPress"
     )
     this
-        .graphicsLayer { scaleX = sc; scaleY = sc }
+        .graphicsLayer { val s = scState.value; scaleX = s; scaleY = s }
         .pointerInput(kind) {
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
@@ -418,11 +421,11 @@ fun LangOverlayHost() {
         val palette = LocalPalette.current
         val accent = LocalGlassStyle.current.accent
         BackHandler(enabled = true) { }
+        val veilBackdrop = remember { GlassBackdrop() }
         Box(
             Modifier
                 .fillMaxSize()
-                .graphicsLayer { alpha = veilA.value }
-                .background(palette.bg)
+                .graphicsLayer { alpha = veilA.value.coerceIn(0f, 1f) }
                 .pointerInput(Unit) {
                     awaitPointerEventScope {
                         while (true) awaitPointerEvent().changes.forEach { it.consume() }
@@ -430,7 +433,14 @@ fun LangOverlayHost() {
                 },
             contentAlignment = Alignment.Center
         ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            AppBackground()
+            androidx.compose.runtime.CompositionLocalProvider(LocalGlassBackdrop provides veilBackdrop) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .liquidGlass(CardShape, 1.15f, reactive = true)
+                    .padding(horizontal = 36.dp, vertical = 28.dp)
+            ) {
                 Box(Modifier.size(64.dp), contentAlignment = Alignment.Center) {
                     AnimatedContent(
                         targetState = revealed,
@@ -452,6 +462,7 @@ fun LangOverlayHost() {
                     Langs.byCode(veil.code)?.native ?: "English",
                     color = TextPrimary, fontSize = 24.sp, fontWeight = FontWeight.SemiBold
                 )
+            }
             }
         }
     }
@@ -500,11 +511,11 @@ private fun LangSetupScreen(s: LangSetup) {
     BackHandler(enabled = true) { }
 
     val breathe = rememberInfiniteTransition(label = "setupBreathe")
-    val glowA by breathe.animateFloat(
+    val glowAState = breathe.animateFloat(
         initialValue = 0.55f, targetValue = 1f,
         animationSpec = infiniteRepeatable(tween(1800, easing = FastOutSlowInEasing), RepeatMode.Reverse), label = "glowA"
     )
-    val globeS by breathe.animateFloat(
+    val globeSState = breathe.animateFloat(
         initialValue = 1f, targetValue = 1.07f,
         animationSpec = infiniteRepeatable(tween(1800, easing = FastOutSlowInEasing), RepeatMode.Reverse), label = "globeS"
     )
@@ -518,17 +529,20 @@ private fun LangSetupScreen(s: LangSetup) {
         else -> SetupIcon.GLOBE
     }
 
+    val setupBackdrop = remember { GlassBackdrop() }
     Box(
         Modifier
             .fillMaxSize()
-            .graphicsLayer { alpha = enterA.value * exitA.value }
-            .background(palette.bg)
+            .graphicsLayer { alpha = (enterA.value * exitA.value).coerceIn(0f, 1f) }
             .pointerInput(Unit) {
                 awaitPointerEventScope {
                     while (true) awaitPointerEvent().changes.forEach { it.consume() }
                 }
             }
     ) {
+        AppBackground()
+        androidx.compose.runtime.CompositionLocalProvider(LocalGlassBackdrop provides setupBackdrop) {
+        Box(Modifier.fillMaxSize()) {
         Column(
             Modifier.align(Alignment.Center).padding(horizontal = 32.dp),
             horizontalAlignment = Alignment.CenterHorizontally
@@ -537,10 +551,10 @@ private fun LangSetupScreen(s: LangSetup) {
                 Box(
                     Modifier
                         .size(240.dp)
-                        .graphicsLayer { alpha = glowA * (if (phase == LangPhase.FAILED) 0.3f else 1f) }
+                        .graphicsLayer { alpha = (glowAState.value * (if (phase == LangPhase.FAILED) 0.3f else 1f)).coerceIn(0f, 1f) }
                         .background(Brush.radialGradient(listOf(accent.copy(alpha = 0.26f), Color.Transparent)), CircleShape)
                 )
-                Box(Modifier.size(132.dp), contentAlignment = Alignment.Center) {
+                Box(Modifier.size(136.dp).liquidGlass(CircleShape, 1.0f, reactive = true), contentAlignment = Alignment.Center) {
                     LangRing(phase, dl.progress, ringColor, 5.dp, Modifier.fillMaxSize())
                     AnimatedContent(
                         targetState = icon,
@@ -553,7 +567,7 @@ private fun LangSetupScreen(s: LangSetup) {
                         when (k) {
                             SetupIcon.GLOBE -> Icon(
                                 AppleIcons.Language, null, tint = accent,
-                                modifier = Modifier.size(52.dp).graphicsLayer { scaleX = globeS; scaleY = globeS }
+                                modifier = Modifier.size(52.dp).graphicsLayer { val gs = globeSState.value; scaleX = gs; scaleY = gs }
                             )
                             SetupIcon.PERCENT -> Text("$pct%", color = TextPrimary, fontSize = 30.sp, fontWeight = FontWeight.Bold)
                             SetupIcon.CHECK -> Icon(AppleIcons.Check, null, tint = Good, modifier = Modifier.size(56.dp))
@@ -606,6 +620,8 @@ private fun LangSetupScreen(s: LangSetup) {
                     GlassPillButton(LangSetupText.SKIP, { AppLang.skipSetup() })
                 }
             }
+        }
+        }
         }
     }
 }

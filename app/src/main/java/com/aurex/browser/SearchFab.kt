@@ -158,7 +158,13 @@ fun ExpandingSearchFab(
             Modifier
                 .width(width)
                 .height(fab)
-                .liquidGlass(Capsule, 1.2f, 0.04f)
+                .liquidWindowDrag(
+                    maxPullDp = 30.dp,
+                    dismissDir = if (expanded) LiquidDismissDir.DOWN else LiquidDismissDir.NONE,
+                    dismissThresholdDp = 46.dp,
+                    onDismiss = if (expanded) ({ close() }) else null
+                )
+                .liquidGlass(Capsule, 1.22f, 0f, reactive = false)
                 // The open bar takes its own taps, so they never count as "empty space".
                 .then(if (expanded) Modifier.pointerInput(Unit) { detectTapGestures { } } else Modifier),
             verticalAlignment = Alignment.CenterVertically

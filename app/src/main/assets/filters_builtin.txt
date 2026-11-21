@@ -85,3 +85,27 @@
 ##[id="ad_box"]
 ##[id="adsbox"]
 ##[id="ads-banner"]
+! Modern pop-under, push-ad & anti-adblock script networks
+||monetag.com^
+||effectivegatecpm.com^
+||profitablecpmrate.com^
+||highperformanceformat.com^
+||acscdn.com^
+||pubfuture.com^
+||clickadilla.com^
+||galaksion.com^
+||evadav.com^
+||richads.com^
+||mondiad.com^
+||pushhouse.io^
+||notifpush.com^
+||getadmiral.com^
+||blockthrough.com^
+||btloader.com^
+||pemsrv.com^
+||alwingulla.com^
+||glizauvo.net^
+||thaudray.com^
+||onclckmn.com^
+||onclckds.com^
+||dolohen.com^

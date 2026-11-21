@@ -1,7 +1,10 @@
 package com.aurex.browser
 
 import android.app.Application
+import android.content.ComponentCallbacks2
 import android.content.res.Configuration
+import android.os.Handler
+import android.os.Looper
 
 /** App-scoped services shared by the browser UI, PlayerActivity and DownloadService. */
 class AurexApp : Application() {
@@ -16,6 +19,8 @@ class AurexApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        PerfTier.init(this)
+        NotifIsland.init(this)
         AppLog.init(this)
         AppLang.init(this)   // app language + website language (Lang.kt)
         AppLang.onReady = {
@@ -25,14 +30,45 @@ class AurexApp : Application() {
         }
         // A killed download can leave a plaintext cookie file behind: never keep one.
         runCatching { cacheDir.listFiles { f -> f.name.startsWith("ytdlp_cookies_") }?.forEach { it.delete() } }
-        PerfTier.init(this)
         VideoDl.load(this)
         downloads = DownloadManager(this)
         // Keep the Download folder in line with the "Files visibility" setting (default: visible).
         MediaVisibility.sync(this)
         MediaVisibility.catchUpAsync(this)   // saves files in Downloads (once for old ones) and finishes a copy that was cut short (Android 10+)
-        // Unpacks the universal downloader engine and keeps it current, off the main thread.
-        // Skipped completely while "Video download" is off, so it costs no memory or data.
-        if (VideoDl.enabled) YtDlpEngine.warmUpAsync(this)
+        // Tier-aware cold-start warmup:
+        //  - LOW-end phones: skip eager warmup completely (yt-dlp unpacks on-demand when a video is downloaded).
+        //  - BALANCED: defer 4s so startup & first page render stay silky smooth.
+        //  - HIGH: defer 800ms to avoid competing with Frame 1 UI draw.
+        if (VideoDl.enabled && !PerfTier.low) {
+            val delayMs = if (PerfTier.balanced) 4_000L else 800L
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (VideoDl.enabled && !PerfTier.low) YtDlpEngine.warmUpAsync(this)
+            }, delayMs)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        val aggressive = level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+            level == ComponentCallbacks2.TRIM_MEMORY_MODERATE ||
+            level == ComponentCallbacks2.TRIM_MEMORY_COMPLETE
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN || aggressive) {
+            GlassBackdrop.trimAll()
+            Favicons.trim(aggressive)
+            AurexHttp.trim(); OkHttpStreamDataSource.trim()
+            DownloadManager.trimSockets()
+            BrowserState.onMemoryPressure(aggressive)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onLowMemory() {
+        super.onLowMemory()
+        GlassBackdrop.trimAll()
+        Favicons.trim(aggressive = true)
+        AurexHttp.trim(); OkHttpStreamDataSource.trim()
+        DownloadManager.trimSockets()
+        BrowserState.onMemoryPressure(aggressive = true)
     }
 }

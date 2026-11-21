@@ -366,10 +366,13 @@ object Remux {
             muxer.start()
             started = true
 
-            val buf = ByteBuffer.allocate(3 * 1024 * 1024)
+            val bufBytes = if (PerfTier.low) 2 * 1024 * 1024 else 4 * 1024 * 1024
+            val buf = ByteBuffer.allocateDirect(bufBytes)
             val info = MediaCodec.BufferInfo()
             var vAlive = true
             var aAlive = aEx != null
+            var lastVTs = -1L
+            var lastATs = -1L
             while (vAlive || aAlive) {
                 // always write the stream that is further behind, so the file is interleaved
                 val takeVideo = when {
@@ -384,10 +387,18 @@ object Remux {
                     if (takeVideo) vAlive = false else aAlive = false
                     continue
                 }
-                info.set(0, size, ex.sampleTime.coerceAtLeast(0L), ex.sampleFlags and MediaCodec.BUFFER_FLAG_KEY_FRAME)
+                var ts = ex.sampleTime.coerceAtLeast(0L)
+                if (takeVideo) {
+                    if (ts < lastVTs) ts = lastVTs + 1L
+                    lastVTs = ts
+                } else {
+                    if (ts < lastATs) ts = lastATs + 1L
+                    lastATs = ts
+                }
+                info.set(0, size, ts, ex.sampleFlags and MediaCodec.BUFFER_FLAG_KEY_FRAME)
                 muxer.writeSampleData(if (takeVideo) vOut else aOut, buf, info)
                 if (takeVideo && durUs > 0 && onProgress != null && (++tick and 0x3F) == 0)
-                    onProgress((info.presentationTimeUs.toFloat() / durUs).coerceIn(0f, 1f))
+                    onProgress((ts.toFloat() / durUs).coerceIn(0f, 1f))
                 ex.advance()
             }
         } catch (e: Throwable) {
@@ -404,6 +415,83 @@ object Remux {
         if (!out.exists() || out.length() < 2_048L) {
             runCatching { out.delete() }
             throw IllegalStateException("merged file is empty")
+        }
+    }
+
+    /**
+     * Losslessly remuxes a single MPEG-TS (.ts) file (preserving both its video & audio tracks)
+     * into a standard, instantly-seekable .mp4 container using Android's hardware MediaMuxer.
+     * Throws cleanly if codecs are not MP4-compatible so callers can keep the original .ts file.
+     */
+    fun remuxTsToMp4(tsFile: File, outMp4: File, onProgress: ((Float) -> Unit)? = null) {
+        val ex = MediaExtractor()
+        var muxer: MediaMuxer? = null
+        var started = false
+        try {
+            ex.setDataSource(tsFile.absolutePath)
+            val vIn = firstTrack(ex, "video/") ?: throw IllegalStateException("no video track in ts")
+            val aIn = firstTrack(ex, "audio/")
+            val vFmt = ex.getTrackFormat(vIn)
+            val aFmt = aIn?.let { ex.getTrackFormat(it) }
+            ex.selectTrack(vIn)
+            if (aIn != null) ex.selectTrack(aIn)
+
+            muxer = MediaMuxer(outMp4.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val vOut = muxer.addTrack(vFmt)
+            val aOut = if (aFmt != null) muxer.addTrack(aFmt) else -1
+            val durUs = if (vFmt.containsKey(MediaFormat.KEY_DURATION)) vFmt.getLong(MediaFormat.KEY_DURATION) else 0L
+            muxer.start()
+            started = true
+
+            val bufBytes = if (PerfTier.low) 1024 * 1024 else 2 * 1024 * 1024
+            val buf = ByteBuffer.allocateDirect(bufBytes)
+            val info = MediaCodec.BufferInfo()
+            var lastVTs = -1L
+            var lastATs = -1L
+            var tick = 0
+            while (true) {
+                val track = ex.sampleTrackIndex
+                if (track < 0) break
+                buf.clear()
+                val size = ex.readSampleData(buf, 0)
+                if (size < 0) break
+                var ts = ex.sampleTime.coerceAtLeast(0L)
+                val outTrack = when {
+                    track == vIn -> {
+                        if (ts < lastVTs) ts = lastVTs + 1L
+                        lastVTs = ts
+                        vOut
+                    }
+                    aIn != null && track == aIn && aOut >= 0 -> {
+                        if (ts < lastATs) ts = lastATs + 1L
+                        lastATs = ts
+                        aOut
+                    }
+                    else -> {
+                        ex.advance()
+                        continue
+                    }
+                }
+                info.set(0, size, ts, ex.sampleFlags and MediaCodec.BUFFER_FLAG_KEY_FRAME)
+                muxer.writeSampleData(outTrack, buf, info)
+                if (outTrack == vOut && durUs > 0 && onProgress != null && (++tick and 0x7F) == 0) {
+                    onProgress((ts.toFloat() / durUs).coerceIn(0f, 1f))
+                }
+                ex.advance()
+            }
+        } catch (e: Throwable) {
+            runCatching { outMp4.delete() }
+            throw e
+        } finally {
+            if (muxer != null) {
+                runCatching { if (started) muxer.stop() }
+                runCatching { muxer.release() }
+            }
+            runCatching { ex.release() }
+        }
+        if (!outMp4.exists() || outMp4.length() < 2_048L) {
+            runCatching { outMp4.delete() }
+            throw IllegalStateException("remuxed mp4 is empty")
         }
     }
 

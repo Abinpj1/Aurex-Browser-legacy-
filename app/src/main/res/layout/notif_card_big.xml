@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Expanded card: bigger thumbnail + text block, thin progress, capsule buttons. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/root"
     android:layout_width="match_parent"
@@ -9,12 +8,13 @@
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:gravity="center_vertical"
         android:orientation="horizontal">
 
         <ImageView
             android:id="@+id/thumb"
-            android:layout_width="128dp"
-            android:layout_height="72dp"
+            android:layout_width="96dp"
+            android:layout_height="54dp"
             android:layout_marginEnd="12dp"
             android:scaleType="fitXY" />
 
@@ -31,8 +31,8 @@
                 android:ellipsize="end"
                 android:fontFamily="sans-serif-medium"
                 android:maxLines="2"
-                android:textAppearance="@android:style/TextAppearance.Material.Notification.Title"
-                android:textSize="15sp" />
+                android:textColor="@color/notif_title"
+                android:textSize="14.5sp" />
 
             <TextView
                 android:id="@+id/sub"
@@ -43,8 +43,8 @@
                 android:fontFeatureSettings="tnum"
                 android:maxLines="1"
                 android:singleLine="true"
-                android:textAppearance="@android:style/TextAppearance.Material.Notification.Line2"
-                android:textSize="13sp" />
+                android:textColor="@color/notif_sub"
+                android:textSize="12.5sp" />
 
             <TextView
                 android:id="@+id/detail"
@@ -54,8 +54,8 @@
                 android:ellipsize="end"
                 android:fontFeatureSettings="tnum"
                 android:maxLines="2"
-                android:textAppearance="@android:style/TextAppearance.Material.Notification.Line2"
-                android:textSize="13sp" />
+                android:textColor="@color/notif_detail"
+                android:textSize="12sp" />
         </LinearLayout>
     </LinearLayout>
 
@@ -63,8 +63,8 @@
         android:id="@+id/progress"
         style="?android:attr/progressBarStyleHorizontal"
         android:layout_width="match_parent"
-        android:layout_height="4dp"
-        android:layout_marginTop="12dp"
+        android:layout_height="4.5dp"
+        android:layout_marginTop="10dp"
         android:max="100"
         android:progress="0"
         android:progressDrawable="@drawable/notif_progress" />
@@ -73,32 +73,32 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="10dp"
-        android:gravity="center"
+        android:gravity="end"
         android:orientation="horizontal">
-
-        <TextView
-            android:id="@+id/btn_a"
-            android:layout_width="wrap_content"
-            android:layout_height="32dp"
-            android:background="@drawable/notif_pill"
-            android:fontFamily="sans-serif-medium"
-            android:gravity="center"
-            android:paddingStart="16dp"
-            android:paddingEnd="16dp"
-            android:textColor="#0A84FF"
-            android:textSize="14sp" />
 
         <TextView
             android:id="@+id/btn_b"
             android:layout_width="wrap_content"
-            android:layout_height="32dp"
+            android:layout_height="31dp"
+            android:background="@drawable/notif_pill_secondary"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:paddingStart="15dp"
+            android:paddingEnd="15dp"
+            android:textColor="@color/notif_btn_sec_fg"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/btn_a"
+            android:layout_width="wrap_content"
+            android:layout_height="31dp"
             android:layout_marginStart="8dp"
-            android:background="@drawable/notif_pill"
+            android:background="@drawable/notif_pill_primary"
             android:fontFamily="sans-serif-medium"
             android:gravity="center"
             android:paddingStart="16dp"
             android:paddingEnd="16dp"
-            android:textColor="#0A84FF"
-            android:textSize="14sp" />
+            android:textColor="#FFFFFF"
+            android:textSize="13sp" />
     </LinearLayout>
 </LinearLayout>

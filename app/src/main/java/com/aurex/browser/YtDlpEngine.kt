@@ -226,11 +226,11 @@ object YtDlpEngine {
             try {
                 ensureReady(ctx)
                 loadState(ctx)
-                checkForUpdate(ctx)
             } catch (_: Throwable) {
             } finally {
                 warmDone.countDown()
             }
+            runCatching { checkForUpdate(ctx) }
         }.apply { name = "aurex-ytdlp-warmup"; isDaemon = true }.start()
     }
 
@@ -327,9 +327,10 @@ object YtDlpEngine {
      */
     private fun updateDirect(ctx: Context): String? {
         val app = ctx.applicationContext
+        runCatching { ensureReady(app) }
         val target = File(app.noBackupFilesDir, "youtubedl-android/yt-dlp/yt-dlp")
         val dir = target.parentFile ?: return null
-        if (!target.isFile) return null
+        if (!dir.exists()) dir.mkdirs()
         val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val tmp = File(dir, "yt-dlp.download")
         var first: java.net.HttpURLConnection? = null
@@ -353,6 +354,7 @@ object YtDlpEngine {
                     (head[0] == 'P'.code.toByte() && head[1] == 'K'.code.toByte()))
             if (!looksRight || tmp.length() < 1_000_000L) return null
             if (!tmp.renameTo(target)) tmp.copyTo(target, overwrite = true)
+            runCatching { target.setExecutable(true, false) }
             if (tag != null) prefs.edit().putString(KEY_DIRECT_TAG, tag).apply()
             "updated"
         } catch (e: Throwable) {
@@ -509,8 +511,10 @@ object YtDlpEngine {
         swapping = true
         if (running.get() > 0) return false
         synchronized(lock) {
-            val root = File(app.noBackupFilesDir, "youtubedl-android/packages")
-            root.listFiles()?.forEach { runCatching { it.deleteRecursively() } }
+            val pkgRoot = File(app.noBackupFilesDir, "youtubedl-android/packages")
+            pkgRoot.listFiles()?.forEach { runCatching { it.deleteRecursively() } }
+            val ytRoot = File(app.noBackupFilesDir, "youtubedl-android/yt-dlp")
+            ytRoot.listFiles()?.forEach { runCatching { it.deleteRecursively() } }
             // the library's own "what I unpacked" record, and ours about the yt-dlp file
             runCatching {
                 app.getSharedPreferences("youtubedl-android", Context.MODE_PRIVATE).edit().clear().apply()
@@ -525,6 +529,8 @@ object YtDlpEngine {
                 return false
             }
             ensureReady(app)
+            engineVersion = installedVersion(app)
+            engineProblem = ""
         }
         return true
     }
@@ -707,7 +713,10 @@ object YtDlpEngine {
         val vcodec: String = "",
         /** Real picture size / frame rate (0 = unknown): needed to judge ultra-wide / portrait 4K and 4K60 decoding. */
         val width: Int = 0,
-        val fps: Int = 0
+        val fps: Int = 0,
+        /** Exact byte lengths reported by server (`filesize` JSON field, > 0 = skip probeSize RTT!). */
+        val vExactBytes: Long = -1L,
+        val aExactBytes: Long = -1L
     )
 
     /** [heights] = every video height the site offers (any protocol), for the quality picker. */
@@ -720,7 +729,11 @@ object YtDlpEngine {
         val durationSec: Double = 0.0,
         val audioBytes: Long = 0L,
         /** Heights (>= 1080) that also exist as an HDR stream. */
-        val hdrHeights: List<Int> = emptyList()
+        val hdrHeights: List<Int> = emptyList(),
+        /** Direct M4A/AAC audio stream URL & headers when available (enables 1-sec native Ghost M4A download!). */
+        val directM4aUrl: String? = null,
+        val directM4aHeaders: Map<String, String> = emptyMap(),
+        val directM4aExactBytes: Long = -1L
     )
 
     private class Cached(val at: Long, val media: ResolvedMedia)
@@ -743,7 +756,9 @@ object YtDlpEngine {
         if (existing == null) use.run()
         try {
             val media = use.get()
-            if (resolveCache.size > 12) resolveCache.clear()
+            if (resolveCache.size >= 24) {
+                resolveCache.entries.minByOrNull { it.value.at }?.key?.let { resolveCache.remove(it) }
+            }
             resolveCache[pageUrl] = Cached(System.currentTimeMillis(), media)
             return media
         } catch (e: java.util.concurrent.ExecutionException) {
@@ -753,13 +768,25 @@ object YtDlpEngine {
         }
     }
 
-    /** Looks the page up in the background so the next tap on Play / Download is instant. */
+    private val prefetchExec: java.util.concurrent.ThreadPoolExecutor by lazy {
+        java.util.concurrent.ThreadPoolExecutor(
+            2, 2, 30L, java.util.concurrent.TimeUnit.SECONDS,
+            java.util.concurrent.LinkedBlockingQueue(8),
+            java.util.concurrent.ThreadFactory { r ->
+                Thread(r, "aurex-prefetch").apply { isDaemon = true; priority = Thread.MIN_PRIORITY + 1 }
+            },
+            java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy()
+        ).apply { allowCoreThreadTimeOut(true) }
+    }
+
+    /** Looks the page up in the background (bounded 2-thread pool) so Play / Download opens instantly. */
     fun prefetch(ctx: Context, pageUrl: String, cookieHeader: String?) {
         val fresh = resolveCache[pageUrl]?.let { System.currentTimeMillis() - it.at < RESOLVE_TTL_MS } == true
         if (fresh || resolveInflight.containsKey(pageUrl)) return
-        Thread {
-            runCatching { resolveCached(ctx, pageUrl, cookieHeader) }
-        }.apply { name = "aurex-prefetch"; isDaemon = true; priority = Thread.MIN_PRIORITY + 1 }.start()
+        val app = ctx.applicationContext
+        runCatching {
+            prefetchExec.execute { runCatching { resolveCached(app, pageUrl, cookieHeader) } }
+        }
     }
 
     /** Forget a lookup whose links stopped working (expired / refused), so the next one is fresh. */
@@ -918,15 +945,20 @@ object YtDlpEngine {
         val sizes = HashMap<Int, Long>()
         for (i in 0 until (formats?.length() ?: 0)) {
             val f = formats?.optJSONObject(i) ?: continue
-            if (MediaTools.tooSharp(f.optInt("width", 0), f.optInt("height", 0))) continue   // 8K and above: never offered
+            val fw = f.optInt("width", 0)
+            val fh = f.optInt("height", 0)
+            if (MediaTools.tooSharp(fw, fh)) continue   // 8K and above: never offered
             run {
                 val vcAll = f.str("vcodec")
-                val hh = f.optInt("height", 0)
-                if (hh > 0 && vcAll != "none" && f.str("ext") != "mhtml" && DeviceCaps.supportsHeight(hh)) {
-                    allHeights.add(hh)
-                    if (hh >= 1080 && isHdrFormat(f)) hdrHeights.add(hh)
+                val tier = DeviceCaps.tierOf(fw, fh)
+                if (tier > 0 && vcAll != "none" && f.str("ext") != "mhtml" && DeviceCaps.supportsHeight(tier)) {
+                    allHeights.add(tier)
+                    if (tier >= 1080 && isHdrFormat(f)) hdrHeights.add(tier)
                     val sz = sizeOf(f, dur)
-                    if (sz > (sizes[hh] ?: 0L)) { sizes[hh] = sz; if (f.str("acodec") == "none") vOnlyHeights.add(hh) else vOnlyHeights.remove(hh) }
+                    if (sz > (sizes[tier] ?: 0L)) {
+                        sizes[tier] = sz
+                        if (f.str("acodec") == "none") vOnlyHeights.add(tier) else vOnlyHeights.remove(tier)
+                    }
                 }
             }
             val u = f.str("url") ?: continue
@@ -956,63 +988,80 @@ object YtDlpEngine {
             .maxByOrNull { it.optDouble("abr", it.optDouble("tbr", 0.0)) }
         val choices = ArrayList<StreamChoice>()
         if (bestAudio != null) {
-            videoOnly.filter { it.optInt("height", 0) > 0 }.groupBy { it.optInt("height", 0) }.forEach { (h, list) ->
-                // 4K / 8K come in several codecs (VP9 / AV1). The player can only use the one this phone has a decoder for at that
-                // size, so for 1440p and above a decodable stream always wins; before this the first codec was taken and 8K
-                // was dropped to 4K even when the phone could decode the other one.
-                // Order: a HARDWARE decoder for this codec + real size + frame rate (a phone with hardware AV1 but only software VP9
-                // gets the AV1 stream; one that does 4K30 but not 4K60 gets the 30 fps stream), then any decoder, then the codec
-                // preference, SDR before HDR, higher bitrate.
-                val best = list.maxWithOrNull(
-                    compareBy<org.json.JSONObject>({ if (deviceDecodes(it, true)) 1 else 0 }, { if (deviceDecodes(it, false)) 1 else 0 }, { codecScore(it.str("vcodec")) }, { if (isHdrFormat(it)) 0 else 1 }, { it.optDouble("tbr", 0.0) })
-                ) ?: return@forEach
-                val fps = best.optInt("fps", 0)
-                val vc = best.str("vcodec").orEmpty()
-                val ac = bestAudio.str("acodec").orEmpty()
-                val safe = (vc.startsWith("avc1") || vc.startsWith("h264")) &&
-                    best.str("ext") in listOf("mp4", "m4v") &&
-                    (bestAudio.str("ext") == "m4a" || ac.startsWith("mp4a") || ac.startsWith("aac"))
-                val webmOk = android.os.Build.VERSION.SDK_INT >= 26 && !safe && !isHdrFormat(best) &&
-                    (vc.startsWith("vp09.00") || vc == "vp9") && best.str("ext") == "webm" && bestWebmAudio != null
-                val aSel = if (webmOk && bestWebmAudio != null) bestWebmAudio else bestAudio
-                choices.add(StreamChoice(
-                    "${h}p" + if (fps > 30) "$fps" else "", h,
-                    best.str("url").orEmpty(), aSel.str("url"),
-                    headersOf(best), headersOf(aSel), safe,
-                    sizeOf(best, dur) + sizeOf(aSel, dur),
-                    webmSafe = webmOk, vcodec = vc,
-                    width = best.optInt("width", 0), fps = fps
-                ))
-            }
+            videoOnly.filter { it.optInt("height", 0) > 0 }
+                .groupBy { DeviceCaps.tierOf(it.optInt("width", 0), it.optInt("height", 0)) }
+                .filterKeys { it > 0 }
+                .forEach { (tier, list) ->
+                    val best = list.maxWithOrNull(
+                        compareBy<org.json.JSONObject>(
+                            { if (deviceDecodes(it, true)) 1 else 0 },
+                            { if (deviceDecodes(it, false)) 1 else 0 },
+                            { codecScore(it.str("vcodec")) },
+                            { if (isHdrFormat(it)) 0 else 1 },
+                            { it.optDouble("tbr", 0.0) }
+                        )
+                    ) ?: return@forEach
+                    val realW = best.optInt("width", 0)
+                    val realH = best.optInt("height", 0)
+                    val fps = best.optInt("fps", 0)
+                    val vc = best.str("vcodec").orEmpty()
+                    val ac = bestAudio.str("acodec").orEmpty()
+                    val safe = (vc.startsWith("avc1") || vc.startsWith("h264")) &&
+                        best.str("ext") in listOf("mp4", "m4v") &&
+                        (bestAudio.str("ext") == "m4a" || ac.startsWith("mp4a") || ac.startsWith("aac"))
+                    val webmOk = android.os.Build.VERSION.SDK_INT >= 26 && !safe && !isHdrFormat(best) &&
+                        (vc.startsWith("vp09.00") || vc == "vp9") && best.str("ext") == "webm" && bestWebmAudio != null
+                    val aSel = if (webmOk) (bestWebmAudio ?: bestAudio) else bestAudio
+                    choices.add(StreamChoice(
+                        MediaTools.heightText(tier), realH,
+                        best.str("url").orEmpty(), aSel.str("url"),
+                        headersOf(best), headersOf(aSel), safe,
+                        sizeOf(best, dur) + sizeOf(aSel, dur),
+                        webmSafe = webmOk, vcodec = vc,
+                        width = realW, fps = fps,
+                        vExactBytes = best.optLong("filesize", -1L).takeIf { it > 0L } ?: -1L,
+                        aExactBytes = aSel.optLong("filesize", -1L).takeIf { it > 0L } ?: -1L
+                    ))
+                }
         }
-        muxed.filter { it.optInt("height", 0) > 0 }.groupBy { it.optInt("height", 0) }.forEach { (h, list) ->
-            if (choices.none { it.height == h }) {
-                val best = list.maxByOrNull { it.optDouble("tbr", 0.0) } ?: return@forEach
-                val vc = best.str("vcodec").orEmpty()
-                val safe = (vc.startsWith("avc1") || vc.startsWith("h264")) && best.str("ext") in listOf("mp4", "m4v")
-                choices.add(StreamChoice(
-                    "${h}p", h, best.str("url").orEmpty(), null,
-                    headersOf(best), emptyMap(), safe, sizeOf(best, dur),
-                    vcodec = vc,
-                    width = best.optInt("width", 0), fps = best.optInt("fps", 0)
-                ))
+        muxed.filter { it.optInt("height", 0) > 0 }
+            .groupBy { DeviceCaps.tierOf(it.optInt("width", 0), it.optInt("height", 0)) }
+            .filterKeys { it > 0 }
+            .forEach { (tier, list) ->
+                if (choices.none { DeviceCaps.tier(it) == tier }) {
+                    val best = list.maxByOrNull { it.optDouble("tbr", 0.0) } ?: return@forEach
+                    val realW = best.optInt("width", 0)
+                    val realH = best.optInt("height", 0)
+                    val vc = best.str("vcodec").orEmpty()
+                    val safe = (vc.startsWith("avc1") || vc.startsWith("h264")) && best.str("ext") in listOf("mp4", "m4v")
+                    choices.add(StreamChoice(
+                        MediaTools.heightText(tier), realH, best.str("url").orEmpty(), null,
+                        headersOf(best), emptyMap(), safe, sizeOf(best, dur),
+                        vcodec = vc,
+                        width = realW, fps = best.optInt("fps", 0),
+                        vExactBytes = best.optLong("filesize", -1L).takeIf { it > 0L } ?: -1L
+                    ))
+                }
             }
-        }
-        hlsMuxed.groupBy { it.optInt("height", 0) }.forEach { (h, list) ->
-            if (choices.none { it.height == h }) {
-                val best = list.maxByOrNull { it.optDouble("tbr", 0.0) } ?: return@forEach
-                choices.add(StreamChoice(
-                    "${h}p", h, best.str("url").orEmpty(), null,
-                    headersOf(best), emptyMap(), false, sizeOf(best, dur), hls = true
-                ))
+        hlsMuxed.filter { it.optInt("height", 0) > 0 }
+            .groupBy { DeviceCaps.tierOf(it.optInt("width", 0), it.optInt("height", 0)) }
+            .filterKeys { it > 0 }
+            .forEach { (tier, list) ->
+                if (choices.none { DeviceCaps.tier(it) == tier }) {
+                    val best = list.maxByOrNull { it.optDouble("tbr", 0.0) } ?: return@forEach
+                    choices.add(StreamChoice(
+                        MediaTools.heightText(tier), best.optInt("height", 0), best.str("url").orEmpty(), null,
+                        headersOf(best), emptyMap(), false, sizeOf(best, dur), hls = true,
+                        width = best.optInt("width", 0), fps = best.optInt("fps", 0)
+                    ))
+                }
             }
-        }
         if (choices.isEmpty()) {
             val direct = root.str("url")
             if (direct != null) choices.add(StreamChoice("Auto", 0, direct, null))
         }
         // 2K / 4K / 8K the phone cannot decode in hardware are never offered (keep at least one stream)
-        choices.filter { it.height > 0 && !DeviceCaps.supportsHeight(it.height) }.let { bad ->
+        choices.filter { it.height > 0 && !DeviceCaps.supportsHeight(DeviceCaps.tier(it)) }.let { bad ->
             if (bad.size < choices.size) choices.removeAll(bad.toSet())
         }
         // sharp -> soft by picture class (ultra-wide / portrait 4K sort as the 4K they are), then by height
@@ -1023,11 +1072,21 @@ object YtDlpEngine {
         // video-only streams are joined with the best audio: its size belongs to the predicted total
         val audioSize = bestAudio?.let { sizeOf(it, dur) } ?: 0L
         vOnlyHeights.forEach { h -> val v = sizes[h] ?: 0L; if (v > 0) sizes[h] = v + audioSize }
+        val m4aCandidate = bestAudio?.takeIf {
+            val ext = it.str("ext").orEmpty()
+            val ac = it.str("acodec").orEmpty()
+            val proto = it.str("protocol").orEmpty()
+            !proto.contains("m3u8") && (ext == "m4a" || ac.startsWith("mp4a") || ac.startsWith("aac")) &&
+                it.str("url")?.startsWith("http") == true
+        }
         return ResolvedMedia(
             root.str("title").orEmpty(), choices, ua,
             allHeights.toList().sortedDescending(), sizes,
             durationSec = dur, audioBytes = audioSize,
-            hdrHeights = hdrHeights.toList().sortedDescending()
+            hdrHeights = hdrHeights.toList().sortedDescending(),
+            directM4aUrl = m4aCandidate?.str("url"),
+            directM4aHeaders = m4aCandidate?.let { headersOf(it) } ?: emptyMap(),
+            directM4aExactBytes = m4aCandidate?.optLong("filesize", -1L)?.takeIf { it > 0L } ?: -1L
         )
     }
 
@@ -1053,13 +1112,20 @@ object YtDlpEngine {
         // one quiet viewer, never a burst: one connection, one retry, a pause between requests. (Speed is not the
         // goal on Instagram; a clip is a few MB.) Every other site keeps the fast settings.
         val ig = isMetaUrl(url)
-        r.addOption("--concurrent-fragments", if (ig) "1" else "16")
+        val fragThreads = when {
+            ig -> "1"
+            PerfTier.low -> "4"
+            PerfTier.balanced -> "8"
+            else -> "16"
+        }
+        r.addOption("--concurrent-fragments", fragThreads)
+        if (!ig) r.addOption("--http-chunk-size", "10M")
         r.addOption("--retries", if (ig) "1" else "5")
         r.addOption("--fragment-retries", if (ig) "1" else "10")
         r.addOption("--extractor-retries", if (ig) "1" else "3")
         if (ig) r.addOption("--sleep-requests", "1.5")
         r.addOption("--socket-timeout", "20")
-        r.addOption("--buffer-size", "64K")
+        r.addOption("--buffer-size", if (PerfTier.low) "64K" else "128K")
         // Sites with their own extractor (YouTube, Instagram ...) manage their own headers.
         // For every other site the browser's identity keeps cookies / CDN checks consistent.
         if (!ua.isNullOrBlank() && !isItemUrl(url)) r.addOption("--user-agent", ua)
@@ -1165,6 +1231,25 @@ object YtDlpEngine {
         Regex("""^https?://([a-z0-9-]+\.)*reddit\.com/r/[^/]+/comments/""", RegexOption.IGNORE_CASE),
         Regex("""^https?://([a-z0-9-]+\.)*dailymotion\.com/video/""", RegexOption.IGNORE_CASE),
         Regex("""^https?://([a-z0-9-]+\.)*twitch\.tv/(videos/|[^/]+/clip/)""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*threads\.(net|com)/(@[^/]+/post/|t/)""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*(pinterest\.com/pin/|pin\.it/)""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*streamable\.com/[a-z0-9]+""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*(bilibili\.com/video/|b23\.tv/)""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*rumble\.com/v[a-z0-9]+""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*soundcloud\.com/[^/]+/[^/]+""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*(vk\.com/video|vkvideo\.ru/video)""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*kick\.com/[^/]+/(videos|clips)/""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://dai\.ly/[a-z0-9]+""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://(v\.)?redd\.it/[a-z0-9]+""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://player\.vimeo\.com/video/\d+""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://clips\.twitch\.tv/[a-z0-9_-]+""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*bsky\.app/profile/[^/]+/post/""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*linkedin\.com/(posts/|feed/update/)""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*ted\.com/talks/""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*rutube\.ru/video/""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*loom\.com/share/""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*imgur\.com/(gallery|a)/""", RegexOption.IGNORE_CASE),
+        Regex("""^https?://([a-z0-9-]+\.)*(odysee\.com|bitchute\.com/video)/""", RegexOption.IGNORE_CASE),
         // ok.ru (Odnoklassniki): its player is an MSE / blob stream and the CDN links are signed, so the page is the source
         Regex("""^https?://([a-z0-9-]+\.)*(ok\.ru|odnoklassniki\.ru)/(video|videoembed|live|web-api/video/moviePlayer)/-?\d+""", RegexOption.IGNORE_CASE),
         // ok.ru opens a clicked video as a LAYER on the feed: the address stays /dk?st.cmd=movieLayer&...&st.mvId=<id>
@@ -1186,8 +1271,8 @@ object YtDlpEngine {
      * (/live/ addresses are left alone: the engine takes them as they are.)
      */
     fun okVideoUrl(url: String?): String? {
-        if (!isOkUrl(url)) return null
-        val u = url!!
+        val u = url ?: return null
+        if (!isOkUrl(u)) return null
         val id = OK_ID_QUERY.find(u)?.groupValues?.get(1) ?: OK_ID_PATH.find(u)?.groupValues?.get(1) ?: return null
         return "https://ok.ru/video/$id"
     }

@@ -1,4 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_background">#000000</color>
+    <color name="notif_title">#11131A</color>
+    <color name="notif_sub">#525866</color>
+    <color name="notif_detail">#6E7485</color>
+    <color name="notif_accent">#0A84FF</color>
+    <color name="notif_btn_sec_bg">#16000000</color>
+    <color name="notif_btn_sec_fg">#1A1D26</color>
+    <color name="notif_track">#22000000</color>
 </resources>

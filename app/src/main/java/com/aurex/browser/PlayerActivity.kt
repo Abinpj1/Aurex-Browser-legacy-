@@ -9,8 +9,11 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.media.AudioManager
+import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.Build
+import android.os.Looper
+import android.os.Handler
 import android.os.Bundle
 import android.os.SystemClock
 import android.webkit.WebSettings
@@ -20,6 +23,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.animation.SizeTransform
+import android.view.SurfaceView
+import android.view.TextureView
+import android.view.PixelCopy
+import android.graphics.Bitmap
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -33,29 +42,30 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -84,7 +94,6 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
-import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
@@ -92,7 +101,8 @@ import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.extractor.Extractor
 import androidx.media3.extractor.ExtractorsFactory
-import androidx.media3.session.MediaSession
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import java.io.File
@@ -242,7 +252,7 @@ class PlayerActivity : ComponentActivity() {
     private fun armHandoffTimer() {
         if (handoff != 1 || handoffArmed) return
         handoffArmed = true
-        val h = choices.value.getOrNull(choiceIndex.intValue)?.height ?: 0
+        val h = choices.value.getOrNull(choiceIndex.intValue)?.let { DeviceCaps.tier(it) } ?: 0
         val hi = MediaTools.plainHeight(wantHeight) >= 1440 || h >= 1440
         handler.postDelayed({ if (handoff in 1..2) finishHandoff() }, if (hi) 20_000L else 9_000L)
     }
@@ -317,10 +327,15 @@ class PlayerActivity : ComponentActivity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val act = intent?.action ?: return
             if (!PipSupport.acceptTap(act)) return   // duplicate / bounced tap
+            Haptics.fireDetached(Hx.TAP)
             when (act) {
                 ACTION_PIP_TOGGLE -> togglePlayPause()
                 ACTION_PIP_AUDIO -> enterAudioOnly()
-                ACTION_PIP_NEXT -> if (player.hasNextMediaItem()) { player.seekToNextMediaItem(); player.play(); refreshPip() }
+                ACTION_PIP_NEXT -> {
+                    if (player.hasNextMediaItem()) {
+                        player.seekToNextMediaItem(); player.play(); refreshPip()
+                    }
+                }
             }
         }
     }
@@ -501,8 +516,8 @@ class PlayerActivity : ComponentActivity() {
         meter = androidx.media3.exoplayer.upstream.DefaultBandwidthMeter.Builder(this).build()
         player = newExo()
         playerRef.value = player
-        // A downloaded video gets the app's own card (BrowserMediaService); a second system session would show twice.
-        if (!isLocal) mediaSession = MediaSession.Builder(this, player).build()
+        // A downloaded video gets the app's own card (BrowserMediaService); online playback uses lightweight native MediaSession.
+        if (!isLocal) ensureNativeSession()
 
         val prefs = getSharedPreferences("liquid", Context.MODE_PRIVATE)
         autoPip = prefs.getBoolean("autoPip", true)
@@ -522,6 +537,7 @@ class PlayerActivity : ComponentActivity() {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (isPlaying) { netRetries = 0; reResolves = 0; endSwitching() }   // a working stream clears the retry budget
                 refreshPip()
+                syncNativeSession()
                 localCard(isPlaying)
             }
             override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -680,12 +696,8 @@ class PlayerActivity : ComponentActivity() {
 
     // -- Sources --------------------------------------------------------------------------------
 
-    private fun httpFactory(h: Map<String, String>) = DefaultHttpDataSource.Factory()
-        .setDefaultRequestProperties(h)
-        .setUserAgent(h["User-Agent"])
-        .setAllowCrossProtocolRedirects(true)
-        .setConnectTimeoutMs(7_000)     // a hung CDN connection is given up (and retried) after seconds, not half a minute
-        .setReadTimeoutMs(10_000)
+    private fun httpFactory(h: Map<String, String>): androidx.media3.datasource.DataSource.Factory =
+        OkHttpStreamDataSource.Factory(h, h["User-Agent"])
 
     /**
      * http(s) with the page headers, plus file:// for downloaded videos. YouTube's CDN is read in ranged chunks
@@ -695,7 +707,7 @@ class PlayerActivity : ComponentActivity() {
         val http = httpFactory(h)
         return androidx.media3.datasource.DefaultDataSource.Factory(
             this,
-            androidx.media3.datasource.DataSource.Factory { ChunkedDataSource(http.createDataSource()) }
+            androidx.media3.datasource.DataSource.Factory { ChunkedDataSource(http.createDataSource(), http) }
         )
     }
 
@@ -713,12 +725,12 @@ class PlayerActivity : ComponentActivity() {
             (kindMime(videoUrl) ?: if (forceHls) MimeTypes.APPLICATION_M3U8 else null)?.let { setMimeType(it) }
         }.build()
         val vSrc = DefaultMediaSourceFactory(dataFactory(vHeaders))
-            .setLoadErrorHandlingPolicy(androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy(5))
+            .setLoadErrorHandlingPolicy(androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy(6))
             .createMediaSource(vItem)
         if (audioUrl == null) return vSrc
         val aItem = MediaItem.Builder().setUri(audioUrl).apply { kindMime(audioUrl)?.let { setMimeType(it) } }.build()
         val aSrc = DefaultMediaSourceFactory(dataFactory(aHeaders))
-            .setLoadErrorHandlingPolicy(androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy(5))
+            .setLoadErrorHandlingPolicy(androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy(6))
             .createMediaSource(aItem)
         return runCatching { MergingMediaSource(vSrc, aSrc) as MediaSource }.getOrDefault(vSrc)
     }
@@ -743,7 +755,15 @@ class PlayerActivity : ComponentActivity() {
 
     private fun playDirect(startMs: Long = 0L) {
         val h = LinkedHashMap<String, String>()
-        referer?.let { h["Referer"] = it }
+        referer?.let { ref ->
+            h["Referer"] = ref
+            runCatching {
+                val ru = Uri.parse(ref)
+                if (!ru.scheme.isNullOrBlank() && !ru.host.isNullOrBlank()) {
+                    h["Origin"] = "${ru.scheme}://${ru.host}"
+                }
+            }
+        }
         userAgent?.let { h["User-Agent"] = it }
         cookie?.let { h["Cookie"] = it }
         val ah = LinkedHashMap<String, String>(h)
@@ -842,8 +862,8 @@ class PlayerActivity : ComponentActivity() {
         // (an HDR pick carries a marker on top of the height: compare the plain height, or it would match "everything")
         val want = MediaTools.plainHeight(wantHeight)
         val wanted = if (want > 0)
-            r.choices.indexOfFirst { it.height == want }.takeIf { it >= 0 }
-                ?: r.choices.withIndex().filter { it.value.height in 1..want }.maxByOrNull { it.value.height }?.index
+            r.choices.indexOfFirst { DeviceCaps.tier(it) == want }.takeIf { it >= 0 }
+                ?: r.choices.withIndex().filter { DeviceCaps.tier(it.value) in 1..want }.maxByOrNull { DeviceCaps.tier(it.value) }?.index
         else null
         resolving.value = false
         if (wanted != null) { selectChoice(wanted, startMs); return }
@@ -866,8 +886,8 @@ class PlayerActivity : ComponentActivity() {
                 nt in 1 until cTier && (nt < 2160 || hwDecodes(n, hardwareOnly = false))
             }
             if (lower != null) {
-                val wasQ = MediaTools.playerText(MediaTools.labelForHeight(c.height))
-                val nowQ = MediaTools.playerText(MediaTools.labelForHeight(list[lower].height))
+                val wasQ = MediaTools.labelForHeight(DeviceCaps.tier(c))
+                val nowQ = MediaTools.labelForHeight(DeviceCaps.tier(list[lower]))
                 Toast.makeText(
                     this,
                     AppLang.translate("$wasQ can't be played on this phone, playing $nowQ instead"),
@@ -887,7 +907,7 @@ class PlayerActivity : ComponentActivity() {
         choiceIndex.intValue = index
         // 4K / 8K picked by hand on a phone without a hardware decoder for it: say so instead of a silent stutter.
         if (cTier >= 2160 && !hwDecodes(c)) {
-            val qLabel = MediaTools.playerText(MediaTools.labelForHeight(c.height))
+            val qLabel = MediaTools.labelForHeight(DeviceCaps.tier(c))
             Toast.makeText(
                 this,
                 AppLang.translate("$qLabel may stutter: this phone has no hardware decoder for it"),
@@ -1048,10 +1068,7 @@ class PlayerActivity : ComponentActivity() {
             player = sb
             findPlayerView(window.decorView)?.player = sb            // the picture follows in the same step
             playerRef.value = sb                                     // ... and the controls
-            if (!isLocal) {
-                runCatching { mediaSession?.release() }
-                mediaSession = MediaSession.Builder(this, sb).build()
-            }
+            if (!isLocal) syncNativeSession()
             playUrlState.value = c.video
             true
         }.getOrDefault(false)
@@ -1103,16 +1120,20 @@ class PlayerActivity : ComponentActivity() {
     private fun newExo(handleAudioFocus: Boolean = true): ExoPlayer {
         val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
             .apply {
+                val stdBufBytes = when (PerfTier.tier) {
+                    PerfTier.TIER_LOW -> 36 * 1024 * 1024
+                    PerfTier.TIER_BALANCED -> 72 * 1024 * 1024
+                    else -> 144 * 1024 * 1024
+                }
                 if (hiResLoad) {
-                    // start after 1 s of data, but after a stall wait for 3 s so it does not stall again at once
-                    setBufferDurationsMs(18_000, 50_000, 1_000, 3_000)
-                    setBackBuffer(5_000, false)
-                    setTargetBufferBytes(hiResBytes)
+                    setBufferDurationsMs(15_000, 45_000, 550, 1_800)
+                    setBackBuffer(if (PerfTier.low) 3_000 else 6_000, false)
+                    setTargetBufferBytes(minOf(hiResBytes, stdBufBytes))
                     setPrioritizeTimeOverSizeThresholds(false)
                 } else {
-                    setBufferDurationsMs(20_000, 60_000, 800, 1_800)
-                    setBackBuffer(20_000, true)        // short rewinds / replays come from memory, not the network
-                    setTargetBufferBytes(144 * 1024 * 1024)
+                    setBufferDurationsMs(16_000, if (PerfTier.low) 32_000 else 56_000, 400, 1_100)
+                    setBackBuffer(if (PerfTier.low) 6_000 else 18_000, true)
+                    setTargetBufferBytes(stdBufBytes)
                     setPrioritizeTimeOverSizeThresholds(true)
                 }
             }
@@ -1125,7 +1146,7 @@ class PlayerActivity : ComponentActivity() {
             .forceEnableMediaCodecAsynchronousQueueing()
         // HLS / DASH: climb after ~7 s of spare buffer, drop only when really needed, use 75 % of the measured speed.
         val trackSelector = androidx.media3.exoplayer.trackselection.DefaultTrackSelector(
-            this, androidx.media3.exoplayer.trackselection.AdaptiveTrackSelection.Factory(7_000, 25_000, 25_000, 0.75f)
+            this, androidx.media3.exoplayer.trackselection.AdaptiveTrackSelection.Factory(4_500, 20_000, 20_000, 0.80f)
         )
         return ExoPlayer.Builder(this, renderers).setLoadControl(loadControl)
             .setBandwidthMeter(meter).setTrackSelector(trackSelector).build().apply {
@@ -1231,8 +1252,8 @@ class PlayerActivity : ComponentActivity() {
         val nowTier = DeviceCaps.tier(now)
         val next = (cur + 1 until list.size).firstOrNull { DeviceCaps.tier(list[it]) in 1 until nowTier } ?: return
         decoderStepDowns++
-        val failedQ = MediaTools.playerText(MediaTools.labelForHeight(now.height))
-        val nextQ = MediaTools.playerText(MediaTools.labelForHeight(list[next].height))
+        val failedQ = MediaTools.labelForHeight(DeviceCaps.tier(now))
+        val nextQ = MediaTools.labelForHeight(DeviceCaps.tier(list[next]))
         Toast.makeText(
             this,
             AppLang.translate("This phone can't decode $failedQ, switched to $nextQ"),
@@ -1269,6 +1290,63 @@ class PlayerActivity : ComponentActivity() {
             manager.start(playUrlState.value, userAgent, null, kindMime(playUrlState.value), referer, title = name)
         }
         Toast.makeText(this, AppLang.translate("Download started"), Toast.LENGTH_SHORT).show()
+    }
+
+    // -- Lightweight native MediaSession (headset / Bluetooth / hardware keys, 0 extra libraries) --
+
+    private fun ensureNativeSession() {
+        if (mediaSession != null) return
+        runCatching {
+            mediaSession = MediaSession(this, "AurexPlayer").apply {
+                @Suppress("DEPRECATION")
+                setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS)
+                setCallback(object : MediaSession.Callback() {
+                    override fun onPlay() { if (::player.isInitialized) { player.play(); syncNativeSession() } }
+                    override fun onPause() { if (::player.isInitialized) { player.pause(); syncNativeSession() } }
+                    override fun onSkipToNext() {
+                        if (::player.isInitialized && player.hasNextMediaItem()) {
+                            player.seekToNextMediaItem(); player.play(); syncNativeSession()
+                        }
+                    }
+                    override fun onSkipToPrevious() {
+                        if (::player.isInitialized) {
+                            if (player.currentPosition > 3_000L || !player.hasPreviousMediaItem()) player.seekTo(0)
+                            else player.seekToPreviousMediaItem()
+                            syncNativeSession()
+                        }
+                    }
+                    override fun onSeekTo(pos: Long) {
+                        if (::player.isInitialized) { player.seekTo(pos.coerceAtLeast(0L)); syncNativeSession() }
+                    }
+                    override fun onStop() { if (::player.isInitialized) player.pause() }
+                })
+                isActive = true
+            }
+            syncNativeSession()
+        }
+    }
+
+    private fun syncNativeSession() {
+        val ms = mediaSession ?: return
+        if (!::player.isInitialized) return
+        runCatching {
+            val playing = wantsPlay()
+            val pos = player.currentPosition.coerceAtLeast(0L)
+            ms.setPlaybackState(
+                PlaybackState.Builder()
+                    .setActions(
+                        PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
+                            PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS or
+                            PlaybackState.ACTION_SEEK_TO or PlaybackState.ACTION_STOP
+                    )
+                    .setState(
+                        if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                        pos,
+                        if (playing) player.playbackParameters.speed else 0f
+                    )
+                    .build()
+            )
+        }
     }
 
     // -- Picture in picture ----------------------------------------------------------------------
@@ -1335,9 +1413,10 @@ class PlayerActivity : ComponentActivity() {
             .setActions(actions)
             .apply {
                 pipSourceRect()?.let { setSourceRectHint(it) }
+                PipSupport.applyMeta(this, resolvedTitle.value.ifBlank { introTitle }, pageUrl?.let { hostOf(it) })
                 if (Build.VERSION.SDK_INT >= 31) {
                     setAutoEnterEnabled(autoPip && playing)
-                    setSeamlessResizeEnabled(false)
+                    setSeamlessResizeEnabled(true)
                 }
             }
             .build()
@@ -1438,7 +1517,9 @@ class PlayerActivity : ComponentActivity() {
         super.onStop()
         if (standby != null) standbyFailed()      // leaving the screen: finish the switch the plain way, free the standby
         savePosition()
-        if (!audioOnly && (Build.VERSION.SDK_INT < 26 || (!isInPictureInPictureMode && !pipRequested))) player.pause()
+        if (::player.isInitialized && !audioOnly && (Build.VERSION.SDK_INT < 26 || (!isInPictureInPictureMode && !pipRequested))) {
+            runCatching { player.pause() }
+        }
     }
 
     override fun onDestroy() {
@@ -1453,8 +1534,8 @@ class PlayerActivity : ComponentActivity() {
             BrowserMediaService.live?.dismissNow()
         }
         cancelStandby()
-        mediaSession?.release()
-        player.release()
+        runCatching { mediaSession?.isActive = false; mediaSession?.release() }
+        if (::player.isInitialized) runCatching { player.release() }
         super.onDestroy()
     }
 
@@ -1490,8 +1571,9 @@ class PlayerActivity : ComponentActivity() {
 // ----------------------------------------------------------------------------------------------
 
 private const val AUTO_HIDE_MS = 3_200L
-private val PLAYER_SPEEDS = listOf(0.25f, 0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f, 3f)
+private val PLAYER_SPEEDS = listOf(0.25f, 0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f, 2.5f, 3f)
 private val SLEEP_OPTIONS = listOf(0, 5, 10, 15, 30, 45, 60, 90)
+private val BOOST_OPTIONS = listOf(0, 25, 50, 75, 100)
 /**
  * The picture modes the resize button cycles through (one tap = next mode). Only the two that really differ and keep
  * the picture undistorted: Fit (the whole video, bars where needed) and Crop (fills the screen, the edges are cut).
@@ -1503,7 +1585,7 @@ private val ASPECTS = listOf(
     "Crop" to AspectRatioFrameLayout.RESIZE_MODE_ZOOM
 )
 
-private enum class PlayerPanel { SPEED, QUALITY, AUDIO, SUBS, SLEEP, MORE }
+private enum class PlayerPanel { SPEED, QUALITY, AUDIO, SUBS, SLEEP, BOOST, MORE }
 
 private class TrackOpt(val label: String, val group: Tracks.Group, val index: Int, val selected: Boolean, val sort: Int)
 
@@ -1517,19 +1599,24 @@ private fun trackOptions(tracks: Tracks, type: Int): List<TrackOpt> {
         for (i in 0 until g.length) {
             if (!g.isTrackSupported(i)) continue
             val f = g.getTrackFormat(i)
-            if (type == C.TRACK_TYPE_VIDEO && f.height > 0 && !DeviceCaps.supportsHeight(f.height)) continue
+            val tier = if (type == C.TRACK_TYPE_VIDEO) DeviceCaps.tierOf(f.width, f.height) else 0
+            if (type == C.TRACK_TYPE_VIDEO && tier > 0 && !DeviceCaps.supportsHeight(tier)) continue
             val label = if (type == C.TRACK_TYPE_VIDEO) {
-                if (f.height > 0) MediaTools.playerText("${f.height}p")
+                if (tier > 0) MediaTools.heightText(tier)
                 else "Video ${out.size + 1}"
             } else {
                 f.label?.takeIf { it.isNotBlank() }
                     ?: f.language?.let { l -> runCatching { java.util.Locale(l).displayLanguage }.getOrNull() }?.takeIf { it.isNotBlank() }
                     ?: "Track ${out.size + 1}"
             }
-            out.add(TrackOpt(label, g, i, g.isTrackSelected(i), f.height))
+            out.add(TrackOpt(label, g, i, g.isTrackSelected(i), if (tier > 0) tier else f.height))
         }
     }
-    return if (type == C.TRACK_TYPE_VIDEO) out.sortedByDescending { it.sort } else out
+    return if (type == C.TRACK_TYPE_VIDEO) {
+        out.groupBy { it.sort }
+            .map { (_, list) -> list.firstOrNull { it.selected } ?: list.first() }
+            .sortedByDescending { it.sort }
+    } else out
 }
 
 private fun applyTrack(player: Player, type: Int, opt: TrackOpt?) {
@@ -1544,18 +1631,69 @@ private fun applyTrack(player: Player, type: Int, opt: TrackOpt?) {
     player.trackSelectionParameters = b.build()
 }
 
-private fun Modifier.glassTouchShield(onTouch: () -> Unit): Modifier = this
-    .pointerInput(Unit) {
-        awaitPointerEventScope {
-            while (true) {
-                val event = awaitPointerEvent(PointerEventPass.Initial)
-                if (event.changes.any { it.pressed || it.previousPressed }) onTouch()
+private fun Modifier.glassTouchShield(onTouch: () -> Unit): Modifier = composed {
+    if (!LocalWindowInteractive.current) return@composed this
+    this
+        .pointerInput(Unit) {
+            awaitPointerEventScope {
+                while (true) {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                    if (event.changes.any { it.pressed || it.previousPressed }) onTouch()
+                }
             }
         }
-    }
-    .pointerInput(Unit) { detectTapGestures { } }
+        .pointerInput(Unit) { detectTapGestures { } }
+}
 
-/** Small capsule chip for the bottom bar. */
+/**
+ * Simple, consistent Apple iOS 27 Liquid Glass surface for all video player buttons & pills:
+ * uses the exact same `.liquidGlass(...)` material, live blur radius, and subtle specular edge
+ * as the 3-dot Menu and Download Quality windows (no extra cyan glow or thick borders).
+ */
+private fun Modifier.playerLiquidGlass(
+    shape: Shape = Capsule,
+    active: Boolean = false,
+    level: Float = 1.05f
+): Modifier = composed {
+    val accent = LocalGlassStyle.current.accent
+    this
+        .liquidGlass(
+            shape = shape,
+            level = level,
+            extraOpacity = 0.04f,
+            reactive = false,
+            optical = true
+        )
+        .then(if (active) Modifier.background(accent.copy(alpha = 0.20f), shape) else Modifier)
+}
+
+/** Perfect circular Apple iOS 27 Liquid Glass icon orb used consistently across top bar, rotate, audio, CC & unlock. */
+@Composable
+private fun PlayerGlassOrb(
+    icon: ImageVector,
+    contentDescription: String,
+    active: Boolean = false,
+    size: Dp = 38.dp,
+    iconSize: Dp = 18.5.dp,
+    haptic: Boolean = true,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val accent = LocalGlassStyle.current.accent
+    val iconTint = if (active) androidx.compose.ui.graphics.lerp(accent, Color.White, 0.42f) else Color.White
+    GlowPress(
+        onClick = onClick,
+        haptic = haptic,
+        shape = CircleShape,
+        modifier = modifier
+            .size(size)
+            .playerLiquidGlass(CircleShape, active = active)
+    ) {
+        Icon(icon, contentDescription, tint = iconTint, modifier = Modifier.size(iconSize))
+    }
+}
+
+/** Unified Apple iOS 27 Liquid Glass capsule chip (Speed, Quality, Unlock) matching PlayerGlassOrb identically. */
 @Composable
 private fun PlayerChip(
     label: String? = null,
@@ -1567,36 +1705,226 @@ private fun PlayerChip(
     onClick: () -> Unit
 ) {
     val accent = LocalGlassStyle.current.accent
-    // A coloured badge tints the whole chip (badge, label and glass) in that colour.
-    val tone = badgeColor ?: if (active) accent else TextPrimary
+    val brightAccent = androidx.compose.ui.graphics.lerp(accent, Color.White, 0.44f)
+    val badgeTint = badgeColor ?: brightAccent
+    val fgTint = if (active) brightAccent else Color.White
     GlowPress(
         onClick = onClick,
         haptic = haptic,
-        modifier = Modifier.height(28.dp).glassTile(
-            Capsule,
-            if (badgeColor != null || active) 0.16f else 0.08f,
-            badgeColor ?: if (active) accent else Color.White
-        ),
+        modifier = Modifier
+            .height(34.dp)
+            .playerLiquidGlass(Capsule, active = active),
         shape = Capsule
     ) {
-        Row(Modifier.padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.padding(horizontal = 11.dp), verticalAlignment = Alignment.CenterVertically) {
             if (badge != null) {
-                // Dynamic resolution badge (LD / SD / HD / FHD / 2K / 4K / 8K) in place of a fixed icon.
-                val c = tone
                 Box(
-                    Modifier.border(1.3.dp, c, RoundedCornerShape(4.dp)).padding(horizontal = 3.dp, vertical = 1.dp),
+                    Modifier
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(badgeTint.copy(alpha = 0.22f))
+                        .border(1.2.dp, badgeTint.copy(alpha = 0.90f), RoundedCornerShape(5.dp))
+                        .padding(horizontal = 4.5.dp, vertical = 1.5.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(badge, color = c, fontSize = 8.5.sp, fontWeight = FontWeight.Bold, lineHeight = 10.sp, maxLines = 1)
+                    Text(
+                        badge,
+                        color = androidx.compose.ui.graphics.lerp(badgeTint, Color.White, 0.28f),
+                        fontSize = 9.5.sp,
+                        fontWeight = FontWeight.Bold,
+                        lineHeight = 11.sp,
+                        maxLines = 1
+                    )
                 }
-            } else if (icon != null) Icon(icon, null, tint = if (active) accent else TextPrimary, modifier = Modifier.size(15.dp))
-            if ((icon != null || badge != null) && label != null) Spacer(Modifier.width(5.dp))
-            if (label != null) Text(label, color = tone, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            } else if (icon != null) {
+                Icon(icon, null, tint = fgTint, modifier = Modifier.size(16.5.dp))
+            }
+            if ((icon != null || badge != null) && label != null) Spacer(Modifier.width(5.5.dp))
+            if (label != null) {
+                Text(
+                    label,
+                    color = if (badge != null) Color.White.copy(alpha = 0.94f) else fgTint,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1
+                )
+            }
         }
     }
 }
 
 /** One option inside the player's floating menu. [sub] is a small value shown on the right. */
+@Composable
+private fun PlayerStaggerRow(index: Int, content: @Composable () -> Unit) {
+    if (PerfTier.low) { content(); return }
+    val p = remember { Animatable(0f) }
+    LaunchedEffect(Unit) {
+        delay((index.coerceAtMost(6) * 10L))
+        p.animateTo(1f, spring(dampingRatio = 0.82f, stiffness = 680f))
+    }
+    Box(
+        Modifier.graphicsLayer {
+            val v = p.value
+            alpha = v.coerceIn(0f, 1f)
+            translationY = (1f - v) * 8.dp.toPx()
+        }
+    ) { content() }
+}
+
+/** Short resolution tag matching QualityUi.kt (8K / UHD / QHD / FHD / HD / SD / Low). */
+private fun playerQualityTag(label: String): String {
+    val clean = label.trim().uppercase()
+    if (clean == "AUTO") return "SMART"
+    val base = clean.substringBefore(' ')
+    val h = base.removeSuffix("P").toIntOrNull() ?: when {
+        base == "8K" -> 4320
+        base == "4K" -> 2160
+        base == "2K" -> 1440
+        else -> 0
+    }
+    return when {
+        h >= 4320 -> "8K"
+        h >= 2160 -> "UHD"
+        h >= 1440 -> "QHD"
+        h >= 1080 -> "FHD"
+        h >= 720 -> "HD"
+        h >= 480 -> "SD"
+        h > 0 -> "Low"
+        else -> ""
+    }
+}
+
+/**
+ * Unified floating popover header matching QualitySheetHost (QualityUi.kt) pixel-for-pixel:
+ * glossy 25dp tinted orb (or back orb) + bold 13sp title + 10sp subtitle + 24dp close orb.
+ */
+@Composable
+private fun PlayerSheetHeader(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    onClose: () -> Unit,
+    onBack: (() -> Unit)? = null
+) {
+    val accent = LocalGlassStyle.current.accent
+    Row(
+        Modifier.fillMaxWidth().padding(bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (onBack != null) {
+            GlassIconButton(
+                AppleIcons.ArrowBack, "Back",
+                onClick = onBack,
+                size = 25.dp, iconSize = 13.5.dp
+            )
+        } else {
+            Box(
+                Modifier
+                    .size(25.dp)
+                    .tintedGlass(CircleShape, accent, swell = 0.06f),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(icon, null, tint = Color.White, modifier = Modifier.size(13.5.dp))
+            }
+        }
+        Spacer(Modifier.width(7.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                title,
+                color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                letterSpacing = (-0.2).sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                subtitle,
+                color = TextSecondary, fontSize = 10.sp,
+                maxLines = 1, overflow = TextOverflow.Ellipsis
+            )
+        }
+        Spacer(Modifier.width(5.dp))
+        GlassIconButton(
+            AppleIcons.Close, "Close",
+            onClick = onClose,
+            size = 24.dp, iconSize = 12.dp
+        )
+    }
+}
+
+/**
+ * Compact 2-column smoked Liquid Glass option chip matching QualityGridChip (QualityUi.kt):
+ * smoked dark glassTile when unselected; vibrant accent glass + crisp rim when selected.
+ */
+@Composable
+private fun PlayerOptionChip(
+    label: String,
+    tag: String = "",
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val accent = LocalGlassStyle.current.accent
+    val brightAccent = androidx.compose.ui.graphics.lerp(accent, Color.White, 0.38f)
+    val shape = RoundedCornerShape(13.dp)
+    val rim = Brush.verticalGradient(
+        0f to accent.copy(alpha = 0.72f),
+        1f to accent.copy(alpha = 0.22f)
+    )
+    GlowPress(
+        onClick = onClick,
+        shape = shape,
+        modifier = modifier.then(
+            if (selected) {
+                Modifier
+                    .clip(shape)
+                    .background(Color(0xFF0A0D16).copy(alpha = 0.50f), shape)
+                    .background(
+                        Brush.linearGradient(listOf(accent.copy(alpha = 0.34f), accent.copy(alpha = 0.16f))),
+                        shape
+                    )
+                    .border(0.95.dp, rim, shape)
+            } else {
+                Modifier.glassTile(shape, 0.11f)
+            }
+        )
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                label,
+                color = Color.White,
+                fontSize = 12.5.sp,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false)
+            )
+            if (selected) {
+                Spacer(Modifier.width(4.dp))
+                Box(
+                    Modifier.size(16.dp).background(accent, CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(AppleIcons.Check, null, tint = Color.White, modifier = Modifier.size(10.5.dp))
+                }
+            } else if (tag.isNotEmpty()) {
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    tag,
+                    color = brightAccent,
+                    fontSize = 9.5.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Menu row matching BrowserMenu's MenuRow (Ui.kt) 1-for-1:
+ * 30dp CircleShape smoked glassTile icon orb, luminous sky-blue tint, 13.5sp label, dark-backed Capsule badge.
+ */
 @Composable
 private fun PanelRow(
     label: String,
@@ -1607,40 +1935,64 @@ private fun PanelRow(
     onClick: () -> Unit
 ) {
     val accent = LocalGlassStyle.current.accent
-    val shape = RoundedCornerShape(16.dp)
-    GlowPress(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth().heightIn(min = 42.dp)
-            .then(if (selected && !chevron) Modifier.background(accent.copy(alpha = 0.13f), shape) else Modifier),
-        shape = shape,
-        contentAlignment = Alignment.CenterStart
-    ) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 5.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            if (icon != null) {
-                PanelIconTile(icon, selected)
-                Spacer(Modifier.width(10.dp))
-            } else {
-                Spacer(Modifier.width(4.dp))
-            }
-            Text(
-                label,
-                color = if (selected && !chevron) accent else TextPrimary,
-                fontSize = 13.sp,
-                fontWeight = if (selected && !chevron) FontWeight.Bold else FontWeight.Medium,
-                maxLines = 1, overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
+    val brightAccent = androidx.compose.ui.graphics.lerp(accent, Color.White, 0.34f)
+    val rowShape = RoundedCornerShape(13.dp)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(rowShape)
+            .then(
+                if (selected && !chevron) Modifier
+                    .background(accent.copy(alpha = 0.22f), rowShape)
+                    .border(0.75.dp, brightAccent.copy(alpha = 0.45f), rowShape)
+                else Modifier
             )
-            if (sub != null) {
-                Spacer(Modifier.width(8.dp))
-                Text(sub, color = if (selected) accent else TextTertiary, fontSize = 11.sp, maxLines = 1)
+            .clickableHaptic(onClick = onClick)
+            .padding(horizontal = 7.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (icon != null) {
+            PanelIconTile(icon, selected || !chevron)
+            Spacer(Modifier.width(10.dp))
+        } else {
+            Spacer(Modifier.width(4.dp))
+        }
+        Text(
+            label,
+            color = TextPrimary,
+            fontSize = 13.5.sp,
+            fontWeight = if (selected && !chevron) FontWeight.SemiBold else FontWeight.Medium,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        if (sub != null) {
+            Spacer(Modifier.width(6.dp))
+            Box(
+                Modifier
+                    .clip(Capsule)
+                    .background(
+                        if (selected) accent else Color(0xFF0A0D16).copy(alpha = 0.56f),
+                        Capsule
+                    )
+                    .padding(horizontal = 7.dp, vertical = 2.5.dp)
+            ) {
+                Text(
+                    sub,
+                    color = if (selected) Color.White else TextPrimary,
+                    fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1
+                )
             }
-            if (chevron) {
-                Icon(AppleIcons.ChevronRight, null, tint = TextTertiary, modifier = Modifier.size(16.dp))
-            } else if (selected) {
-                Icon(AppleIcons.Check, null, tint = accent, modifier = Modifier.size(16.dp))
+        }
+        if (chevron) {
+            Spacer(Modifier.width(4.dp))
+            Icon(AppleIcons.ChevronRight, null, tint = TextSecondary, modifier = Modifier.size(15.dp))
+        } else if (selected && icon == null) {
+            Spacer(Modifier.width(6.dp))
+            Box(
+                Modifier.size(18.dp).background(accent, CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(AppleIcons.Check, null, tint = Color.White, modifier = Modifier.size(11.5.dp))
             }
         }
     }
@@ -1649,36 +2001,19 @@ private fun PanelRow(
 @Composable
 private fun PanelIconTile(icon: ImageVector, active: Boolean) {
     val accent = LocalGlassStyle.current.accent
+    val brightAccent = androidx.compose.ui.graphics.lerp(accent, Color.White, 0.48f)
     Box(
-        Modifier.size(30.dp).glassTile(RoundedCornerShape(12.dp), if (active) 0.16f else 0.07f, if (active) accent else Color.White),
+        Modifier.size(31.dp).glassTile(CircleShape, 0.20f, if (active) accent else Color.White),
         contentAlignment = Alignment.Center
     ) {
-        Icon(icon, null, tint = if (active) accent else TextPrimary, modifier = Modifier.size(16.dp))
+        Icon(icon, null, tint = if (active) brightAccent else TextPrimary, modifier = Modifier.size(17.dp))
     }
 }
 
-/** Thin separator between groups of menu rows. */
+/** Thin separator matching QualityUi.kt & BrowserMenu. */
 @Composable
 private fun PanelDivider() {
-    Box(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 3.dp).height(0.75.dp).background(Color.White.copy(alpha = 0.10f)))
-}
-
-/** Title + back arrow for the sub-page (sleep timer) of the three-dots menu. */
-@Composable
-private fun PanelHeader(title: String, onBack: () -> Unit) {
-    GlowPress(
-        onClick = onBack,
-        modifier = Modifier.fillMaxWidth().height(38.dp),
-        shape = RoundedCornerShape(12.dp),
-        contentAlignment = Alignment.CenterStart
-    ) {
-        Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(AppleIcons.ArrowBack, null, tint = TextSecondary, modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(title, color = TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-        }
-    }
-    PanelDivider()
+    Box(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 3.dp).height(0.5.dp).background(Separator))
 }
 
 @Composable
@@ -1766,6 +2101,36 @@ internal fun PlayerScreen(
     val aspectIndex = if (screenLandscape) aspectLand else aspectPort
     var sleepMinutes by remember { mutableIntStateOf(0) }
     var panel by remember { mutableStateOf<PlayerPanel?>(null) }
+    var audioBoostPct by remember { mutableIntStateOf(0) }
+    var nightMode by remember { mutableStateOf(aspectPrefs.getBoolean("playerNightMode", false)) }
+    var showRemaining by remember { mutableStateOf(false) }
+    var dblTapSide by remember { mutableIntStateOf(0) } // -1 left, +1 right, 0 hidden
+    var dblTapAccSec by remember { mutableIntStateOf(0) }
+    var dblTapToken by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(dblTapToken) {
+        if (dblTapToken == 0) return@LaunchedEffect
+        delay(680)
+        dblTapSide = 0
+        dblTapAccSec = 0
+    }
+
+    // Hardware Audio Boost (100% -> 200%) cleanly attached to ExoPlayer's audio session
+    DisposableEffect(player, audioBoostPct) {
+        val exo = player as? ExoPlayer
+        val sid = exo?.audioSessionId ?: 0
+        val enhancer = if (audioBoostPct > 0 && sid > 0 && !overlay) {
+            runCatching {
+                LoudnessEnhancer(sid).apply {
+                    setTargetGain(audioBoostPct * 15) // up to +1500 mB (+15 dB)
+                    enabled = true
+                }
+            }.getOrNull()
+        } else null
+        onDispose {
+            runCatching { enhancer?.enabled = false; enhancer?.release() }
+        }
+    }
     // The picture the in-app player showed when it handed over to this one (a quality switch such as 4K): it stays on
     // screen until the new stream renders its first frame, so the swap never shows a black screen ('player opens again').
     val bridge = remember { if (overlay) null else PlayerSync.takeBridge() }
@@ -1835,20 +2200,6 @@ internal fun PlayerScreen(
         onDispose { pl.removeListener(l) }
     }
     LaunchedEffect(resolving, resolveError) { if (resolving) error = null }
-    LaunchedEffect(Unit) {
-        while (isActive) {
-            if (!dragging) {
-                val d = player.duration
-                if (d != C.TIME_UNSET && d > 0) duration = d              // length unknown while a new stream loads: keep the last one
-                else if (duration <= 0L && knownDur.value > 0L) duration = knownDur.value   // ... or the length the site reported
-                val p = player.currentPosition.coerceAtLeast(0)
-                // a stream that is still loading reports 0: do not drag the bar back to the start
-                if (!(p == 0L && position > 1_000L && player.playbackState != Player.STATE_READY)) position = p
-            }
-            bufferedPosition = player.bufferedPosition.coerceAtLeast(0)
-            delay(250)
-        }
-    }
     LaunchedEffect(sleepMinutes) {
         if (sleepMinutes <= 0) return@LaunchedEffect
         delay(sleepMinutes * 60_000L)
@@ -1897,49 +2248,242 @@ internal fun PlayerScreen(
     }
 
     val barsVisible = controlsVisible && !locked && error == null && !resolving
+    // Poll timeline ONLY while bars are visible (0 recompositions/sec while watching full-screen video!)
+    LaunchedEffect(barsVisible, pipMode) {
+        if (!barsVisible || pipMode) return@LaunchedEffect
+        while (isActive) {
+            if (!dragging) {
+                val d = player.duration
+                if (d != C.TIME_UNSET && d > 0) duration = d
+                else if (duration <= 0L && knownDur.value > 0L) duration = knownDur.value
+                val p = player.currentPosition.coerceAtLeast(0)
+                if (!(p == 0L && position > 1_000L && player.playbackState != Player.STATE_READY)) position = p
+            }
+            bufferedPosition = player.bufferedPosition.coerceAtLeast(0)
+            delay(250)
+        }
+    }
     val videoOpts = remember(tracks) { trackOptions(tracks, C.TRACK_TYPE_VIDEO) }
     val audioOpts = remember(tracks) { trackOptions(tracks, C.TRACK_TYPE_AUDIO) }
     val textOpts = remember(tracks) { trackOptions(tracks, C.TRACK_TYPE_TEXT) }
     val subsOff = player.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT) || textOpts.none { it.selected }
+    val curChoice = choices.getOrNull(choiceIndex)
     val qualityLabel = when {
-        choices.size > 1 && choiceIndex in choices.indices -> MediaTools.playerText(choices[choiceIndex].label)
-        videoH > 0 -> MediaTools.playerText("${videoH}p")
+        choices.size > 1 && curChoice != null ->
+            if (curChoice.height > 0) MediaTools.heightText(DeviceCaps.tier(curChoice))
+            else MediaTools.playerText(curChoice.label)
+        videoH > 0 -> MediaTools.heightText(DeviceCaps.tierOf(videoW, videoH))
         else -> "Auto"
     }
-    // Resolution class of what is really playing (short side, so portrait videos are judged correctly);
-    // falls back to the chosen stream's height until the first frame size is known.
-    val shortSide = when {
-        videoH > 0 && videoW > 0 -> minOf(videoH, videoW)
-        videoH > 0 -> videoH
-        choices.size > 1 && choiceIndex in choices.indices -> choices[choiceIndex].height
+    val isAutoQuality = qualityLabel.startsWith("Auto", ignoreCase = true)
+    // Single canonical resolution class (identical in Quality sheet, Current header & bottom badge!):
+    // - Manual pick: always matches the picked StreamChoice tier (2K -> 2K, 4K -> 4K)
+    // - Auto mode: reflects the live playing frame's canonical tier via DeviceCaps.tierOf(videoW, videoH)
+    val activeTier = when {
+        !isAutoQuality && curChoice != null && curChoice.height > 0 -> DeviceCaps.tier(curChoice)
+        videoH > 0 -> DeviceCaps.tierOf(videoW, videoH)
+        curChoice != null && curChoice.height > 0 -> DeviceCaps.tier(curChoice)
         else -> 0
     }
-    val qualityBadge = when {
-        shortSide <= 0 -> "AUTO"
-        shortSide <= 300 -> "240p"
-        shortSide <= 576 -> "480p"
-        shortSide <= 900 -> "720p"
-        shortSide <= 1200 -> "1080p"
-        shortSide <= 1800 -> "2K"
-        shortSide <= 3000 -> "4K"
-        else -> "8K"
+    val qualityBadge = if (activeTier > 0) MediaTools.heightText(activeTier)
+                       else qualityLabel.removePrefix("Auto").trim().ifBlank { "AUTO" }
+    // Single-source chip label: NEVER repeats a second resolution next to the badge!
+    val qualityChipLabel: String? = when {
+        isAutoQuality && !qualityBadge.equals("AUTO", true) -> "Auto"
+        qualityLabel.contains("HDR", ignoreCase = true) -> "HDR"
+        else -> null
     }
-    // Colour follows the quality, like the download-speed colours: low = red, then warmer to cooler as it rises.
     val qualityColor: Color? = when (qualityBadge) {
-        "240p" -> Color(0xFFFF453A)
-        "480p" -> Color(0xFFFF9F0A)
-        "720p" -> Color(0xFF30D158)
-        "1080p" -> Color(0xFF40C8E0)
-        "2K" -> Color(0xFF0A84FF)
-        "4K" -> Color(0xFF5E5CE6)
-        "8K" -> Color(0xFFBF5AF2)
+        "144p", "240p" -> Color(0xFFFF5A52)
+        "360p", "480p" -> Color(0xFFFFB340)
+        "720p" -> Color(0xFF3AE068)
+        "1080p" -> Color(0xFF5AC8FA)
+        "2K" -> Color(0xFF409CFF)
+        "4K" -> Color(0xFF7D7AFF)
+        "8K" -> Color(0xFFDA8FFF)
         else -> null
     }
 
     LaunchedEffect(aspectIndex, zoom) { if (overlay) onFit?.invoke(aspectIndex, zoom) }
 
     val fitMode = ASPECTS[aspectIndex].second == AspectRatioFrameLayout.RESIZE_MODE_FIT
+    // Dedicated live GPU Liquid Glass backdrop for BOTH PlayerActivity & InlinePlayer:
+    //  - Never reuses WebView's software `pageBackdrop` (Chromium paints <video> solid black on software Canvas!).
+    //  - Standalone PlayerActivity: async PixelCopy from Video SurfaceView (zero UI feedback, 5 Hz live while a
+    //    floating window is open so moving video refracts continuously through the Liquid Glass!).
+    //  - InlinePlayer (WebView <video>): clean async PixelCopy from Activity.window while controls are up and no
+    //    floating panel is drawn (zero feedback loop) so the real playing video refracts vividly from Frame 0!
+    val ownedPlayerBackdrop = remember { GlassBackdrop() }
+    var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
+    val copyHandler = remember { Handler(Looper.getMainLooper()) }
+    val copyLoc = remember { IntArray(2) }
+    val copyPool = remember { arrayOfNulls<Bitmap>(2) }
+    var copySlot by remember { mutableIntStateOf(0) }
+    var copyInFlight by remember { mutableStateOf(false) }
+    val hudActive = hud != null
+    val errActive = resolveError != null || error != null
+
+    DisposableEffect(ownedPlayerBackdrop) {
+        onDispose {
+            ownedPlayerBackdrop.setCustomFrame(null)
+            copyPool[0] = null
+            copyPool[1] = null
+        }
+    }
+
+    fun requestVideoGlassFrame() {
+        if (copyInFlight || PerfTier.low || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        if (!overlay) {
+            val pv = playerViewRef
+            val vs = pv?.videoSurfaceView
+            if (vs is SurfaceView && vs.holder.surface.isValid && vs.width > 16 && vs.height > 16) {
+                runCatching {
+                    val aspect = vs.width.toFloat() / vs.height.toFloat().coerceAtLeast(1f)
+                    val bw = if (aspect >= 1f) 200 else (200f * aspect).roundToInt().coerceIn(80, 200)
+                    val bh = if (aspect >= 1f) (200f / aspect).roundToInt().coerceIn(80, 200) else 200
+                    val slot = copySlot and 1
+                    copySlot = slot xor 1
+                    val existing = copyPool[slot]
+                    val bmp = if (existing != null && !existing.isRecycled && existing.width == bw && existing.height == bh) {
+                        existing
+                    } else {
+                        Bitmap.createBitmap(bw, bh, Bitmap.Config.RGB_565).also { copyPool[slot] = it }
+                    }
+                    vs.getLocationInWindow(copyLoc)
+                    val bounds = androidx.compose.ui.geometry.Rect(
+                        copyLoc[0].toFloat(), copyLoc[1].toFloat(),
+                        (copyLoc[0] + vs.width).toFloat(), (copyLoc[1] + vs.height).toFloat()
+                    )
+                    copyInFlight = true
+                    PixelCopy.request(vs, bmp, { res ->
+                        copyInFlight = false
+                        if (res == PixelCopy.SUCCESS) {
+                            ownedPlayerBackdrop.setCustomFrame(bmp, bounds)
+                        }
+                    }, copyHandler)
+                }.onFailure { copyInFlight = false }
+            } else if (vs is TextureView && vs.isAvailable && vs.width > 16 && vs.height > 16) {
+                runCatching {
+                    val aspect = vs.width.toFloat() / vs.height.toFloat().coerceAtLeast(1f)
+                    val bw = if (aspect >= 1f) 200 else (200f * aspect).roundToInt().coerceIn(80, 200)
+                    val bh = if (aspect >= 1f) (200f / aspect).roundToInt().coerceIn(80, 200) else 200
+                    val bmp = vs.getBitmap(bw, bh) ?: return
+                    vs.getLocationInWindow(copyLoc)
+                    val bounds = androidx.compose.ui.geometry.Rect(
+                        copyLoc[0].toFloat(), copyLoc[1].toFloat(),
+                        (copyLoc[0] + vs.width).toFloat(), (copyLoc[1] + vs.height).toFloat()
+                    )
+                    ownedPlayerBackdrop.setCustomFrame(bmp, bounds)
+                }
+            }
+        } else {
+            val win = activity?.window ?: return
+            val decor = win.decorView
+            val vw = decor.width
+            val vh = decor.height
+            if (vw < 32 || vh < 32) return
+            runCatching {
+                val aspect = vw.toFloat() / vh.toFloat().coerceAtLeast(1f)
+                val bw = if (aspect >= 1f) 240 else (240f * aspect).roundToInt().coerceIn(80, 240)
+                val bh = if (aspect >= 1f) (240f / aspect).roundToInt().coerceIn(80, 240) else 240
+                val slot = copySlot and 1
+                copySlot = slot xor 1
+                val existing = copyPool[slot]
+                val bmp = if (existing != null && !existing.isRecycled && existing.width == bw && existing.height == bh) {
+                    existing
+                } else {
+                    Bitmap.createBitmap(bw, bh, Bitmap.Config.RGB_565).also { copyPool[slot] = it }
+                }
+                val bounds = androidx.compose.ui.geometry.Rect(0f, 0f, vw.toFloat(), vh.toFloat())
+                PixelCopy.request(win, bmp, { res ->
+                    if (res == PixelCopy.SUCCESS) {
+                        ownedPlayerBackdrop.setCustomFrame(bmp, bounds)
+                    }
+                }, copyHandler)
+            }
+        }
+    }
+
+    // Live video glass pump:
+    //  - Standalone PlayerActivity: ~5 Hz live video refraction while panel/HUD/error is open, 1 frame when bars open, 0 Hz idle!
+    //  - InlinePlayer: captures clean hardware video frame whenever bars are up and panel is closed (0 feedback loop!).
+    LaunchedEffect(barsVisible, panel, hudActive, dblTapSide, errActive, overlay, pipMode) {
+        if (pipMode || PerfTier.low || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return@LaunchedEffect
+        val panelOpenNow = panel != null
+        val anyOverlay = panelOpenNow || hudActive || dblTapSide != 0 || errActive
+        if (!overlay) {
+            if (!barsVisible && !anyOverlay) return@LaunchedEffect
+            requestVideoGlassFrame()
+            val liveMs = when {
+                anyOverlay -> if (PerfTier.balanced) 150L else 95L
+                else -> if (PerfTier.balanced) 200L else 120L
+            }
+            while (isActive && (barsVisible || anyOverlay)) {
+                delay(liveMs)
+                requestVideoGlassFrame()
+            }
+        } else {
+            // InlinePlayer (fullscreen web <video>):
+            //  - When controls are HIDDEN (`!barsVisible && !anyOverlay`): cleanly capture the unobstructed full
+            //    video frame every ~450 ms (ZERO controls on screen -> 0% feedback loop!), so the instant the
+            //    user taps to show controls, every button & Play/Pause orb already blurs the exact live video!
+            //  - When controls OR a panel ARE visible: NEVER re-capture full Activity.window over the buttons
+            //    (prevents neon self-amplification!). Instead, continuously sample ONLY a clean button-free
+            //    video strip (`y = 20%..36%`, strictly between top bar and center Play button) into `ambientBitmap`.
+            if (!barsVisible && !anyOverlay) {
+                ownedPlayerBackdrop.setAmbientVideoFrame(null)
+                requestVideoGlassFrame()
+                while (isActive) {
+                    delay(if (PerfTier.balanced) 650L else 420L)
+                    requestVideoGlassFrame()
+                }
+            } else {
+                if (ownedPlayerBackdrop.customBitmap == null) requestVideoGlassFrame()
+                val win = activity?.window ?: return@LaunchedEffect
+                val decor = win.decorView
+                val ambPool = arrayOfNulls<Bitmap>(2)
+                var ambSlot = 0
+                var ambInFlight = false
+                val liveMs = if (PerfTier.balanced) 240L else 150L
+                try {
+                    while (isActive) {
+                        val vw = decor.width
+                        val vh = decor.height
+                        if (!ambInFlight && vw > 100 && vh > 100) {
+                            runCatching {
+                                // Strictly unobstructed video strip (below top bar, above center Play orb, left of right popover!)
+                                val rightEdge = if (panelOpenNow) {
+                                    (vw - (256f * context.resources.displayMetrics.density).toInt()).coerceIn((vw * 0.28f).toInt(), (vw * 0.62f).toInt())
+                                } else {
+                                    (vw * 0.86f).toInt()
+                                }
+                                val leftEdge = if (panelOpenNow) 0 else (vw * 0.14f).toInt()
+                                val srcRect = android.graphics.Rect(leftEdge, (vh * 0.20f).toInt(), rightEdge, (vh * 0.36f).toInt())
+                                val bw = 120
+                                val bh = 72
+                                val slot = ambSlot and 1
+                                ambSlot = slot xor 1
+                                val ex = ambPool[slot]
+                                val bmp = if (ex != null && !ex.isRecycled && ex.width == bw && ex.height == bh) ex
+                                          else Bitmap.createBitmap(bw, bh, Bitmap.Config.RGB_565).also { ambPool[slot] = it }
+                                ambInFlight = true
+                                PixelCopy.request(win, srcRect, bmp, { res ->
+                                    ambInFlight = false
+                                    if (res == PixelCopy.SUCCESS) ownedPlayerBackdrop.setAmbientVideoFrame(bmp)
+                                }, copyHandler)
+                            }.onFailure { ambInFlight = false }
+                        }
+                        delay(liveMs)
+                    }
+                } finally {
+                    ownedPlayerBackdrop.setAmbientVideoFrame(null)
+                }
+            }
+        }
+    }
+
     val shownShift = if (fitMode && !pipMode && rootWide == shiftWide) shiftPx else 0f
+    CompositionLocalProvider(LocalGlassBackdrop provides ownedPlayerBackdrop) {
     Box(Modifier.fillMaxSize().onGloballyPositioned {
         rootAt = it.positionInRoot()
         rootWide = it.size.width > it.size.height
@@ -1955,6 +2499,7 @@ internal fun PlayerScreen(
         if (!overlay) AndroidView(
             factory = { ctx ->
                 PlayerView(ctx).apply {
+                    playerViewRef = this
                     this.player = player
                     useController = false
                     // the last picture stays until the new stream shows its first one (no black flash on a quality switch)
@@ -1969,7 +2514,7 @@ internal fun PlayerScreen(
                 scaleX = zoom; scaleY = zoom
                 translationY = shownShift
             },
-            update = { v -> v.player = player; v.useController = false; v.resizeMode = ASPECTS[aspectIndex].second }
+            update = { v -> playerViewRef = v; v.player = player; v.useController = false; v.resizeMode = ASPECTS[aspectIndex].second }
         )
 
         if (!overlay && bridgeUp && bridgeImage != null) Image(
@@ -1999,7 +2544,8 @@ internal fun PlayerScreen(
                             val dur = player.duration
                             val startB = brightnessNow(); val startV = volumeNow()
                             var target = startPos
-                            var lastStep = -1
+                            val seekStepMs = if (dur != C.TIME_UNSET && dur in 1L..30_000L) 1_000L else 2_500L
+                            var lastStep = Int.MIN_VALUE
                             do {
                                 val ev = awaitPointerEvent()
                                 val pressed = ev.changes.count { it.pressed }
@@ -2017,6 +2563,7 @@ internal fun PlayerScreen(
                                 if (mode == 0 && (abs(tx) > slop * 2 || abs(ty) > slop * 2)) {
                                     mode = if (abs(tx) > abs(ty)) 1 else if (startX < size.width / 2f) 2 else 3
                                     dragging = mode == 1
+                                    if (mode == 1) lastStep = (startPos / seekStepMs).toInt()
                                     Haptics.fire(null, Hx.DRAG_START)
                                 }
                                 when (mode) {
@@ -2024,6 +2571,11 @@ internal fun PlayerScreen(
                                         target = (startPos + (tx / size.width * 90_000f).toLong()).coerceIn(0L, dur)
                                         position = target
                                         hud = "${formatDuration(target)}  (${if (target >= startPos) "+" else "-"}${abs(target - startPos) / 1000}s)"
+                                        val st = (target / seekStepMs).toInt()
+                                        if (st != lastStep) {
+                                            lastStep = st
+                                            Haptics.fire(null, if (target <= 0L || target >= dur) Hx.THRESHOLD else Hx.TICK)
+                                        }
                                     }
                                     2 -> {
                                         val v = (startB - ty / size.height * 1.4f).coerceIn(0f, 1f); setBrightness(v); hud = "Brightness ${(v * 100).roundToInt()}%"
@@ -2038,7 +2590,10 @@ internal fun PlayerScreen(
                                 }
                                 if (mode in 1..3) c.consume()
                             } while (ev.changes.any { it.pressed })
-                            if (mode == 1 && dur != C.TIME_UNSET) { player.seekTo(target) }
+                            if (mode == 1 && dur != C.TIME_UNSET && dur > 0) {
+                                player.seekTo(target)
+                                Haptics.fire(null, Hx.DRAG_END)
+                            }
                             dragging = false
                         }
                     }
@@ -2054,13 +2609,17 @@ internal fun PlayerScreen(
                                     lastTapAt = 0L; controlsVisible = before
                                     if (player.duration > 0) {
                                         val left = o.x < size.width / 2f
+                                        val side = if (left) -1 else 1
                                         Haptics.fire(null, Hx.TAP)
                                         seekBy(if (left) -10_000L else 10_000L)
-                                        hud = if (left) "-10 s" else "+10 s"
+                                        dblTapAccSec = if (dblTapSide == side) dblTapAccSec + 10 else 10
+                                        dblTapSide = side
+                                        dblTapToken++
                                     }
                                 } else {
                                     before = controlsVisible
                                     controlsVisible = !controlsVisible; panel = null
+                                    Haptics.fire(null, Hx.TICK)
                                     lastTapAt = now; lastTapX = o.x
                                 }
                             },
@@ -2075,12 +2634,53 @@ internal fun PlayerScreen(
                     }
             )
 
-            // ---- HUD ----
-            AnimatedVisibility(hud != null, Modifier.align(Alignment.TopCenter).padding(top = 64.dp), enter = fadeIn(tween(80)), exit = fadeOut(tween(200))) {
-                Text(
-                    hud.orEmpty(), color = TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.liquidGlass(Capsule, 1f, 0.05f).padding(horizontal = 14.dp, vertical = 7.dp)
-                )
+            // ---- HUD (Mirror Liquid Glass Pill + Fluid Spring Pop) ----
+            AnimatedVisibility(
+                hud != null,
+                Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 56.dp),
+                enter = fadeIn(tween(120)) + scaleIn(spring(dampingRatio = 0.66f, stiffness = 520f), initialScale = 0.84f),
+                exit = fadeOut(tween(160)) + scaleOut(tween(160), targetScale = 0.90f)
+            ) {
+                Box(
+                    Modifier
+                        .liquidGlass(Capsule, 1.15f, 0.02f, reactive = false)
+                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                ) {
+                    Text(hud.orEmpty(), color = TextPrimary, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+
+            // ---- Double-Tap Side Seek Pill (positioned cleanly above center so it NEVER overlaps Rotate or Play/Pause) ----
+            AnimatedVisibility(
+                visible = dblTapSide != 0 && dblTapAccSec > 0,
+                modifier = Modifier
+                    .align(if (dblTapSide < 0) Alignment.CenterStart else Alignment.CenterEnd)
+                    .padding(
+                        start = if (dblTapSide < 0) 40.dp else 0.dp,
+                        end = if (dblTapSide > 0) 40.dp else 0.dp,
+                        bottom = 132.dp
+                    ),
+                enter = fadeIn(tween(110)) + scaleIn(spring(dampingRatio = 0.66f, stiffness = 540f), initialScale = 0.80f),
+                exit = fadeOut(tween(160)) + scaleOut(tween(160), targetScale = 0.88f)
+            ) {
+                Row(
+                    Modifier
+                        .playerLiquidGlass(Capsule, level = 1.16f)
+                        .padding(horizontal = 16.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (dblTapSide < 0) {
+                        Icon(AppleIcons.ArrowBack, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                    }
+                    Text(
+                        if (dblTapSide < 0) "-${dblTapAccSec}s" else "+${dblTapAccSec}s",
+                        color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold
+                    )
+                    if (dblTapSide > 0) {
+                        Icon(AppleIcons.ArrowForward, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                    }
+                }
             }
 
             // Quality switch: the buffer screen is there in the same frame as the tap (last picture stays, slightly dimmed,
@@ -2091,89 +2691,131 @@ internal fun PlayerScreen(
                 else if (buffering || resolving) { delay(700); showSpin = true }
                 else showSpin = false
             }
-            val dim by animateFloatAsState(if (switching) 0.38f else 0f, tween(if (switching) 90 else 160), label = "switchDim")
-            if (dim > 0.001f) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = dim)))
+            val dimState = animateFloatAsState(if (switching) 0.38f else 0f, tween(if (switching) 90 else 160), label = "switchDim")
+            Box(Modifier.fillMaxSize().drawBehind {
+                val d = dimState.value.coerceIn(0f, 1f)
+                if (d > 0.001f) drawRect(Color.Black.copy(alpha = d))
+            })
             // `switching` shows the spinner in the SAME frame (no wait for the effect above to run first)
             if (switching || (showSpin && (buffering || resolving))) {
                 CircularProgressIndicator(color = accent, strokeWidth = 2.5.dp, modifier = Modifier.align(Alignment.Center).size(34.dp))
             }
 
-            // ---- top bar (compact) ----
-            AnimatedVisibility(barsVisible, Modifier.align(Alignment.TopCenter), enter = fadeIn(tween(140)), exit = fadeOut(tween(140))) {
-                // Same style as the bottom controls: no glass container, just a soft scrim.
+            // ---- top bar: Close Liquid Glass Orb · Title · Unified iOS 27 Liquid Glass Action Cluster ----
+            AnimatedVisibility(barsVisible, Modifier.align(Alignment.TopCenter), enter = fadeIn(tween(100)), exit = fadeOut(tween(90))) {
                 Row(
                     Modifier.fillMaxWidth()
                         .background(androidx.compose.ui.graphics.Brush.verticalGradient(
-                            listOf(Color.Black.copy(alpha = 0.6f), Color.Transparent)
+                            listOf(Color.Black.copy(alpha = 0.62f), Color.Transparent)
                         ))
                         .glassTouchShield { touch() }
                         .statusBarsPadding()
-                        .padding(start = PlayerEdge, end = PlayerEdge, top = 8.dp, bottom = 16.dp),
+                        .padding(start = PlayerEdge, end = PlayerEdge, top = 8.dp, bottom = 14.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    PlayerChip(null, AppleIcons.Close, false) { onClose() }
-                    // Close · name · size · lock · more: all in this single row, name on one line
+                    PlayerGlassOrb(AppleIcons.Close, "Close", size = 38.dp, iconSize = 18.dp) { onClose() }
                     Text(
-                        title, color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                        title, color = Color.White, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold,
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f).padding(horizontal = 6.dp)
+                        modifier = Modifier.weight(1f).padding(horizontal = 10.dp)
                     )
-                    // Same capsule style as the bottom chips; the name gives up space first.
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                        // one tap = next picture mode (Fit -> Crop -> Fit ...), no panel; the centre text names the mode
-                        PlayerChip(null, if (aspectIndex == 0) AppleIcons.FitScreen else AppleIcons.Crop, aspectIndex != 0) {
-                            touch()
-                            val next = (aspectIndex + 1) % ASPECTS.size
-                            if (screenLandscape) { aspectLand = next; aspectPrefs.edit().putInt("aspectLand", next).apply() }
-                            else { aspectPort = next; aspectPrefs.edit().putInt("aspectPort", next).apply() }
-                            zoom = 1f
-                            panel = null
-                            hud = ASPECTS[next].first
+                    // Unified iOS 27 Liquid Glass Control Cluster (Fit/Crop · Lock · More) — crisp, symmetrical, 100% consistent!
+                    Row(
+                        Modifier
+                            .height(38.dp)
+                            .playerLiquidGlass(Capsule, level = 1.12f)
+                            .padding(horizontal = 3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        val brightAccent = androidx.compose.ui.graphics.lerp(accent, Color.White, 0.44f)
+                        GlowPress(
+                            onClick = {
+                                touch()
+                                val next = (aspectIndex + 1) % ASPECTS.size
+                                if (screenLandscape) { aspectLand = next; aspectPrefs.edit().putInt("aspectLand", next).apply() }
+                                else { aspectPort = next; aspectPrefs.edit().putInt("aspectPort", next).apply() }
+                                zoom = 1f
+                                panel = null
+                                hud = ASPECTS[next].first
+                            },
+                            shape = CircleShape,
+                            modifier = Modifier
+                                .size(32.dp)
+                                .then(if (aspectIndex != 0) Modifier.background(accent.copy(alpha = 0.28f), CircleShape) else Modifier)
+                        ) {
+                            Icon(
+                                if (aspectIndex == 0) AppleIcons.FitScreen else AppleIcons.Crop,
+                                "Aspect mode",
+                                tint = if (aspectIndex != 0) brightAccent else Color.White,
+                                modifier = Modifier.size(18.dp)
+                            )
                         }
                         Box(Modifier.onGloballyPositioned { lockAt = it.positionInRoot() }) {
-                            // own haptic (a firm "click on"), the button's default tap would be swallowed by it
-                            PlayerChip(null, AppleIcons.Lock, false, haptic = false) {
-                                Haptics.fire(null, Hx.TOGGLE_ON)
-                                locked = true; unlockVisible = true; controlsVisible = false; panel = null; hud = "Locked"
+                            GlowPress(
+                                onClick = {
+                                    Haptics.fire(null, Hx.TOGGLE_ON)
+                                    locked = true; unlockVisible = true; controlsVisible = false; panel = null; hud = "Locked"
+                                },
+                                shape = CircleShape,
+                                haptic = false,
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(AppleIcons.Lock, "Lock screen", tint = Color.White, modifier = Modifier.size(17.5.dp))
                             }
                         }
-                        // lit while the sleep timer (which lives in this menu now) is running
-                        PlayerChip(null, AppleIcons.MoreVert, panel == PlayerPanel.MORE || sleepMinutes > 0) { panel = if (panel == PlayerPanel.MORE) null else PlayerPanel.MORE }
+                        val moreLit = panel == PlayerPanel.MORE || sleepMinutes > 0 || audioBoostPct > 0 || nightMode
+                        GlowPress(
+                            onClick = { panel = if (panel == PlayerPanel.MORE) null else PlayerPanel.MORE },
+                            shape = CircleShape,
+                            modifier = Modifier
+                                .size(32.dp)
+                                .then(if (moreLit) Modifier.background(accent.copy(alpha = 0.28f), CircleShape) else Modifier)
+                        ) {
+                            Icon(
+                                AppleIcons.MoreVert,
+                                "More options",
+                                tint = if (moreLit) brightAccent else Color.White,
+                                modifier = Modifier.size(18.5.dp)
+                            )
+                        }
                     }
                 }
             }
 
-            // ---- centre play / pause (one button, no skip buttons) ----
+            // ---- centre play / pause: authentic Apple iOS 27 Liquid Glass Lens Orb ----
             AnimatedVisibility(
                 barsVisible && !buffering && !switching, Modifier.align(Alignment.Center),
                 enter = fadeIn(tween(140)) + scaleIn(initialScale = 0.85f, animationSpec = spring(dampingRatio = 0.7f, stiffness = 600f)),
                 exit = fadeOut(tween(120)) + scaleOut(targetScale = 0.9f)
             ) {
                 val on = playWhenReady && player.playbackState != Player.STATE_ENDED
-                PlayPauseDisc(on = on, accent = accent, diameter = 56.dp) { touch(); togglePlay() }
+                PlayPauseDisc(on = on, accent = accent, diameter = 64.dp) { touch(); togglePlay() }
             }
 
-            // ---- bottom bar: ONE row. Progress bar on the left, tools on the right, rotate last ----
-            AnimatedVisibility(barsVisible, Modifier.align(Alignment.BottomCenter), enter = fadeIn(tween(140)), exit = fadeOut(tween(140))) {
-                // The tools (plus rotate) get at most half of the bar; the progress bar keeps the rest.
-                // When the tools do not fit (portrait), they scroll inside their half and rotate stays put.
-                val toolsHalf = ((LocalConfiguration.current.screenWidthDp - 44) * 0.5f).dp
-                val stripMax = maxOf(60.dp, toolsHalf)
-                // No master pill any more: the controls float on a soft bottom scrim, the
-                // chips keep their own glass, so the bar is lower and lighter.
+            // ---- bottom bar: Scrubber + Uniform 34dp Liquid Glass Pills & Orbs ----
+            AnimatedVisibility(barsVisible, Modifier.align(Alignment.BottomCenter), enter = fadeIn(tween(100)), exit = fadeOut(tween(90))) {
+                val toolsHalf = ((LocalConfiguration.current.screenWidthDp - 40) * 0.52f).dp
+                val stripMax = maxOf(72.dp, toolsHalf)
                 Row(
                     Modifier.fillMaxWidth()
                         .background(androidx.compose.ui.graphics.Brush.verticalGradient(
-                            listOf(Color.Transparent, Color.Black.copy(alpha = 0.6f))
+                            listOf(Color.Transparent, Color.Black.copy(alpha = 0.64f))
                         ))
                         .glassTouchShield { touch() }
                         .navigationBarsPadding()
-                        .padding(start = PlayerEdge, end = PlayerEdge, top = 16.dp, bottom = 8.dp),
+                        .padding(start = PlayerEdge, end = PlayerEdge, top = 16.dp, bottom = 10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // left: position - progress bar - duration (takes all the space the tools leave)
                     Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-                        Text(formatDuration(position), color = TextPrimary, fontSize = 10.sp, maxLines = 1)
+                        Text(
+                            formatDuration(position),
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            style = androidx.compose.ui.text.TextStyle(fontFeatureSettings = "tnum"),
+                            maxLines = 1
+                        )
                         GlassSlider(
                             value = if (duration > 0L) position.toFloat().coerceIn(0f, duration.toFloat()) else 0f,
                             onValueChange = { if (duration > 0L) { dragging = true; position = it.toLong() }; touch() },
@@ -2182,107 +2824,310 @@ internal fun PlayerScreen(
                             bufferedFraction = if (duration > 0) (bufferedPosition.toFloat() / duration).coerceIn(0f, 1f) else 0f,
                             onValueChangeFinished = { player.seekTo(position); dragging = false }
                         )
-                        // length not known yet: the slot keeps its width but shows nothing (no "00:00" flash)
-                        Text(formatDuration(duration), color = if (duration > 0L) TextTertiary else Color.Transparent, fontSize = 10.sp, maxLines = 1)
+                        val durDisplay = when {
+                            duration <= 0L -> "0:00"
+                            showRemaining -> "-" + formatDuration((duration - position).coerceAtLeast(0L))
+                            else -> formatDuration(duration)
+                        }
+                        Text(
+                            durDisplay,
+                            color = if (duration > 0L) Color.White.copy(alpha = 0.80f) else Color.Transparent,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            style = androidx.compose.ui.text.TextStyle(fontFeatureSettings = "tnum"),
+                            maxLines = 1,
+                            modifier = if (duration > 0L) Modifier.clickableHaptic { showRemaining = !showRemaining } else Modifier
+                        )
                     }
                     Spacer(Modifier.width(10.dp))
-                    // right: tools
                     Row(
                         Modifier.widthIn(max = stripMax).horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        PlayerChip(speedLabel(speed), AppleIcons.Speed, speed != 1f) { panel = if (panel == PlayerPanel.SPEED) null else PlayerPanel.SPEED }
-                        // quality switching only makes sense for online streams, not downloaded files
-                        if (!isLocal) PlayerChip(qualityLabel.replace(qualityBadge, "").trim().ifBlank { null }, null, false, badge = qualityBadge, badgeColor = qualityColor) { panel = if (panel == PlayerPanel.QUALITY) null else PlayerPanel.QUALITY }
-                        if (audioOpts.size > 1) PlayerChip(null, AppleIcons.Audiotrack, false) { panel = if (panel == PlayerPanel.AUDIO) null else PlayerPanel.AUDIO }
-                        if (textOpts.isNotEmpty()) PlayerChip(null, AppleIcons.ClosedCaption, !subsOff) { panel = if (panel == PlayerPanel.SUBS) null else PlayerPanel.SUBS }
+                        PlayerChip(speedLabel(speed), AppleIcons.Speed, speed != 1f) {
+                            panel = if (panel == PlayerPanel.SPEED) null else PlayerPanel.SPEED
+                        }
+                        if (!isLocal) {
+                            PlayerChip(
+                                label = qualityChipLabel,
+                                icon = null,
+                                active = panel == PlayerPanel.QUALITY,
+                                badge = qualityBadge,
+                                badgeColor = qualityColor
+                            ) {
+                                panel = if (panel == PlayerPanel.QUALITY) null else PlayerPanel.QUALITY
+                            }
+                        }
+                        if (audioOpts.size > 1) {
+                            PlayerGlassOrb(AppleIcons.Audiotrack, "Audio track", panel == PlayerPanel.AUDIO, size = 34.dp, iconSize = 16.5.dp) {
+                                panel = if (panel == PlayerPanel.AUDIO) null else PlayerPanel.AUDIO
+                            }
+                        }
+                        if (textOpts.isNotEmpty()) {
+                            PlayerGlassOrb(AppleIcons.ClosedCaption, "Subtitles", !subsOff || panel == PlayerPanel.SUBS, size = 34.dp, iconSize = 17.dp) {
+                                panel = if (panel == PlayerPanel.SUBS) null else PlayerPanel.SUBS
+                            }
+                        }
                     }
                 }
             }
 
-            // ---- rotate: big round button on the right edge, easy to reach with the thumb ----
+            // ---- rotate: consistent Apple iOS 27 Liquid Glass Orb (pure white crisp glyph matching every other button!) ----
             AnimatedVisibility(
                 barsVisible, Modifier.align(Alignment.CenterEnd),
-                enter = fadeIn(tween(140)), exit = fadeOut(tween(140))
+                enter = fadeIn(tween(100)), exit = fadeOut(tween(90))
             ) {
                 GlowPress(
                     onClick = { touch(); rotate(activity) },
                     modifier = Modifier.padding(end = PlayerEdge)
-                        .size(46.dp).liquidGlass(CircleShape, 1f, 0.05f),
+                        .size(44.dp)
+                        .liquidWindowDrag(maxPullDp = 24.dp)
+                        .playerLiquidGlass(CircleShape, level = 1.15f),
                     shape = CircleShape
                 ) {
-                    RotateToggleIcon(accent)
+                    RotateToggleIcon(Color.White)
                 }
             }
 
-            // ---- options panel ----
-            if (panel != null) {
-                Box(Modifier.fillMaxSize().clickable(remember { MutableInteractionSource() }, null) { panel = null })
-                // The menu opens right next to the button it came from: the three-dots / aspect buttons are in the top
-                // bar, so their menu hangs just below it; the speed / quality / audio / subtitle chips are in the
-                // bottom bar, so theirs opens just above it. It grows out of the corner nearest to that button.
-                val fromTop = panel == PlayerPanel.MORE || panel == PlayerPanel.SLEEP
-                val pop = remember(fromTop) { Animatable(0f) }
-                LaunchedEffect(fromTop) { pop.animateTo(1f, spring(dampingRatio = 0.78f, stiffness = 520f)) }
-                Column(
-                    Modifier.align(if (fromTop) Alignment.TopEnd else Alignment.BottomEnd)
-                        .then(
-                            // top bar: status bar + 8 dp + the 28 dp button, then a small gap
-                            if (fromTop) Modifier.statusBarsPadding().padding(end = PlayerEdge, top = 42.dp)
-                            else Modifier.navigationBarsPadding().padding(end = PlayerEdge, bottom = 60.dp)
-                        )
-                        .graphicsLayer {
-                            val sc = 0.90f + 0.10f * pop.value
-                            scaleX = sc; scaleY = sc
-                            alpha = pop.value.coerceIn(0f, 1f)
-                            transformOrigin = TransformOrigin(1f, if (fromTop) 0f else 1f)
-                        }
-                        .width(236.dp).heightIn(max = 290.dp)
-                        .liquidGlass(RoundedCornerShape(26.dp), 1f, 0.12f).glassTouchShield { touch() }
-                        .verticalScroll(rememberScrollState()).padding(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(2.dp)
+            // ---- options panel (100% unified LiquidFloatingWindow — exact same look, size, animation & feel as outside!) ----
+            var lastPanel by remember { mutableStateOf<PlayerPanel?>(null) }
+            if (panel != null) lastPanel = panel
+            LaunchedEffect(panel) {
+                if (panel == null && lastPanel != null) {
+                    delay(105)
+                    lastPanel = null
+                }
+            }
+            val shownPanel = panel ?: lastPanel
+            val panelOpen = panel != null
+            val fromTop = shownPanel == PlayerPanel.MORE || shownPanel == PlayerPanel.SLEEP || shownPanel == PlayerPanel.BOOST
+            val endMargin = if (screenLandscape) PlayerEdge else FloatingPopoverMargin
+
+            if (shownPanel != null) {
+                LiquidFloatingWindow(
+                    visible = panelOpen,
+                    onDismiss = { panel = null },
+                    fromTop = fromTop,
+                    edgeMargin = endMargin,
+                    anchorOffset = if (fromTop) 46.dp else 60.dp,
+                    sheenKey = shownPanel,
+                    immersive = screenLandscape,
+                    contentModifier = Modifier.glassTouchShield { touch() }
                 ) {
-                    when (panel) {
-                        PlayerPanel.SPEED -> PLAYER_SPEEDS.forEach { v ->
-                            PanelRow(speedLabel(v), speed == v) { speed = v; player.setPlaybackSpeed(v); panel = null }
-                        }
-                        PlayerPanel.QUALITY -> {
-                            if (choices.size > 1) {
-                                choices.forEachIndexed { i, c ->
-                                    PanelRow(MediaTools.playerText(c.label), i == choiceIndex) { onChoice(i); panel = null }
+                    AnimatedContent(
+                        targetState = shownPanel,
+                        transitionSpec = {
+                            ((fadeIn(tween(180, delayMillis = 25)) + scaleIn(tween(180), initialScale = 0.96f)) togetherWith
+                                (fadeOut(tween(100)) + scaleOut(tween(100), targetScale = 0.97f))).using(
+                                SizeTransform(clip = true) { _, _ -> spring(dampingRatio = 0.82f, stiffness = 480f) })
+                        },
+                        label = "playerPanelMorph",
+                        modifier = Modifier.fillMaxWidth().weight(1f, fill = false)
+                    ) { curPanel ->
+                        Column(Modifier.fillMaxWidth()) {
+                            when (curPanel) {
+                                PlayerPanel.QUALITY -> {
+                                    val qSubtitle = qualityLabel.ifBlank { "Auto" }
+                                    PlayerSheetHeader("Quality", "Current · $qSubtitle", AppleIcons.HighQuality, onClose = { panel = null })
+                                    Column(
+                                        Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()),
+                                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                                    ) {
+                                        if (choices.size > 1) {
+                                            choices.withIndex().toList().chunked(2).forEachIndexed { rIdx, pair ->
+                                                PlayerStaggerRow(rIdx) {
+                                                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                                        pair.forEach { (i, c) ->
+                                                            val lbl = if (c.height > 0) MediaTools.heightText(DeviceCaps.tier(c)) else MediaTools.playerText(c.label)
+                                                            PlayerOptionChip(
+                                                                label = lbl,
+                                                                tag = playerQualityTag(lbl),
+                                                                selected = i == choiceIndex,
+                                                                modifier = Modifier.weight(1f)
+                                                            ) { onChoice(i); panel = null }
+                                                        }
+                                                        if (pair.size == 1) Spacer(Modifier.weight(1f))
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            val allOpts = listOf<TrackOpt?>(null) + videoOpts
+                                            allOpts.chunked(2).forEachIndexed { rIdx, pair ->
+                                                PlayerStaggerRow(rIdx) {
+                                                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                                        pair.forEach { o ->
+                                                            val lbl = o?.label ?: "Auto"
+                                                            val isSel = if (o == null) (videoOpts.none { it.selected } || videoOpts.size < 2)
+                                                                        else (o.selected && videoOpts.size > 1)
+                                                            PlayerOptionChip(
+                                                                label = lbl,
+                                                                tag = playerQualityTag(lbl),
+                                                                selected = isSel,
+                                                                modifier = Modifier.weight(1f)
+                                                            ) { applyTrack(player, C.TRACK_TYPE_VIDEO, o); panel = null }
+                                                        }
+                                                        if (pair.size == 1) Spacer(Modifier.weight(1f))
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                            } else {
-                                PanelRow("Auto", videoOpts.none { it.selected } || videoOpts.size < 2) { applyTrack(player, C.TRACK_TYPE_VIDEO, null); panel = null }
-                                videoOpts.forEach { o -> PanelRow(o.label, o.selected && videoOpts.size > 1) { applyTrack(player, C.TRACK_TYPE_VIDEO, o); panel = null } }
-                            }
-                        }
-                        PlayerPanel.AUDIO -> audioOpts.forEach { o -> PanelRow(o.label, o.selected) { applyTrack(player, C.TRACK_TYPE_AUDIO, o); panel = null } }
-                        PlayerPanel.SUBS -> {
-                            PanelRow("Off", subsOff) { applyTrack(player, C.TRACK_TYPE_TEXT, null); panel = null }
-                            textOpts.forEach { o -> PanelRow(o.label, !subsOff && o.selected) { applyTrack(player, C.TRACK_TYPE_TEXT, o); panel = null } }
-                        }
-                        PlayerPanel.SLEEP -> {
-                            PanelHeader("Sleep timer") { panel = PlayerPanel.MORE }
-                            SLEEP_OPTIONS.forEach { m ->
-                                PanelRow(if (m == 0) "Off" else "$m minutes", sleepMinutes == m) { sleepMinutes = m; panel = null }
-                            }
-                        }
-                        PlayerPanel.MORE -> {
-                            PanelRow(
-                                "Sleep timer", sleepMinutes > 0, if (sleepMinutes > 0) "$sleepMinutes min" else "Off",
-                                icon = AppleIcons.Bedtime, chevron = true
-                            ) { panel = PlayerPanel.SLEEP }
-                            PanelDivider()
-                            PanelRow("Share", false, icon = AppleIcons.Share) {
-                                panel = null
-                                runCatching {
-                                    context.startActivity(Intent.createChooser(
-                                        Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, pageUrl ?: playUrl), null))
+                                PlayerPanel.SPEED -> {
+                                    PlayerSheetHeader("Playback speed", "Current · ${speedLabel(speed)}", AppleIcons.Speed, onClose = { panel = null })
+                                    Column(
+                                        Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()),
+                                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                                    ) {
+                                        PLAYER_SPEEDS.chunked(2).forEachIndexed { rIdx, pair ->
+                                            PlayerStaggerRow(rIdx) {
+                                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                                    pair.forEach { v ->
+                                                        PlayerOptionChip(
+                                                            label = speedLabel(v),
+                                                            tag = if (v == 1f) "Normal" else "",
+                                                            selected = speed == v,
+                                                            modifier = Modifier.weight(1f)
+                                                        ) { speed = v; player.setPlaybackSpeed(v); panel = null }
+                                                    }
+                                                    if (pair.size == 1) Spacer(Modifier.weight(1f))
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                PlayerPanel.AUDIO -> {
+                                    PlayerSheetHeader("Audio track", "${audioOpts.size} available", AppleIcons.Audiotrack, onClose = { panel = null })
+                                    Column(
+                                        Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()),
+                                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                                    ) {
+                                        audioOpts.forEachIndexed { i, o ->
+                                            PlayerStaggerRow(i) {
+                                                PanelRow(o.label, o.selected) { applyTrack(player, C.TRACK_TYPE_AUDIO, o); panel = null }
+                                            }
+                                        }
+                                    }
+                                }
+                                PlayerPanel.SUBS -> {
+                                    PlayerSheetHeader("Subtitles", if (subsOff) "Off" else "On", AppleIcons.ClosedCaption, onClose = { panel = null })
+                                    Column(
+                                        Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()),
+                                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                                    ) {
+                                        PlayerStaggerRow(0) {
+                                            PanelRow("Off", subsOff) { applyTrack(player, C.TRACK_TYPE_TEXT, null); panel = null }
+                                        }
+                                        textOpts.forEachIndexed { i, o ->
+                                            PlayerStaggerRow(i + 1) {
+                                                PanelRow(o.label, !subsOff && o.selected) { applyTrack(player, C.TRACK_TYPE_TEXT, o); panel = null }
+                                            }
+                                        }
+                                    }
+                                }
+                                PlayerPanel.SLEEP -> {
+                                    PlayerSheetHeader(
+                                        "Sleep timer",
+                                        if (sleepMinutes > 0) "$sleepMinutes min active" else "Auto pause playback",
+                                        AppleIcons.Bedtime,
+                                        onClose = { panel = null },
+                                        onBack = { panel = PlayerPanel.MORE }
+                                    )
+                                    Column(
+                                        Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()),
+                                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                                    ) {
+                                        SLEEP_OPTIONS.chunked(2).forEachIndexed { rIdx, pair ->
+                                            PlayerStaggerRow(rIdx) {
+                                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                                    pair.forEach { m ->
+                                                        PlayerOptionChip(
+                                                            label = if (m == 0) "Off" else "${m}m",
+                                                            tag = if (m == 0) "" else "min",
+                                                            selected = sleepMinutes == m,
+                                                            modifier = Modifier.weight(1f)
+                                                        ) { sleepMinutes = m; panel = null }
+                                                    }
+                                                    if (pair.size == 1) Spacer(Modifier.weight(1f))
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                PlayerPanel.BOOST -> {
+                                    PlayerSheetHeader(
+                                        "Audio boost",
+                                        if (audioBoostPct > 0) "Boost +$audioBoostPct%" else "Normal volume",
+                                        AppleIcons.Audiotrack,
+                                        onClose = { panel = null },
+                                        onBack = { panel = PlayerPanel.MORE }
+                                    )
+                                    Column(
+                                        Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()),
+                                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                                    ) {
+                                        BOOST_OPTIONS.chunked(2).forEachIndexed { rIdx, pair ->
+                                            PlayerStaggerRow(rIdx) {
+                                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                                    pair.forEach { pct ->
+                                                        PlayerOptionChip(
+                                                            label = if (pct == 0) "100%" else "+$pct%",
+                                                            tag = if (pct == 0) "Normal" else "Loud",
+                                                            selected = audioBoostPct == pct,
+                                                            modifier = Modifier.weight(1f)
+                                                        ) {
+                                                            audioBoostPct = pct
+                                                            hud = if (pct == 0) "Audio boost off" else "Audio boost +$pct%"
+                                                            panel = null
+                                                        }
+                                                    }
+                                                    if (pair.size == 1) Spacer(Modifier.weight(1f))
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                PlayerPanel.MORE -> {
+                                    Column(
+                                        Modifier.fillMaxWidth().heightIn(max = 276.dp).verticalScroll(rememberScrollState()),
+                                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                                    ) {
+                                        var idx = 0
+                                        if (!overlay) {
+                                            PlayerStaggerRow(idx++) {
+                                                PanelRow(
+                                                    "Audio boost", audioBoostPct > 0,
+                                                    if (audioBoostPct > 0) "+$audioBoostPct%" else "Off",
+                                                    icon = AppleIcons.Audiotrack, chevron = true
+                                                ) { panel = PlayerPanel.BOOST }
+                                            }
+                                        }
+                                        PlayerStaggerRow(idx++) {
+                                            PanelRow(
+                                                "Night mode", nightMode, if (nightMode) "On" else "Off",
+                                                icon = AppleIcons.DarkMode
+                                            ) {
+                                                nightMode = !nightMode
+                                                aspectPrefs.edit().putBoolean("playerNightMode", nightMode).apply()
+                                                hud = if (nightMode) "Night mode on · Extra dim" else "Night mode off"
+                                                panel = null
+                                            }
+                                        }
+                                        PlayerStaggerRow(idx++) {
+                                            PanelRow(
+                                                "Sleep timer", sleepMinutes > 0, if (sleepMinutes > 0) "$sleepMinutes min" else "Off",
+                                                icon = AppleIcons.Bedtime, chevron = true
+                                            ) { panel = PlayerPanel.SLEEP }
+                                        }
+                                        PanelDivider()
+                                        PlayerStaggerRow(idx++) {
+                                            PanelRow("Download", false, icon = AppleIcons.Download) { panel = null; onDownload() }
+                                        }
+                                    }
                                 }
                             }
-                            PanelRow("Download", false, icon = AppleIcons.Download) { panel = null; onDownload() }
                         }
-                        null -> Unit
                     }
                 }
             }
@@ -2298,18 +3143,38 @@ internal fun PlayerScreen(
                 else Modifier.align(Alignment.CenterStart).padding(start = PlayerEdge)),
                 enter = fadeIn(tween(140)), exit = fadeOut(tween(200))
             ) {
-                PlayerChip(null, AppleIcons.LockOpen, true, haptic = false) {
+                PlayerGlassOrb(AppleIcons.LockOpen, "Unlock screen", active = true, size = 38.dp, iconSize = 18.5.dp, haptic = false) {
                     Haptics.fire(null, Hx.TOGGLE_OFF)
                     locked = false; controlsVisible = true; hud = "Unlocked"
                 }
             }
 
-            // ---- error / resolver failure ----
+            // ---- Night mode: warm extra-dim optical veil for dark-room viewing (0 touch interception!) ----
+            val nightDimState = animateFloatAsState(
+                targetValue = if (nightMode) 1f else 0f,
+                animationSpec = tween(260),
+                label = "playerNightDim"
+            )
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .drawBehind {
+                        val a = nightDimState.value.coerceIn(0f, 1f)
+                        if (a > 0.004f) {
+                            drawRect(Color(0xFF0A0602).copy(alpha = 0.50f * a))
+                        }
+                    }
+            )
+
+            // ---- error / resolver failure (Mirror Liquid Glass) ----
             val problem = resolveError ?: error
             if (problem != null && !resolving) {
                 Column(
                     Modifier.align(Alignment.Center).padding(28.dp).widthIn(max = 320.dp)
-                        .liquidGlass(RoundedCornerShape(26.dp), 1f, 0.06f).padding(18.dp),
+                        .liquidWindowDrag(maxPullDp = 44.dp)
+                        .liquidGlass(FloatingPopoverShape, 1.18f, 0.02f, reactive = true)
+                        .liquidEntranceSheen(problem)
+                        .padding(18.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Icon(AppleIcons.ErrorOutline, null, tint = Bad, modifier = Modifier.size(30.dp))
@@ -2323,6 +3188,7 @@ internal fun PlayerScreen(
             }
         }
     }
+    }
 }
 
 /**
@@ -2332,11 +3198,13 @@ internal fun PlayerScreen(
 /** The main button: accent-tinted glass, the icon morphs between play and pause with a little pop. */
 @Composable
 private fun PlayPauseDisc(on: Boolean, accent: Color, diameter: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
+    @Suppress("UNUSED_EXPRESSION")
+    accent
     val view = LocalView.current
     val pop = remember { Animatable(1f) }
     var armed by remember { mutableStateOf(false) }
     LaunchedEffect(on) {
-        if (armed) { pop.snapTo(0.9f); pop.animateTo(1f, spring(dampingRatio = 0.45f, stiffness = 500f)) }
+        if (armed) { pop.snapTo(0.88f); pop.animateTo(1f, spring(dampingRatio = 0.46f, stiffness = 540f)) }
         armed = true
     }
     GlowPress(
@@ -2344,19 +3212,16 @@ private fun PlayPauseDisc(on: Boolean, accent: Color, diameter: androidx.compose
         modifier = Modifier
             .size(diameter)
             .graphicsLayer { scaleX = pop.value; scaleY = pop.value }
-            .liquidGlass(CircleShape, 1f, 0.05f)
-            .background(
-                androidx.compose.ui.graphics.Brush.verticalGradient(listOf(accent.copy(alpha = 0.36f), accent.copy(alpha = 0.16f))),
-                CircleShape
-            ),
+            .liquidGlass(CircleShape, level = 1.10f, extraOpacity = 0.04f, reactive = false, optical = true),
         shape = CircleShape,
-        haptic = false
+        haptic = false,
+        glassBody = true
     ) {
         AnimatedContent(
             targetState = on,
             transitionSpec = {
-                (fadeIn(tween(160)) + scaleIn(initialScale = 0.55f, animationSpec = spring(dampingRatio = 0.6f, stiffness = 500f))) togetherWith
-                    (fadeOut(tween(90)) + scaleOut(targetScale = 0.55f))
+                (fadeIn(tween(150)) + scaleIn(initialScale = 0.58f, animationSpec = spring(dampingRatio = 0.62f, stiffness = 560f))) togetherWith
+                    (fadeOut(tween(85)) + scaleOut(targetScale = 0.58f))
             },
             label = "playPauseIcon"
         ) { playing ->
@@ -2364,7 +3229,9 @@ private fun PlayPauseDisc(on: Boolean, accent: Color, diameter: androidx.compose
                 if (playing) AppleIcons.Pause else AppleIcons.PlayArrow,
                 if (playing) "Pause" else "Play",
                 tint = Color.White,
-                modifier = Modifier.size(diameter * 0.46f)
+                modifier = Modifier
+                    .size(diameter * 0.44f)
+                    .padding(start = if (playing) 0.dp else 2.5.dp)
             )
         }
     }
@@ -2384,16 +3251,16 @@ private fun RotateToggleIcon(tint: Color) {
     val e = swap.value
     val s = if (landscape) -1f else 1f            // the symbol turns the same way the screen does
     fun symbol(l: Boolean) = if (l) AppleIcons.RotateToPortrait else AppleIcons.RotateToLandscape
-    Box(Modifier.size(26.dp), contentAlignment = Alignment.Center) {
+    Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
         if (e < 1f) Icon(
             symbol(prev), null, tint = tint,
-            modifier = Modifier.size(26.dp).graphicsLayer {
+            modifier = Modifier.size(22.dp).graphicsLayer {
                 rotationZ = s * 90f * e; alpha = (1f - e * 1.4f).coerceIn(0f, 1f); scaleX = 1f - 0.25f * e; scaleY = scaleX
             }
         )
         Icon(
             symbol(landscape), if (landscape) "Switch to portrait" else "Switch to landscape", tint = tint,
-            modifier = Modifier.size(26.dp).graphicsLayer {
+            modifier = Modifier.size(22.dp).graphicsLayer {
                 rotationZ = -s * 90f * (1f - e); alpha = ((e - 0.15f) / 0.85f).coerceIn(0f, 1f); scaleX = 0.75f + 0.25f * e; scaleY = scaleX
             }
         )

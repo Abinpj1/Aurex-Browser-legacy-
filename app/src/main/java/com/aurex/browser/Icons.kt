@@ -2,7 +2,6 @@ package com.aurex.browser
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.heightIn
@@ -44,7 +43,7 @@ fun SafariGlyph(
     modifier: Modifier = Modifier,
     size: Dp = 22.dp,
     tint: Color = TextPrimary,
-    strokeWidth: Dp = 1.9.dp
+    strokeWidth: Dp = 2.15.dp
 ) {
     Canvas(modifier.size(size)) {
         val s = min(this.size.width, this.size.height)
@@ -166,7 +165,7 @@ fun SafariButton(
                 CircleShape
             )
         } else {
-            Modifier.glassTile(CircleShape, 0.075f)
+            Modifier.glassTile(CircleShape, 0.13f)
         }
         GlowPress(
             onClick = onClick,
@@ -178,7 +177,7 @@ fun SafariButton(
                 glyph,
                 size = glyphSize,
                 tint = if (accent) onAccent(style.accent) else (tint ?: TextPrimary),
-                strokeWidth = if (size < 34.dp) 1.7.dp else 1.9.dp
+                strokeWidth = if (size < 34.dp) 1.95.dp else 2.2.dp
             )
         }
         if (badge != null) {
@@ -225,7 +224,7 @@ fun TabCounterButton(
     ) {
         GlowPress(
             onClick = onClick,
-            modifier = Modifier.fillMaxSize().glassTile(CircleShape, 0.075f),
+            modifier = Modifier.fillMaxSize().glassTile(CircleShape, 0.13f),
             shape = CircleShape,
             onLongClick = onLongClick
         ) {
@@ -238,7 +237,7 @@ fun TabCounterButton(
                         size = Size(0.88f * s, 0.74f * s),
                         cornerRadius = CornerRadius(0.20f * s),
                         style = Stroke(
-                            width = (if (size < 34.dp) 1.6f else 1.8f) * density,
+                            width = (if (size < 34.dp) 1.9f else 2.1f) * density,
                             cap = StrokeCap.Round,
                             join = StrokeJoin.Round
                         )
@@ -278,7 +277,6 @@ fun MenuDotsButton(
     onLongClick: (() -> Unit)? = null
 ) {
     val style = LocalGlassStyle.current
-    val top = androidx.compose.ui.graphics.lerp(style.accent, Color.White, 0.24f)
     Box(
         modifier
             .size(size)
@@ -288,30 +286,18 @@ fun MenuDotsButton(
             },
         contentAlignment = Alignment.Center
     ) {
-        // soft accent glow under the bubble
-        Box(
-            Modifier
-                .fillMaxSize()
-                .padding(1.5.dp)
-                .offset(y = 1.5.dp)
-                .background(style.accent.copy(alpha = 0.30f), CircleShape)
-        )
         GlowPress(
             onClick = onClick,
             modifier = Modifier
                 .fillMaxSize()
-                .background(Brush.verticalGradient(listOf(top, style.accent)), CircleShape)
-                .border(
-                    0.75.dp,
-                    Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.60f), Color.White.copy(alpha = 0.06f))),
-                    CircleShape
-                ),
+                .tintedGlass(CircleShape, style.accent, swell = 0.09f),
             shape = CircleShape,
-            onLongClick = onLongClick
+            onLongClick = onLongClick,
+            glassBody = true
         ) {
             Canvas(Modifier.size(size * 0.52f)) {
                 val s = this.size.minDimension
-                val r = 0.085f * s
+                val r = 0.095f * s
                 listOf(0.20f, 0.50f, 0.80f).forEach { x ->
                     drawCircle(Color.White, radius = r, center = Offset(x * s, 0.5f * s))
                 }

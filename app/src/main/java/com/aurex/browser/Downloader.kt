@@ -8,7 +8,6 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
@@ -23,7 +22,6 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -44,6 +42,8 @@ import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
+import java.nio.ByteBuffer
+import okhttp3.Call
 import java.io.File
 import java.io.RandomAccessFile
 import java.net.URI
@@ -121,6 +121,10 @@ class DlItem(
     /** Range chunks already written to disk, so retries/resumes skip them. */
     internal val completedChunks = java.util.Collections.synchronizedSet(mutableSetOf<Long>())
     internal var chunkTotal = -1L
+    /** Server ETag / Last-Modified validator captured on first probe to prevent corrupted resumes. */
+    internal var etag: String? = null
+    /** Final post-redirect CDN URL cached on first probe so parallel workers skip redundant 302 hops. */
+    @Volatile internal var resolvedUrl: String? = null
     /** Live connection count of every stream the smart engine runs (keyed by the stream's first part). */
     internal val streamConn = java.util.concurrent.ConcurrentHashMap<Int, Int>()
     internal var job: Job? = null
@@ -160,12 +164,18 @@ class DownloadManager(private val ctx: Context) {
     private var nextId = 0
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val meta = File(ctx.filesDir, "downloads.tsv")
+    private val dlPool = ConnectionPool(
+        when (PerfTier.tier) { PerfTier.TIER_LOW -> 8; PerfTier.TIER_BALANCED -> 20; else -> 48 },
+        3,
+        TimeUnit.MINUTES
+    )
     private val http = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
-            maxRequests = 96
-            maxRequestsPerHost = 96
+            val maxReq = when (PerfTier.tier) { PerfTier.TIER_LOW -> 16; PerfTier.TIER_BALANCED -> 40; else -> 80 }
+            maxRequests = maxReq
+            maxRequestsPerHost = maxReq
         })
-        .connectionPool(ConnectionPool(64, 5, TimeUnit.MINUTES))
+        .connectionPool(dlPool)
         // Parallel byte ranges get their own TCP connections. HTTP/2 multiplexing
         // funnels every part through one flow-controlled stream, which is slower
         // than true parallel HTTP/1.1 connections on most CDNs.
@@ -174,9 +184,15 @@ class DownloadManager(private val ctx: Context) {
         .followSslRedirects(true)
         .addNetworkInterceptor(CookieGuard.interceptor)
         .retryOnConnectionFailure(true)
-        .connectTimeout(20, TimeUnit.SECONDS)
+        .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(45, TimeUnit.SECONDS)
+        .build()
+
+    /** Fast-fail segment client sharing the same connection pool (dead HLS edge recycles in 15s, not 45s). */
+    private val hlsSegHttp = http.newBuilder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
         .build()
 
     init {
@@ -185,17 +201,23 @@ class DownloadManager(private val ctx: Context) {
             if (meta.exists()) {
                 val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: ctx.filesDir
                 meta.readLines().forEach { line ->
-                    val p = line.split('\t', limit = 3)
+                    val p = line.split('\t')
                     if (p.size >= 2 && p[0].isNotBlank()) {
                         val f = File(dir, p[1])
-                        if (f.exists()) {
+                        val st = p.getOrNull(3) ?: "DONE"
+                        val knd = runCatching { DlKind.valueOf(p.getOrNull(4) ?: "FILE") }.getOrDefault(DlKind.FILE)
+                        val savedTotal = p.getOrNull(5)?.toLongOrNull() ?: -1L
+                        val savedDone = p.getOrNull(6)?.toLongOrNull() ?: 0L
+                        val savedRef = p.getOrNull(7)?.takeIf { it.isNotBlank() }
+                        val hasPartial = f.exists() || File(dir, ".${f.name}.parts").exists() || File(dir, ".${f.name}.ckpt").exists()
+                        if (st == "DONE" && f.exists()) {
                             items.add(
                                 DlItem(
                                     id = nextId++,
                                     url = p[0],
-                                    ua = "",
+                                    ua = DEFAULT_UA,
                                     cookie = null,
-                                    referer = null,
+                                    referer = savedRef,
                                     mime = p.getOrNull(2)?.takeIf { it.isNotBlank() },
                                     file = f
                                 ).apply {
@@ -205,6 +227,24 @@ class DownloadManager(private val ctx: Context) {
                                     partsUsed = 1
                                     probed = true
                                     partProgress.add(1f)
+                                }
+                            )
+                        } else if (st == "PAUSED" && hasPartial && knd != DlKind.YTDLP) {
+                            items.add(
+                                DlItem(
+                                    id = nextId++,
+                                    url = p[0],
+                                    ua = DEFAULT_UA,
+                                    cookie = siteCookie(p[0]),
+                                    referer = savedRef,
+                                    mime = p.getOrNull(2)?.takeIf { it.isNotBlank() },
+                                    file = f
+                                ).apply {
+                                    kind = knd
+                                    total = savedTotal
+                                    done = savedDone.coerceAtLeast(0L)
+                                    status = DlStatus.PAUSED
+                                    probed = false
                                 }
                             )
                         }
@@ -217,7 +257,7 @@ class DownloadManager(private val ctx: Context) {
 
     /** Reads the real resolution of a finished video file (cheap, off the main thread). */
     private fun labelInBackground(d: DlItem) {
-        if (d.qualityLabel.isNotBlank() || !MediaTools.isVideoFile(d.file)) return
+        if (d.status != DlStatus.DONE || d.qualityLabel.isNotBlank() || !MediaTools.isVideoFile(d.file)) return
         scope.launch {
             val q = MediaTools.qualityOf(d.file)
             if (q.isNotBlank()) d.qualityLabel = q
@@ -226,12 +266,62 @@ class DownloadManager(private val ctx: Context) {
 
     private fun persist() {
         runCatching {
-            val done = items.filter { it.status == DlStatus.DONE && it.file.exists() }
+            val keep = items.filter {
+                (it.status == DlStatus.DONE && it.file.exists()) ||
+                    ((it.status == DlStatus.PAUSED || it.status == DlStatus.RUNNING) && it.kind != DlKind.YTDLP)
+            }
             meta.writeText(
-                done.joinToString("\n") {
-                    it.url + "\t" + it.file.name + "\t" + (it.mime ?: "")
+                keep.joinToString("\n") {
+                    val st = if (it.status == DlStatus.DONE) "DONE" else "PAUSED"
+                    listOf(
+                        it.url,
+                        it.file.name,
+                        it.mime ?: "",
+                        st,
+                        it.kind.name,
+                        it.total.toString(),
+                        it.done.toString(),
+                        it.referer ?: ""
+                    ).joinToString("\t")
                 }
             )
+        }
+    }
+
+    // ── Ghost-Downloader-3 style persistent chunk checkpoint (.ckpt sidecar) ──
+    private fun ckptFile(dest: File): File = File(dest.parentFile, ".${dest.name}.ckpt")
+
+    private fun loadCheckpoint(dest: File, total: Long, etag: String?, resume: MutableSet<Long>) {
+        val f = ckptFile(dest)
+        if (!f.exists() || !dest.exists() || dest.length() <= 0L || dest.length() > total) return
+        runCatching {
+            val lines = f.readLines()
+            if (lines.size < 2) return
+            val savedTotal = lines[0].toLongOrNull() ?: return
+            val savedTag = lines[1]
+            if (savedTotal != total) return
+            if (!etag.isNullOrBlank() && savedTag.isNotBlank() && savedTag != etag) return
+            for (i in 2 until lines.size) {
+                lines[i].toLongOrNull()?.let { resume.add(it) }
+            }
+        }
+    }
+
+    private fun saveCheckpoint(dest: File, total: Long, etag: String?, resume: Set<Long>) {
+        if (total <= 0L) return
+        runCatching {
+            val snapshot = synchronized(resume) { resume.toList() }
+            if (snapshot.isEmpty()) return
+            val tmp = File(dest.parentFile, ".${dest.name}.ckpt.tmp")
+            val sb = StringBuilder(snapshot.size * 12 + 64)
+            sb.append(total).append('\n').append(etag ?: "").append('\n')
+            for (off in snapshot) sb.append(off).append('\n')
+            tmp.writeText(sb.toString())
+            val dst = ckptFile(dest)
+            if (!tmp.renameTo(dst)) {
+                dst.writeText(sb.toString())
+                tmp.delete()
+            }
         }
     }
 
@@ -514,7 +604,7 @@ class DownloadManager(private val ctx: Context) {
                 }
             }
             // one entry per quality: the richest stream of each height
-            val list = out.groupBy { it.height }.map { (_, l) -> l.maxByOrNull { it.bandwidth }!! }
+            val list = out.groupBy { it.height }.mapNotNull { (_, l) -> l.maxByOrNull { it.bandwidth } }
                 .sortedByDescending { it.height }
             // size prediction: the duration comes from one media playlist (all qualities share it)
             val dur = list.firstOrNull()?.let { hlsDuration(it.url, ua, referer, cookie) } ?: 0.0
@@ -665,6 +755,10 @@ class DownloadManager(private val ctx: Context) {
             d.status = DlStatus.PAUSED
             d.speed = 0
             d.eta = -1
+            if (d.kind == DlKind.FILE && d.chunkTotal > 0L) {
+                saveCheckpoint(d.file, d.chunkTotal, d.etag, d.completedChunks)
+            }
+            persist()
             updateNotification()
         }
     }
@@ -683,6 +777,7 @@ class DownloadManager(private val ctx: Context) {
         }
         if (d.status != DlStatus.DONE) runCatching { d.file.delete() }
         runCatching { File(d.file.parentFile, ".${d.file.name}.parts").deleteRecursively() }
+        runCatching { ckptFile(d.file).delete() }
         items.remove(d)
         persist()
         updateNotification()
@@ -717,6 +812,7 @@ class DownloadManager(private val ctx: Context) {
         if (d.ytTag.isNotBlank()) YtDlpEngine.deleteLeftovers(d.file.parentFile, d.ytTag)
         runCatching { d.file.delete() }
         runCatching { File(d.file.parentFile, ".${d.file.name}.parts").deleteRecursively() }
+        runCatching { ckptFile(d.file).delete() }
     }
 
     fun remove(d: DlItem) {
@@ -776,12 +872,20 @@ class DownloadManager(private val ctx: Context) {
                     header("Cookie", it)
                     tag(CookieHome::class.java, CookieHome.of(url))
                 }
-                (d.frameReferer ?: d.referer)?.let { header("Referer", it) }
+                (d.frameReferer ?: d.referer)?.let { ref ->
+                    header("Referer", ref)
+                    runCatching {
+                        val u = URI(ref)
+                        if (!u.scheme.isNullOrBlank() && !u.host.isNullOrBlank()) {
+                            header("Origin", "${u.scheme}://${u.host}")
+                        }
+                    }
+                }
                 range?.let { header("Range", it) }
             }
             .build()
 
-    private fun request(d: DlItem, range: String? = null): Request = buildRequest(d, d.url, range)
+    private fun request(d: DlItem, range: String? = null): Request = buildRequest(d, d.resolvedUrl ?: d.url, range)
 
     private fun requestFor(d: DlItem, url: String, range: String? = null): Request =
         buildRequest(d, url, range)
@@ -800,21 +904,46 @@ class DownloadManager(private val ctx: Context) {
                 if (!VideoDl.enabled && (d.kind == DlKind.YTDLP || d.kind == DlKind.HLS)) {
                     throw IllegalStateException(VideoDl.OFF_HINT)
                 }
-                if (!d.probed) probe(d)
-                if (d.kind == DlKind.YTDLP) {
-                    ytdlpDownload(d)
-                } else if (d.kind == DlKind.HLS) {
-                    hlsDownload(d)
-                } else if (d.ranged && d.total >= MIN_CHUNKED_BYTES) {
+                persist()
+                var netRetry = 0
+                while (true) {
                     try {
-                        chunkedDownload(d)
-                    } catch (e: RangeUnsupportedException) {
-                        // Server advertised ranges but suddenly ignored one.
-                        singleStream(d)
+                        if (!d.probed) probe(d)
+                        if (d.kind == DlKind.YTDLP) {
+                            ytdlpDownload(d)
+                        } else if (d.kind == DlKind.HLS) {
+                            hlsDownload(d)
+                        } else if (d.ranged && d.total >= MIN_CHUNKED_BYTES) {
+                            try {
+                                chunkedDownload(d)
+                            } catch (e: RangeUnsupportedException) {
+                                singleStream(d)
+                            }
+                        } else {
+                            singleStream(d)
+                        }
+                        break
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        val transient = d.kind != DlKind.YTDLP && !isPermanentError(e.message) && (
+                            e is java.io.IOException ||
+                            e.message?.contains("timeout", true) == true ||
+                            e.message?.contains("reset", true) == true ||
+                            e.message?.contains("ended early", true) == true
+                        )
+                        if (transient && netRetry < 2) {
+                            netRetry++
+                            d.resolvedUrl = null
+                            d.statusNote = "Reconnecting ($netRetry/2)…"
+                            delay(1_100L * netRetry)
+                            d.statusNote = null
+                            continue
+                        }
+                        throw e
                     }
-                } else {
-                    singleStream(d)
                 }
+                runCatching { ckptFile(d.file).delete() }
                 d.speed = 0
                 d.eta = -1
                 d.done = if (d.total > 0) d.total else d.done
@@ -826,6 +955,7 @@ class DownloadManager(private val ctx: Context) {
                 Haptics.fire(null, Hx.SUCCESS)
                 persist()
                 MediaVisibility.onFinished(ctx, d.file)
+                runCatching { DownloadService.notifyFinished(ctx, d) }
                 if (d.qualityLabel.isBlank() || d.kind == DlKind.YTDLP) {
                     MediaTools.qualityOf(d.file).takeIf { it.isNotBlank() }?.let { d.qualityLabel = it }
                 }
@@ -840,6 +970,9 @@ class DownloadManager(private val ctx: Context) {
                 Haptics.fire(null, Hx.ERROR)
                 d.error = e.message ?: "Download failed"
                 AppLog.warn("Download", "FAILED id=${d.id} kind=${d.kind} ${AppLog.url(d.url)}: ${d.error}")
+                val willAutoFallback = VideoDl.enabled && d.kind != DlKind.YTDLP && !d.universalTried &&
+                    isPermanentError(d.error) && d.referer?.startsWith("http", true) == true && YtDlpEngine.canTry(d.referer)
+                if (!willAutoFallback) runCatching { DownloadService.notifyFailed(ctx, d) }
                 // A refused link or an error page will never turn into the file,
                 // so the stub is removed instead of pretending to be a download.
                 if (isPermanentError(d.error)) {
@@ -878,11 +1011,11 @@ class DownloadManager(private val ctx: Context) {
         // YouTube changes faster than anything else: the start-up check for a newer yt-dlp gets a
         // bounded chance to finish first, so the very first download does not run on a stale engine.
         AppLog.info("Download", "video start id=${d.id} ${AppLog.url(d.url)} quality=${d.ytQuality} height=${d.ytHeight}")
-        if (YtDlpEngine.isYoutubeUrl(d.url)) YtDlpEngine.awaitWarm(20_000L)
+        if (YtDlpEngine.isYoutubeUrl(d.url)) YtDlpEngine.awaitWarm(2_500L)
 
-        // FAST PATH: real stream links (looked up once, usually already prefetched while the video
-        // was playing) fetched with many parallel range connections and joined natively.
-        if (!d.ytQuality.audio && YtDlpEngine.isItemUrl(d.url)) {
+        // GHOST-DOWNLOADER-3 FAST PATH: works for ALL supported websites (YouTube, social, streaming,
+        // direct video, HLS, and M4A audio!) — fetches with parallel dynamic-split ranges & native muxing.
+        if (d.ytQuality != YtQuality.MP3 && (YtDlpEngine.isQualitySite(d.url) || YtDlpEngine.peekCached(d.url) != null)) {
             if (fastDownload(d, dir)) return@withContext
         }
 
@@ -1114,7 +1247,9 @@ class DownloadManager(private val ctx: Context) {
         resume: MutableSet<Long>?,
         retries: Int
     ) = withContext(Dispatchers.IO) {
-        val wanted = (total / PART_TARGET_BYTES).toInt().coerceIn(MIN_PARTS, MAX_PARTS)
+        if (resume != null) loadCheckpoint(dest, total, d.etag, resume)
+        val maxPartsTier = when (PerfTier.tier) { PerfTier.TIER_LOW -> 16; PerfTier.TIER_BALANCED -> 32; else -> MAX_PARTS }
+        val wanted = (total / PART_TARGET_BYTES).toInt().coerceIn(MIN_PARTS, maxPartsTier)
         val size = ((total + wanted - 1) / wanted).coerceIn(MIN_PART_BYTES, maxPart)
         val plan = ArrayList<RPlan>()
         var c = 0L
@@ -1137,56 +1272,143 @@ class DownloadManager(private val ctx: Context) {
         }
         counter.addAndGet(already)
         d.done = counter.get().coerceAtMost(d.total)
-        RandomAccessFile(dest, "rw").use { it.setLength(total) }
+        // ZERO-DELAY START: never call setLength(total) upfront (on Android FUSE that zero-fills 1-5 GB files
+        // and stalls download start for 3-8s!). FileChannel positional pwrite grows the file sparsely at 0ms!
+        if (!dest.exists()) runCatching { dest.createNewFile() }
 
         val pending = AtomicInteger(queue.size)
-        // Instagram / Meta CDN: two connections at most, however fast the link is (the same IP carries the
-        // logged-in account; 16 parallel range requests to Meta's servers is not what a viewer looks like).
-        val connCap = if (isHandsOffHost(d.url)) 2 else SMART_MAX_CONN
-        val maxConn = min(connCap, queue.size.coerceAtLeast(1))
-        val target = AtomicInteger(min(SMART_START_CONN, maxConn))
+        // Hands-off hosts (Instagram/Meta): max 2 connections; all other hosts hit full speed immediately!
+        val tierConn = when (PerfTier.tier) { PerfTier.TIER_LOW -> 4; PerfTier.TIER_BALANCED -> 10; else -> SMART_MAX_CONN }
+        val bigFile = total >= 25L * 1024L * 1024L
+        val startConn = when (PerfTier.tier) {
+            PerfTier.TIER_LOW -> 2
+            PerfTier.TIER_BALANCED -> if (bigFile) 6 else 4
+            else -> if (bigFile) 8 else 6
+        }
+        val connCap = if (isHandsOffHost(d.url)) 2 else tierConn
+        val maxConn = min(connCap, (queue.size + 4).coerceAtLeast(1))
+        val target = AtomicInteger(min(startConn, maxConn))
         val ceiling = AtomicInteger(maxConn)
         val throttled = java.util.concurrent.atomic.AtomicBoolean(false)
         val active = ConcurrentHashMap.newKeySet<Int>()
+        val lastCkptAt = AtomicLong(System.currentTimeMillis())
         fun publish() { d.streamConn[base] = target.get(); d.partsUsed = d.streamConn.values.sum().coerceAtLeast(1) }
 
-        suspend fun fetchPart(raf: RandomAccessFile, ch: RPlan, id: Int) {
+        // Ghost-Downloader-3 live chunk: tracks dynamic tail bounds, active socket, stall timer & worker speed (for ETA-weighted splitting!)
+        class LiveChunk(
+            val index: Int,
+            val start: Long,
+            val cursor: AtomicLong,
+            val end: AtomicLong,
+            val isStolen: Boolean = false
+        ) {
+            @Volatile var activeCall: Call? = null
+            val startedAt = System.currentTimeMillis()
+            val lastByteAt = AtomicLong(startedAt)
+            val bytesRead = AtomicLong(0L)
+            fun speedBps(now: Long): Long {
+                val dt = (now - startedAt).coerceAtLeast(350L)
+                return (bytesRead.get() * 1000L / dt).coerceAtLeast(64L * 1024L)
+            }
+        }
+        val inflight = ConcurrentHashMap<Int, LiveChunk>()
+        val splitMinBytes = 384L * 1024L
+
+        fun tryStealTail(): LiveChunk? {
+            if (isHandsOffHost(d.url) || throttled.get()) return null
+            val now = System.currentTimeMillis()
+            var best: LiveChunk? = null
+            var bestEtaMs = -1L
+            for (lc in inflight.values) {
+                val rem = lc.end.get() - lc.cursor.get() + 1L
+                if (rem >= splitMinBytes * 2L) {
+                    // Ghost-Downloader-3 core heuristic: always split the chunk with the LONGEST remaining ETA!
+                    val etaMs = rem * 1000L / lc.speedBps(now)
+                    if (etaMs > bestEtaMs) {
+                        bestEtaMs = etaMs
+                        best = lc
+                    }
+                }
+            }
+            val victim = best ?: return null
+            synchronized(victim) {
+                val cur = victim.cursor.get()
+                val curEnd = victim.end.get()
+                val rem = curEnd - cur + 1L
+                if (rem < splitMinBytes * 2L) return null
+                val mid = cur + rem / 2L
+                victim.end.set(mid - 1L)
+                pending.incrementAndGet()
+                return LiveChunk(victim.index, mid, AtomicLong(mid), AtomicLong(curEnd), isStolen = true)
+            }
+        }
+
+        suspend fun fetchLiveChunk(raf: RandomAccessFile, lc: LiveChunk, id: Int) {
+            val ch = raf.channel
+            val bufBytes = when (PerfTier.tier) {
+                PerfTier.TIER_LOW -> 64 * 1024
+                PerfTier.TIER_BALANCED -> 128 * 1024
+                else -> 256 * 1024
+            }
+            val buf = ByteArray(bufBytes)
             var attempt = 0
-            val length = ch.end - ch.start + 1
             while (true) {
-                var got = 0L
+                val reqStart = lc.cursor.get()
+                val reqEnd = lc.end.get()
+                if (reqStart > reqEnd) return
+                lc.lastByteAt.set(System.currentTimeMillis())
+                val call = http.newCall(makeRequest("bytes=$reqStart-$reqEnd"))
+                lc.activeCall = call
                 try {
-                    http.newCall(makeRequest("bytes=${ch.start}-${ch.end}")).execute().use { r ->
+                    call.execute().use { r ->
                         if (r.code == 200) throw RangeUnsupportedException()
                         if (r.code != 206) throw IllegalStateException("Server refused range (${r.code})")
                         val body = r.body ?: throw IllegalStateException("Empty response")
-                        raf.seek(ch.start)
                         body.byteStream().use { input ->
-                            val buf = ByteArray(128 * 1024)
-                            var left = length
-                            while (left > 0) {
+                            while (true) {
                                 currentCoroutineContext().ensureActive()
-                                val k = input.read(buf, 0, min(buf.size.toLong(), left).toInt())
-                                if (k < 0) throw IllegalStateException("Connection ended early")
-                                raf.write(buf, 0, k)
-                                left -= k; got += k
-                                partDone.addAndGet(ch.index, k.toLong())
-                                d.done = counter.addAndGet(k.toLong()).coerceAtMost(d.total)
+                                val curPos = lc.cursor.get()
+                                val dynamicEnd = lc.end.get()
+                                val remaining = dynamicEnd - curPos + 1L
+                                if (remaining <= 0L) break
+                                val toRead = min(buf.size.toLong(), remaining).toInt()
+                                val k = input.read(buf, 0, toRead)
+                                if (k < 0) {
+                                    if (lc.cursor.get() > lc.end.get()) break
+                                    throw IllegalStateException("Connection ended early")
+                                }
+                                lc.lastByteAt.set(System.currentTimeMillis())
+                                val allowed = min(k.toLong(), (lc.end.get() - lc.cursor.get() + 1L).coerceAtLeast(0L)).toInt()
+                                if (allowed <= 0) break
+                                // Positional FileChannel write (atomic pwrite: zero extra lseek syscall!)
+                                val bb = ByteBuffer.wrap(buf, 0, allowed)
+                                var writeOff = curPos
+                                while (bb.hasRemaining()) {
+                                    val w = ch.write(bb, writeOff)
+                                    if (w <= 0) break
+                                    writeOff += w
+                                }
+                                lc.cursor.addAndGet(allowed.toLong())
+                                lc.bytesRead.addAndGet(allowed.toLong())
+                                partDone.addAndGet(lc.index, allowed.toLong())
+                                d.done = counter.addAndGet(allowed.toLong()).coerceAtMost(d.total)
+                                if (allowed < k) break
                             }
                         }
                     }
                     return
                 } catch (e: CancellationException) {
+                    call.cancel()
                     throw e
                 } catch (e: RangeUnsupportedException) {
                     throw e
                 } catch (e: Exception) {
-                    // the bytes of a failed attempt are taken back, the retry counts them again
-                    counter.addAndGet(-got); partDone.addAndGet(ch.index, -got)
                     val msg = e.message.orEmpty()
+                    // If a cached redirect edge URL expired (403/410), clear it so retries use the original URL!
+                    if ((msg.contains("(403") || msg.contains("(410")) && d.resolvedUrl != null) {
+                        d.resolvedUrl = null
+                    }
                     val limited = msg.contains("(429") || msg.contains("(503")
-                    // An extra connection that the site pushes back on (429 / 503 / 403 ...) is not a failed
-                    // download: it retires, its part goes back to the queue and the others carry on.
                     if (limited && id > 0) throw ConnLimitException()
                     if (limited) throttled.set(true)
                     else if (msg.contains("(4") && !msg.contains("(408")) {
@@ -1196,10 +1418,13 @@ class DownloadManager(private val ctx: Context) {
                     }
                     attempt++
                     if (attempt > retries) {
-                        if (id > 0) throw ConnLimitException()   // this many connections do not work here: use fewer
+                        if (id > 0) throw ConnLimitException()
                         throw e
                     }
-                    delay(350L * attempt)
+                    val backoff = min(2_500L, 260L * (1L shl (attempt - 1).coerceAtMost(4)))
+                    delay(backoff + (id * 37L % 150L))
+                } finally {
+                    lc.activeCall = null
                 }
             }
         }
@@ -1212,18 +1437,40 @@ class DownloadManager(private val ctx: Context) {
                         RandomAccessFile(dest, "rw").use { raf ->
                             while (true) {
                                 currentCoroutineContext().ensureActive()
-                                if (id >= target.get()) break          // the tuner stepped back: this connection retires
-                                val ch = queue.poll() ?: break
+                                if (id >= target.get()) break
+                                val polled = queue.poll()
+                                val lc = if (polled != null) {
+                                    LiveChunk(polled.index, polled.start, AtomicLong(polled.start), AtomicLong(polled.end))
+                                } else {
+                                    tryStealTail() ?: break
+                                }
+                                inflight[id] = lc
                                 try {
-                                    fetchPart(raf, ch, id)
+                                    fetchLiveChunk(raf, lc, id)
                                 } catch (e: ConnLimitException) {
-                                    queue.add(ch)                       // another connection takes this part
+                                    inflight.remove(id)
+                                    val remStart = lc.cursor.get()
+                                    val remEnd = lc.end.get()
+                                    if (remStart <= remEnd) {
+                                        queue.add(RPlan(lc.index, remStart, remEnd))
+                                    } else {
+                                        pending.decrementAndGet()
+                                    }
                                     ceiling.updateAndGet { v -> min(v, id) }
                                     target.updateAndGet { v -> min(v, id) }
                                     publish()
-                                    break                               // connections 0 until id keep working
+                                    break
+                                } finally {
+                                    inflight.remove(id)
                                 }
-                                resume?.add(ch.start)
+                                if (resume != null && !lc.isStolen && partDone.get(lc.index) >= (plan[lc.index].end - plan[lc.index].start + 1L)) {
+                                    resume.add(plan[lc.index].start)
+                                    val now = System.currentTimeMillis()
+                                    if (now - lastCkptAt.get() > 2_500L) {
+                                        lastCkptAt.set(now)
+                                        saveCheckpoint(dest, total, d.etag, resume)
+                                    }
+                                }
                                 pending.decrementAndGet()
                             }
                         }
@@ -1233,7 +1480,7 @@ class DownloadManager(private val ctx: Context) {
             publish()
             for (id in 0 until target.get()) spawn(id)
 
-            // Tuner: hill-climbs the connection count from the measured speed.
+            // Adaptive hill-climbing connection tuner + Stall-Watchdog (kills >4.5s hung sockets immediately!)
             launch {
                 var prevBytes = counter.get()
                 var prevSpeed = 0L
@@ -1241,8 +1488,17 @@ class DownloadManager(private val ctx: Context) {
                 var lastAdded = 0
                 var tick = 0
                 while (pending.get() > 0) {
-                    delay(1000)
+                    delay(650)
                     tick++
+                    val nowMs = System.currentTimeMillis()
+                    // Recycle any stalled socket (>4.5s with zero bytes) so a dead CDN edge never hangs a download!
+                    for (lc in inflight.values) {
+                        val rem = lc.end.get() - lc.cursor.get() + 1L
+                        if (rem > 0L && nowMs - lc.lastByteAt.get() > 3_500L) {
+                            lc.lastByteAt.set(nowMs)
+                            runCatching { lc.activeCall?.cancel() }
+                        }
+                    }
                     val nowBytes = counter.get()
                     val speed = (nowBytes - prevBytes).coerceAtLeast(0)
                     prevBytes = nowBytes
@@ -1252,10 +1508,10 @@ class DownloadManager(private val ctx: Context) {
                         ceiling.set(nt); target.set(nt); climbing = false; lastAdded = 0; publish()
                         prevSpeed = speed; continue
                     }
-                    if (queue.size < 2) { prevSpeed = speed; continue }   // tail of the file: nothing left to share out
+                    if (queue.isEmpty() && inflight.size < 2) { prevSpeed = speed; continue }
                     val cap = min(ceiling.get(), maxConn)
                     if (climbing) {
-                        if (prevSpeed == 0L || speed >= prevSpeed * 1.10) {
+                        if (prevSpeed == 0L || speed >= prevSpeed * 1.06) {
                             if (t < cap) {
                                 val nt = min(cap, t + if (t < 8) 2 else 1)
                                 lastAdded = nt - t
@@ -1264,12 +1520,11 @@ class DownloadManager(private val ctx: Context) {
                                 publish()
                             } else climbing = false
                         } else {
-                            // more connections stopped helping: take back what was added last and settle
-                            if (lastAdded > 0 && speed < prevSpeed * 0.92) target.set((t - lastAdded).coerceAtLeast(1))
+                            if (lastAdded > 0 && speed < prevSpeed * 0.90) target.set((t - lastAdded).coerceAtLeast(1))
                             climbing = false; lastAdded = 0; publish()
                         }
-                    } else if (tick % 8 == 0 && t < cap) {
-                        climbing = true                                   // network may have changed: probe again
+                    } else if (tick % 6 == 0 && t < cap) {
+                        climbing = true
                     }
                     prevSpeed = speed
                 }
@@ -1285,7 +1540,7 @@ class DownloadManager(private val ctx: Context) {
                         if (idx < d.partProgress.size && kotlin.math.abs(d.partProgress[idx] - f) >= 0.01f) d.partProgress[idx] = f
                     }
                 }
-                while (pending.get() > 0) { sync(); delay(400) }
+                while (pending.get() > 0) { sync(); delay(350) }
                 sync()
             }
         }
@@ -1310,6 +1565,52 @@ class DownloadManager(private val ctx: Context) {
             AppLog.warn("Fast", "lookup failed ${AppLog.url(d.url)}: ${e.message?.take(500)}")
             return false
         }
+
+        val title = (d.pageTitle?.takeIf { it.isNotBlank() }
+            ?: stripMediaExt(cleanTitle(media.title))).ifBlank { "video" }
+
+        // ── FAST PATH A: Direct M4A audio via Ghost-Downloader-3 parallel ranges (1-sec downloads!) ──
+        if (d.ytQuality == YtQuality.M4A) {
+            val aUrl = media.directM4aUrl ?: return false
+            val aHdrs = media.directM4aHeaders
+            val aUa = aHdrs["User-Agent"] ?: media.userAgent ?: d.ua
+            val aTotal = if (media.directM4aExactBytes > 0L) media.directM4aExactBytes else withContext(Dispatchers.IO) { probeSize(aUrl, aHdrs, aUa) }
+            if (aTotal <= 0L) return false
+            val out = uniqueFile(dir, "$title.m4a")
+            val tmp = File(dir, ".${out.name}.a.tmp")
+            return try {
+                d.displayName = title
+                d.qualityLabel = "M4A"
+                d.total = aTotal
+                d.done = 0
+                d.pct = -1f
+                d.partProgress.clear(); d.streamConn.clear(); d.partsUsed = 1
+                val counter = AtomicLong(0L)
+                val maxPart = if (aUrl.contains("googlevideo.com", true)) 3L * 1024 * 1024 else 16L * 1024 * 1024
+                smartFetch(d, tmp, aTotal, counter, { r -> rangeRequest(aUrl, aHdrs, aUa, r) }, maxPart, null, 3)
+                if (!tmp.renameTo(out)) tmp.copyTo(out, overwrite = false)
+                d.file = out
+                d.displayName = null
+                d.mime = "audio/mp4"
+                d.total = out.length()
+                d.done = d.total
+                d.pct = 1f
+                true
+            } catch (e: CancellationException) {
+                runCatching { out.delete() }
+                throw e
+            } catch (e: Throwable) {
+                runCatching { out.delete() }
+                d.done = 0; d.total = -1L; d.pct = 0f
+                d.partProgress.clear(); d.streamConn.clear(); d.partsUsed = 1
+                false
+            } finally {
+                runCatching { tmp.delete() }
+            }
+        }
+
+        if (d.ytQuality.audio) return false
+
         val target = when {
             d.ytHeight > 0 -> MediaTools.plainHeight(d.ytHeight)
             d.ytQuality == YtQuality.P1080 -> 1080
@@ -1319,38 +1620,103 @@ class DownloadManager(private val ctx: Context) {
         }
         val fastOk: (YtDlpEngine.StreamChoice) -> Boolean = { it.mp4Safe || (it.webmSafe && !webmMuxBroken) }
         val choice = if (target == Int.MAX_VALUE) {
-            val top = media.choices.filter { !it.hls }.maxByOrNull { it.height }
-            val fast = media.choices.filter(fastOk).maxByOrNull { it.height }
-            // a sharper stream exists that the native joiner cannot write: the full engine takes the best one
-            if (fast != null && top != null && top.height > fast.height) null else fast
+            val top = media.choices.filter { !it.hls }.maxByOrNull { DeviceCaps.tier(it) }
+            val fast = media.choices.filter(fastOk).maxByOrNull { DeviceCaps.tier(it) }
+            if (fast != null && top != null && DeviceCaps.tier(top) > DeviceCaps.tier(fast)) null else fast
         } else {
-            media.choices.filter { !it.hls && it.height <= target }.maxByOrNull { it.height }
+            media.choices.filter { !it.hls && DeviceCaps.tier(it) in 1..target }.maxByOrNull { DeviceCaps.tier(it) }
         }
-        if (choice == null || !fastOk(choice)) return false
+
+        // ── FAST PATH B: Native 16-Worker HLS Engine + TS->MP4 Remux for HLS-only sites! ──
+        if (choice == null || !fastOk(choice)) {
+            val hlsChoice = if (target == Int.MAX_VALUE) {
+                media.choices.filter { it.hls && it.video.startsWith("http", true) }.maxByOrNull { DeviceCaps.tier(it) }
+            } else {
+                media.choices.filter { it.hls && it.video.startsWith("http", true) && DeviceCaps.tier(it) in 1..target }.maxByOrNull { DeviceCaps.tier(it) }
+                    ?: media.choices.filter { it.hls && it.video.startsWith("http", true) }.maxByOrNull { DeviceCaps.tier(it) }
+            }
+            if (hlsChoice != null && !YtDlpEngine.isYoutubeUrl(d.url)) {
+                val outTs = uniqueFile(dir, "$title.ts")
+                val hlsUa = hlsChoice.vHeaders["User-Agent"] ?: media.userAgent ?: d.ua
+                val hlsRef = hlsChoice.vHeaders["Referer"] ?: d.url
+                val prevFile = d.file
+                val prevKind = d.kind
+                return try {
+                    val proxy = DlItem(d.id, hlsChoice.video, hlsUa, d.cookie, hlsRef, "video/mp2t", outTs).apply {
+                        pageTitle = title
+                        ytHeight = d.ytHeight
+                        qualityLabel = if (hlsChoice.height > 0) MediaTools.labelForHeight(DeviceCaps.tier(hlsChoice)) else d.qualityLabel
+                    }
+                    d.displayName = title
+                    if (proxy.qualityLabel.isNotBlank()) d.qualityLabel = proxy.qualityLabel
+                    // Mirror live HLS progress straight onto the user's visible Download card
+                    coroutineScope {
+                        val syncer = launch {
+                            while (isActive) {
+                                d.done = proxy.done
+                                d.segmentDone = proxy.segmentDone
+                                d.segmentTotal = proxy.segmentTotal
+                                d.partsUsed = proxy.partsUsed
+                                d.statusNote = proxy.statusNote
+                                if (proxy.segmentTotal > 0) d.pct = (proxy.segmentDone.toFloat() / proxy.segmentTotal).coerceIn(0f, 0.99f)
+                                delay(220)
+                            }
+                        }
+                        try {
+                            hlsDownload(proxy)
+                        } finally {
+                            syncer.cancel()
+                        }
+                    }
+                    d.file = proxy.file
+                    d.displayName = null
+                    d.statusNote = null
+                    d.mime = proxy.mime ?: "video/mp4"
+                    d.total = proxy.file.length()
+                    d.done = d.total
+                    d.pct = 1f
+                    true
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    AppLog.warn("FastHLS", "native HLS fallback ${AppLog.url(d.url)}: ${e.message?.take(220)}")
+                    runCatching { outTs.delete() }
+                    runCatching { File(dir, ".${outTs.name}.parts").deleteRecursively() }
+                    d.file = prevFile
+                    d.kind = prevKind
+                    d.done = 0; d.total = -1L; d.pct = 0f; d.segmentDone = 0; d.segmentTotal = 0; d.statusNote = null
+                    d.partProgress.clear(); d.streamConn.clear(); d.partsUsed = 1
+                    false
+                }
+            }
+            return false
+        }
+
+        // ── FAST PATH C: Ghost-Downloader-3 Parallel Range Video (+ Audio) + Hardware Remux ──
         val webm = !choice.mp4Safe
         val outExt = if (webm) "webm" else "mp4"
-
         val ua = choice.vHeaders["User-Agent"] ?: media.userAgent ?: d.ua
-        val title = (d.pageTitle?.takeIf { it.isNotBlank() }
-            ?: stripMediaExt(cleanTitle(media.title))).ifBlank { "video" }
-        var out = File(dir, "$title.$outExt")
-        var n = 1
-        while (out.exists()) { out = File(dir, "$title($n).$outExt"); n++ }
+        val out = uniqueFile(dir, "$title.$outExt")
         val vTmp = File(dir, ".${out.name}.v.tmp")
         val aTmp = File(dir, ".${out.name}.a.tmp")
         try {
-            // video and audio sizes are asked at the same time (was one after the other)
             val (vTotal, aTotal) = coroutineScope {
-                val v = async(Dispatchers.IO) { probeSize(choice.video, choice.vHeaders, ua) }
+                val v = async(Dispatchers.IO) {
+                    if (choice.vExactBytes > 0L) choice.vExactBytes else probeSize(choice.video, choice.vHeaders, ua)
+                }
                 val a = async(Dispatchers.IO) {
-                    if (choice.audio != null) probeSize(choice.audio, choice.aHeaders, ua) else 0L
+                    when {
+                        choice.audio == null -> 0L
+                        choice.aExactBytes > 0L -> choice.aExactBytes
+                        else -> probeSize(choice.audio, choice.aHeaders, ua)
+                    }
                 }
                 v.await() to a.await()
             }
             if (vTotal <= 0 || (choice.audio != null && aTotal <= 0)) return false
 
             d.displayName = title
-            d.qualityLabel = MediaTools.labelForHeight(choice.height)
+            d.qualityLabel = MediaTools.labelForHeight(DeviceCaps.tier(choice))
             d.total = vTotal + aTotal
             d.done = 0
             d.pct = -1f
@@ -1359,12 +1725,11 @@ class DownloadManager(private val ctx: Context) {
             fun maxPartFor(u: String) = if (u.contains("googlevideo.com", true)) 3L * 1024 * 1024 else 24L * 1024 * 1024
             coroutineScope {
                 val a = launch {
-                    smartFetch(d, vTmp, vTotal, counter, { r -> rangeRequest(choice.video, choice.vHeaders, d.ua, r) }, maxPartFor(choice.video), null, 3)
+                    smartFetch(d, vTmp, vTotal, counter, { r -> rangeRequest(choice.video, choice.vHeaders, ua, r) }, maxPartFor(choice.video), null, 3)
                 }
                 val b = if (choice.audio != null) launch {
-                    smartFetch(d, aTmp, aTotal, counter, { r -> rangeRequest(choice.audio, choice.aHeaders, d.ua, r) }, maxPartFor(choice.audio), null, 3)
+                    smartFetch(d, aTmp, aTotal, counter, { r -> rangeRequest(choice.audio, choice.aHeaders, ua, r) }, maxPartFor(choice.audio), null, 3)
                 } else null
-                // one smooth bar: download fills 0-90%, joining fills the rest
                 val ticker = launch {
                     while (true) {
                         if (d.total > 0) d.pct = (d.done.toFloat() / d.total).coerceIn(0f, 1f) * 0.9f
@@ -1400,7 +1765,6 @@ class DownloadManager(private val ctx: Context) {
             runCatching { out.delete() }
             throw e
         } catch (e: Throwable) {
-            // anything unexpected: the full engine takes over
             AppLog.warn("Fast", "fast path failed ${AppLog.url(d.url)}: ${e.javaClass.simpleName} ${e.message?.take(300)}")
             runCatching { out.delete() }
             d.done = 0; d.total = -1L; d.pct = 0f
@@ -1461,6 +1825,19 @@ class DownloadManager(private val ctx: Context) {
                         val e = if (sniffed != null && sniffed != "zip") sniffed else fromServer ?: sniffed
                         if (e != null) d.file = uniqueFile(d.file.parentFile, withExt(d.file.name, e))
                     }
+                    val tag = r.header("ETag")?.takeIf { it.isNotBlank() } ?: r.header("Last-Modified")?.takeIf { it.isNotBlank() }
+                    if (tag != null) {
+                        if (d.etag != null && d.etag != tag) {
+                            d.completedChunks.clear()
+                            runCatching { d.file.delete() }
+                        }
+                        d.etag = tag
+                    }
+                    // Cache post-redirect CDN URL so parallel workers skip redundant 302 redirect hops!
+                    val finalUrl = r.request.url.toString()
+                    if (finalUrl != d.url && (finalUrl.startsWith("https://", true) || finalUrl.startsWith("http://", true))) {
+                        d.resolvedUrl = finalUrl
+                    }
                     if (r.code == 206) {
                         d.ranged = true
                         d.total = r.header("Content-Range")?.substringAfterLast('/')?.toLongOrNull() ?: -1L
@@ -1470,6 +1847,15 @@ class DownloadManager(private val ctx: Context) {
                     } else {
                         d.ranged = false
                         d.total = -1L
+                        if (r.code == 416 || r.code == 405 || r.code == 501) {
+                            runCatching {
+                                http.newCall(request(d).newBuilder().head().build()).execute().use { hr ->
+                                    val ht = hr.header("Content-Type").orEmpty().lowercase()
+                                    if (ht.contains("mpegurl")) d.kind = DlKind.HLS
+                                    else d.total = hr.header("Content-Length")?.toLongOrNull() ?: -1L
+                                }
+                            }
+                        }
                     }
                 }
                 break
@@ -1553,10 +1939,11 @@ class DownloadManager(private val ctx: Context) {
                         ?: sniffBytes(head, headLen)
                     if (e != null) d.file = uniqueFile(d.file.parentFile, withExt(d.file.name, e))
                 }
-                d.file.outputStream().buffered(128 * 1024).use { out ->
+                val ioBuf = if (PerfTier.low) 64 * 1024 else 128 * 1024
+                d.file.outputStream().buffered(ioBuf).use { out ->
                     out.write(head, 0, headLen)
                     d.done = headLen.toLong()
-                    val buf = ByteArray(128 * 1024)
+                    val buf = ByteArray(ioBuf)
                     while (true) {
                         currentCoroutineContext().ensureActive()
                         val n = input.read(buf)
@@ -1627,28 +2014,56 @@ class DownloadManager(private val ctx: Context) {
         var playlistUrl = d.url
         var text = fetchText(d, playlistUrl)
 
-        // Master playlist: pick the highest-bandwidth variant.
+        // Master playlist: pick the highest-bandwidth variant AND detect separate #EXT-X-MEDIA:TYPE=AUDIO rendition!
+        var audioPlaylistUrl: String? = null
         if (text.contains("#EXT-X-STREAM-INF")) {
             val lines = text.lines()
-            var bestBw = -1L
-            var bestUrl: String? = null
-            lines.forEachIndexed { i, line ->
-                if (line.trim().startsWith("#EXT-X-STREAM-INF")) {
-                    val bw = HLS_BANDWIDTH_RE.find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                    val avg = HLS_AVG_BANDWIDTH_RE.find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                    val next = lines.drop(i + 1).firstOrNull { it.isNotBlank() && !it.trim().startsWith("#") }
-                    if (next != null && bw >= bestBw) {
-                        bestBw = bw
-                        bestUrl = resolve(playlistUrl, next.trim())
-                        HLS_RESOLUTION_RE.find(line)?.let { m ->
-                            val q = MediaTools.qualityLabel(
-                                m.groupValues[1].toIntOrNull() ?: 0, m.groupValues[2].toIntOrNull() ?: 0
-                            )
-                            if (q.isNotBlank() && d.qualityLabel.isBlank()) d.qualityLabel = q
+            val audioGroups = HashMap<String, String>()
+            var fallbackAudioUrl: String? = null
+            for (raw in lines) {
+                val l = raw.trim()
+                if (l.startsWith("#EXT-X-MEDIA:")) {
+                    val attrs = parseAttrs(l.substringAfter(':'))
+                    if (attrs["TYPE"].equals("AUDIO", true)) {
+                        val u = attrs["URI"]?.takeIf { it.isNotBlank() }?.let { resolve(playlistUrl, it) }
+                        val grp = attrs["GROUP-ID"]?.takeIf { it.isNotBlank() }
+                        val isDefault = attrs["DEFAULT"].equals("YES", true)
+                        if (u != null) {
+                            if (fallbackAudioUrl == null || isDefault) fallbackAudioUrl = u
+                            if (grp != null && (!audioGroups.containsKey(grp) || isDefault)) {
+                                audioGroups[grp] = u
+                            }
                         }
                     }
                 }
             }
+            val wantH = MediaTools.plainHeight(d.ytHeight)
+            class MasterVar(val url: String, val bw: Long, val w: Int, val h: Int, val audioGroup: String?)
+            val vars = ArrayList<MasterVar>()
+            lines.forEachIndexed { i, line ->
+                if (line.trim().startsWith("#EXT-X-STREAM-INF")) {
+                    val bw = HLS_BANDWIDTH_RE.find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                    val next = lines.drop(i + 1).firstOrNull { it.isNotBlank() && !it.trim().startsWith("#") }
+                    val res = HLS_RESOLUTION_RE.find(line)
+                    val vw = res?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    val vh = res?.groupValues?.get(2)?.toIntOrNull() ?: 0
+                    val aGrp = parseAttrs(line.substringAfter(':'))["AUDIO"]
+                    if (next != null) vars.add(MasterVar(resolve(playlistUrl, next.trim()), bw, vw, vh, aGrp))
+                }
+            }
+            val chosen = if (wantH > 0) {
+                vars.filter { it.h in 1..wantH }.maxWithOrNull(compareBy<MasterVar> { it.h }.thenBy { it.bw })
+                    ?: vars.maxWithOrNull(compareBy<MasterVar> { it.h }.thenBy { it.bw })
+            } else {
+                vars.maxWithOrNull(compareBy<MasterVar> { it.h }.thenBy { it.bw })
+            }
+            val bestUrl = chosen?.url
+            val bestAudioGroup = chosen?.audioGroup
+            if (chosen != null && chosen.w > 0 && chosen.h > 0 && d.qualityLabel.isBlank()) {
+                val q = MediaTools.qualityLabel(chosen.w, chosen.h)
+                if (q.isNotBlank()) d.qualityLabel = q
+            }
+            audioPlaylistUrl = bestAudioGroup?.let { audioGroups[it] } ?: if (bestAudioGroup != null) fallbackAudioUrl else null
             playlistUrl = bestUrl ?: throw IllegalStateException("No HLS variant found")
             text = fetchText(d, playlistUrl)
         }
@@ -1711,6 +2126,10 @@ class DownloadManager(private val ctx: Context) {
             }
         }
         if (segments.isEmpty()) throw IllegalStateException("No media segments found in playlist")
+        val isVod = text.contains("#EXT-X-ENDLIST") || text.contains("PLAYLIST-TYPE:VOD", true)
+        if (!isVod && segments.size < 16) {
+            throw IllegalStateException("Live streams can't be saved as a file while broadcasting")
+        }
 
         // fMP4 streams (init map) are valid as .mp4 once concatenated; MPEG-TS stays .ts.
         if (initUrl != null && d.file.extension.equals("ts", true)) {
@@ -1726,7 +2145,8 @@ class DownloadManager(private val ctx: Context) {
         }
 
         val keyCache = ConcurrentHashMap<String, ByteArray>()
-        val n = min(HLS_WORKERS, segments.size).coerceAtLeast(1)
+        val hlsCap = when (PerfTier.tier) { PerfTier.TIER_LOW -> 4; PerfTier.TIER_BALANCED -> 8; else -> HLS_WORKERS }
+        val n = min(hlsCap, segments.size).coerceAtLeast(1)
         d.partsUsed = n
         d.kind = DlKind.HLS
         d.segmentTotal = segments.size
@@ -1790,13 +2210,120 @@ class DownloadManager(private val ctx: Context) {
             }.joinAll()
         }
 
-        d.file.outputStream().buffered(512 * 1024).use { out ->
+        // If the master playlist specified a separate HLS audio rendition, fetch and mux it seamlessly!
+        val audioFile: File? = audioPlaylistUrl?.let { aUrl ->
+            runCatching {
+                d.statusNote = "Downloading audio track…"
+                val aText = fetchText(d, aUrl)
+                val aSegs = mutableListOf<HlsSeg>()
+                var aInitUrl: String? = null; var aInitRange: String? = null
+                var aKeyUri: String? = null; var aKeyIv: String? = null
+                var aSeq = 0L; var aPendRange: String? = null
+                val aLastEnd = HashMap<String, Long>()
+                for (raw in aText.lines()) {
+                    val l = raw.trim()
+                    if (l.isEmpty()) continue
+                    when {
+                        l.startsWith("#EXT-X-MEDIA-SEQUENCE") -> aSeq = l.substringAfter(':').trim().toLongOrNull() ?: 0L
+                        l.startsWith("#EXT-X-MAP") -> {
+                            val attrs = parseAttrs(l.substringAfter(':'))
+                            attrs["URI"]?.let { aInitUrl = resolve(aUrl, it) }
+                            aInitRange = attrs["BYTERANGE"]?.let { spec ->
+                                val parts = spec.trim().split('@')
+                                val len = parts[0].trim().toLongOrNull()
+                                val off = parts.getOrNull(1)?.trim()?.toLongOrNull() ?: 0L
+                                if (len != null) "bytes=$off-${off + len - 1}" else null
+                            }
+                        }
+                        l.startsWith("#EXT-X-KEY") -> {
+                            val attrs = parseAttrs(l.substringAfter(':'))
+                            if (attrs["METHOD"].equals("AES-128", true)) {
+                                aKeyUri = attrs["URI"]?.let { resolve(aUrl, it) }
+                                aKeyIv = attrs["IV"]
+                            } else if (attrs["METHOD"].equals("NONE", true)) {
+                                aKeyUri = null; aKeyIv = null
+                            }
+                        }
+                        l.startsWith("#EXT-X-BYTERANGE") -> aPendRange = l.substringAfter(':').trim()
+                        !l.startsWith("#") -> {
+                            val su = resolve(aUrl, l)
+                            val rng = aPendRange?.let { spec ->
+                                val parts = spec.trim().split('@')
+                                val len = parts[0].trim().toLongOrNull()
+                                val off = parts.getOrNull(1)?.trim()?.toLongOrNull() ?: (aLastEnd[su] ?: 0L)
+                                if (len != null) { aLastEnd[su] = off + len; "bytes=$off-${off + len - 1}" } else null
+                            }
+                            aPendRange = null
+                            aSegs.add(HlsSeg(su, rng, aKeyUri, aKeyIv, aSeq + aSegs.size))
+                        }
+                    }
+                }
+                if (aSegs.isEmpty()) return@runCatching null
+                val aDir = File(tempDir, "audio").apply { mkdirs() }
+                val aInit = aInitUrl?.let { u -> runCatching { fetchBytes(d, u, aInitRange) }.getOrNull() }
+                val aNext = AtomicInteger(0)
+                val aWorkers = min(n, aSegs.size).coerceAtLeast(1)
+                coroutineScope {
+                    (0 until aWorkers).map {
+                        launch {
+                            while (true) {
+                                val idx = aNext.getAndIncrement()
+                                if (idx >= aSegs.size) break
+                                currentCoroutineContext().ensureActive()
+                                val p = File(aDir, "%05d.part".format(idx))
+                                if (!p.exists() || p.length() == 0L) {
+                                    val b = fetchSegment(d, aSegs[idx], keyCache)
+                                    p.writeBytes(b)
+                                    bytesDone.addAndGet(b.size.toLong())
+                                    d.done = bytesDone.get()
+                                }
+                            }
+                        }
+                    }.joinAll()
+                }
+                val mergedAudio = File(tempDir, "audio_track.m4a")
+                mergedAudio.outputStream().buffered(256 * 1024).use { out ->
+                    aInit?.let { out.write(it) }
+                    for (i in aSegs.indices) {
+                        val p = File(aDir, "%05d.part".format(i))
+                        if (p.exists()) p.inputStream().use { it.copyTo(out, 256 * 1024) }
+                    }
+                }
+                mergedAudio.takeIf { it.exists() && it.length() > 1024L }
+            }.getOrNull()
+        }
+
+        val rawVideoFile = if (audioFile != null) File(tempDir, "video_track.mp4") else d.file
+        rawVideoFile.outputStream().buffered(512 * 1024).use { out ->
             initBytes?.let { out.write(it) }
             for (i in segments.indices) {
                 val part = File(tempDir, "%05d.part".format(i))
                 if (!part.exists()) throw IllegalStateException("Segment ${i + 1} is missing")
                 part.inputStream().use { it.copyTo(out, 512 * 1024) }
             }
+        }
+        if (audioFile != null) {
+            d.statusNote = "Merging audio & video…"
+            val muxOk = runCatching {
+                Remux.mux(rawVideoFile, audioFile, d.file, webm = false)
+            }.isSuccess
+            if (!muxOk) {
+                rawVideoFile.copyTo(d.file, overwrite = true)
+            }
+            d.statusNote = null
+        } else if (initUrl == null && d.file.extension.equals("ts", true)) {
+            // Losslessly remux MPEG-TS -> standard seekable .mp4 (proper duration, thumbnails & fast seeking!)
+            d.statusNote = "Converting to MP4…"
+            val mp4Out = uniqueFile(d.file.parentFile, d.file.name.removeSuffix(".ts") + ".mp4")
+            val ok = runCatching { Remux.remuxTsToMp4(d.file, mp4Out) }.isSuccess
+            if (ok && mp4Out.exists() && mp4Out.length() > 2_048L) {
+                runCatching { d.file.delete() }
+                d.file = mp4Out
+                d.mime = "video/mp4"
+            } else {
+                runCatching { mp4Out.delete() }
+            }
+            d.statusNote = null
         }
         runCatching { tempDir.deleteRecursively() }
         d.total = d.file.length()
@@ -1813,24 +2340,28 @@ class DownloadManager(private val ctx: Context) {
     }
 
     private fun fetchBytes(d: DlItem, url: String, range: String? = null): ByteArray {
-        http.newCall(requestFor(d, url, range)).execute().use { r ->
+        hlsSegHttp.newCall(requestFor(d, url, range)).execute().use { r ->
             if (!r.isSuccessful) throw IllegalStateException("HTTP ${r.code}")
             return r.body?.bytes() ?: throw IllegalStateException("Empty response")
         }
     }
 
-    /** Fetches one segment (4 attempts) and decrypts it when its playlist entry has an AES-128 key. */
-    private fun fetchSegment(d: DlItem, seg: HlsSeg, keyCache: ConcurrentHashMap<String, ByteArray>): ByteArray {
+    /** Fetches one segment (up to 5 attempts, non-blocking coroutine backoff) and decrypts AES-128 if present. */
+    private suspend fun fetchSegment(d: DlItem, seg: HlsSeg, keyCache: ConcurrentHashMap<String, ByteArray>): ByteArray {
         var raw: ByteArray
         var attempt = 0
         while (true) {
+            currentCoroutineContext().ensureActive()
             try {
                 raw = fetchBytes(d, seg.url, seg.range)
                 break
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 attempt++
-                if (attempt > 4) throw e
-                Thread.sleep(350L * attempt)
+                if (attempt > 5) throw e
+                val backoff = min(3_000L, 280L * (1L shl (attempt - 1).coerceAtMost(4)))
+                delay(backoff + ((seg.seq * 41L) % 160L))
             }
         }
         val keyUri = seg.keyUri ?: return raw
@@ -1893,12 +2424,14 @@ class DownloadManager(private val ctx: Context) {
             }
             val now = System.currentTimeMillis()
             val dt = (now - lastTime).coerceAtLeast(1)
-            d.speed = ((d.done - lastDone).coerceAtLeast(0) * 1000L / dt)
+            val instSpeed = ((d.done - lastDone).coerceAtLeast(0) * 1000L / dt)
+            // Exponential moving average gives rock-steady IDM-style speed & accurate ETA
+            d.speed = if (d.speed <= 0L) instSpeed else ((d.speed * 58L + instSpeed * 42L) / 100L)
             lastDone = d.done
             lastTime = now
-            // yt-dlp reports its own ETA (total size is unknown across video + audio streams).
             if (d.kind != DlKind.YTDLP) {
-                d.eta = if (d.speed > 0 && d.total > d.done) (d.total - d.done) / d.speed else -1
+                val targetTotal = d.shownTotal
+                d.eta = if (d.speed > 0 && targetTotal > d.done) (targetTotal - d.done) / d.speed else -1L
             }
             updateNotification()
         }
@@ -1928,6 +2461,8 @@ class DownloadManager(private val ctx: Context) {
         /** The live manager: the notification buttons (pause / resume / cancel) act on it. */
         @Volatile var current: DownloadManager? = null
 
+        fun trimSockets() { runCatching { current?.dlPool?.evictAll() } }
+
         private const val DEFAULT_UA =
             "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36"
         private const val MIN_PART_BYTES = 512L * 1024L
@@ -1937,8 +2472,7 @@ class DownloadManager(private val ctx: Context) {
         private const val MIN_PARTS = 4
         private const val MAX_PARTS = 48
         private const val MAX_PART_BYTES = 64L * 1024L * 1024L
-        private const val SMART_START_CONN = 2
-        private const val SMART_MAX_CONN = 16
+        private const val SMART_MAX_CONN = 20
         private const val HLS_WORKERS = 16
 
         private val GENERIC_NAMES = setOf(
@@ -1999,42 +2533,61 @@ class DownloadManager(private val ctx: Context) {
     }
 }
 
-class DownloadService : Service() {
-    private var actionReceiver: BroadcastReceiver? = null
+class DownloadActionReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+        val ctx = context ?: return
+        val action = intent?.action ?: return
+        Haptics.fireDetached(Hx.TAP)
+        val targetId = intent.getIntExtra(DownloadService.EXTRA_ITEM_ID, -1)
+        val m = DownloadManager.current
+        if (m == null) {
+            if (action == DownloadService.ACTION_CANCEL || action == DownloadService.ACTION_RETRY) {
+                runCatching {
+                    val nm = ctx.getSystemService(NotificationManager::class.java)
+                    nm.cancel(DownloadService.NOTIF_ID)
+                    if (targetId >= 0) nm.cancel(DownloadService.doneNotifId(targetId))
+                }
+            }
+            return
+        }
+        when (action) {
+            DownloadService.ACTION_PAUSE -> m.pauseAll()
+            DownloadService.ACTION_RESUME -> {
+                m.items.filter { it.status == DlStatus.PAUSED }.forEach { m.resume(it) }
+            }
+            DownloadService.ACTION_RETRY -> {
+                val item = m.items.firstOrNull { it.id == targetId }
+                    ?: m.items.firstOrNull { it.status == DlStatus.FAILED }
+                if (item != null) {
+                    runCatching {
+                        ctx.getSystemService(NotificationManager::class.java)
+                            .cancel(DownloadService.doneNotifId(item.id))
+                    }
+                    m.resume(item)
+                }
+            }
+            DownloadService.ACTION_CANCEL -> {
+                val d = m.items.firstOrNull { it.id == targetId }
+                    ?: m.items.firstOrNull { it.status == DlStatus.RUNNING }
+                    ?: m.items.firstOrNull { it.status == DlStatus.PAUSED }
+                if (d != null) m.cancel(d)
+                else runCatching {
+                    ctx.getSystemService(NotificationManager::class.java).cancel(DownloadService.NOTIF_ID)
+                }
+            }
+        }
+    }
+}
 
+class DownloadService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        ensureChannel(this)
-        // Notification buttons (Pause / Resume / Cancel) arrive here as app-internal broadcasts.
-        val r = object : BroadcastReceiver() {
-            override fun onReceive(c: Context?, i: Intent?) {
-                handleAction(i?.action)
-            }
-        }
-        actionReceiver = r
-        runCatching {
-            ContextCompat.registerReceiver(
-                this, r,
-                IntentFilter().apply {
-                    addAction(ACTION_PAUSE)
-                    addAction(ACTION_RESUME)
-                    addAction(ACTION_CANCEL)
-                },
-                ContextCompat.RECEIVER_NOT_EXPORTED
-            )
-        }
-    }
-
-    override fun onDestroy() {
-        actionReceiver?.let { r -> runCatching { unregisterReceiver(r) } }
-        actionReceiver = null
-        super.onDestroy()
+        ensureChannels(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Show the real state at once when there is one; "preparing" only for a brand-new start.
         val n = build(this, DownloadManager.current?.items?.toList().orEmpty()) ?: buildStarting(this)
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
@@ -2044,48 +2597,60 @@ class DownloadService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun handleAction(action: String?) {
-        val m = DownloadManager.current ?: return
-        when (action) {
-            ACTION_PAUSE -> m.pauseAll()
-            ACTION_RESUME -> m.items.filter { it.status == DlStatus.PAUSED }.forEach { m.resume(it) }
-            ACTION_CANCEL -> {
-                val d = m.items.firstOrNull { it.status == DlStatus.RUNNING }
-                    ?: m.items.firstOrNull { it.status == DlStatus.PAUSED }
-                if (d != null) m.cancel(d)
-            }
-        }
-    }
-
     companion object {
-        const val CHANNEL = "liquid_downloads"
+        const val CHANNEL_LIVE = "aurex_downloads_live"
+        const val CHANNEL_DONE = "aurex_downloads_done"
         const val NOTIF_ID = 4310
+        const val EXTRA_ITEM_ID = "aurex_dl_id"
 
-        private const val ACTION_PAUSE = "com.aurex.browser.DL_PAUSE"
-        private const val ACTION_RESUME = "com.aurex.browser.DL_RESUME"
-        private const val ACTION_CANCEL = "com.aurex.browser.DL_CANCEL"
-        private val ACCENT = 0xFF0A84FF.toInt()
+        const val ACTION_PAUSE = "com.aurex.browser.DL_PAUSE"
+        const val ACTION_RESUME = "com.aurex.browser.DL_RESUME"
+        const val ACTION_CANCEL = "com.aurex.browser.DL_CANCEL"
+        const val ACTION_RETRY = "com.aurex.browser.DL_RETRY"
+
+        private const val ACCENT = 0xFF0A84FF.toInt()
         private const val SEP = " · "
+        @Volatile private var lastPostAt = 0L
+        @Volatile private var lastSig = ""
+
+        fun doneNotifId(itemId: Int): Int = 4320 + (itemId and 0x0F)
 
         fun start(ctx: Context) {
             val i = Intent(ctx, DownloadService::class.java)
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
         }
 
-        fun ensureChannel(ctx: Context) {
+        fun ensureChannels(ctx: Context) {
             if (Build.VERSION.SDK_INT < 26) return
-            val nm = ctx.getSystemService(NotificationManager::class.java)
+            val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
             nm.createNotificationChannel(
-                NotificationChannel(CHANNEL, AppLang.translate("Downloads"), NotificationManager.IMPORTANCE_LOW).apply {
+                NotificationChannel(
+                    CHANNEL_LIVE,
+                    AppLang.translate("Active Downloads"),
+                    NotificationManager.IMPORTANCE_DEFAULT
+                ).apply {
+                    description = AppLang.translate("Live download progress and status-bar pill")
                     setShowBadge(false)
-                    description = AppLang.translate("Download progress")
+                    setSound(null, null)
+                    enableVibration(false)
+                    enableLights(false)
+                }
+            )
+            nm.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_DONE,
+                    AppLang.translate("Completed Downloads"),
+                    NotificationManager.IMPORTANCE_DEFAULT
+                ).apply {
+                    description = AppLang.translate("Alerts when a download finishes or fails")
+                    setShowBadge(true)
+                    setSound(null, null)
+                    enableVibration(false)
                 }
             )
         }
 
-        // ── Pieces ───────────────────────────────────────────────────────────────
-
-        private fun openIntent(ctx: Context): PendingIntent = PendingIntent.getActivity(
+        private fun openDownloadsIntent(ctx: Context): PendingIntent = PendingIntent.getActivity(
             ctx, 0,
             Intent(ctx, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
@@ -2093,39 +2658,78 @@ class DownloadService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        private fun actionIntent(ctx: Context, action: String, code: Int): PendingIntent =
+        private fun actionIntent(ctx: Context, action: String, code: Int, itemId: Int = -1): PendingIntent =
             PendingIntent.getBroadcast(
                 ctx, code,
-                Intent(action).setPackage(ctx.packageName),
+                Intent(ctx, DownloadActionReceiver::class.java)
+                    .setAction(action)
+                    .putExtra(EXTRA_ITEM_ID, itemId),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
 
-        private fun base(ctx: Context): NotificationCompat.Builder {
-            ensureChannel(ctx)
-            return NotificationCompat.Builder(ctx, CHANNEL)
-                .setSmallIcon(R.drawable.ic_stat_aurex)
+        private fun openFileIntent(ctx: Context, d: DlItem): PendingIntent {
+            val mime = d.mime ?: URLConnection.guessContentTypeFromName(d.name) ?: "application/octet-stream"
+            val actIntent = runCatching {
+                val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", d.file)
+                Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(uri, mime)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }.getOrElse {
+                Intent(ctx, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                    .putExtra(MainActivity.EXTRA_OPEN, "downloads")
+            }
+            return PendingIntent.getActivity(
+                ctx, 500 + (d.id and 0xFF), actIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        }
+
+        private fun shareFileIntent(ctx: Context, d: DlItem): PendingIntent {
+            val mime = d.mime ?: URLConnection.guessContentTypeFromName(d.name) ?: "application/octet-stream"
+            val share = runCatching {
+                val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", d.file)
+                Intent.createChooser(
+                    Intent(Intent.ACTION_SEND)
+                        .setType(mime)
+                        .putExtra(Intent.EXTRA_STREAM, uri)
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                    AppLang.translate("Share")
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }.getOrElse {
+                Intent(ctx, MainActivity::class.java).putExtra(MainActivity.EXTRA_OPEN, "downloads")
+            }
+            return PendingIntent.getActivity(
+                ctx, 800 + (d.id and 0xFF), share,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        }
+
+        private fun base(ctx: Context, channel: String = CHANNEL_LIVE, ongoing: Boolean = true): NotificationCompat.Builder {
+            ensureChannels(ctx)
+            return NotificationCompat.Builder(ctx, channel)
+                .setSmallIcon(R.drawable.ic_notif_download)
                 .setColor(ACCENT)
-                .setContentIntent(openIntent(ctx))
-                .setOngoing(true)
+                .setContentIntent(openDownloadsIntent(ctx))
+                .setOngoing(ongoing)
                 .setOnlyAlertOnce(true)
                 .setSilent(true)
-                .setShowWhen(false)
-                .setCategory(NotificationCompat.CATEGORY_PROGRESS)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setShowWhen(!ongoing)
+                .setCategory(if (ongoing) NotificationCompat.CATEGORY_PROGRESS else NotificationCompat.CATEGORY_STATUS)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                 .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
         }
 
-        private fun host(url: String): String =
-            runCatching { Uri.parse(url).host }.getOrNull().orEmpty()
-
         private fun percent(d: DlItem): Int = (d.progress * 100).toInt().coerceIn(0, 100)
 
-        /** Time left in whole minutes only ("3 min left"); under a minute reads "1 min left". */
-        private fun etaText(seconds: Long): String? =
-            if (seconds > 0) AppLang.translate("${((seconds + 59L) / 60L).coerceAtLeast(1L)} min left") else null
+        private fun etaText(seconds: Long): String? = when {
+            seconds <= 0L -> null
+            seconds < 60L -> AppLang.translate("${seconds}s left")
+            seconds < 3600L -> AppLang.translate("${(seconds + 30L) / 60L}m left")
+            else -> AppLang.translate("${seconds / 3600L}h ${(seconds % 3600L) / 60L}m left")
+        }
 
-        /** "740.2 MB / ~1.48 GB" (received / total, "~" while the total is only a guess). */
         private fun sizeText(d: DlItem): String = buildString {
             append(formatBytes(d.done))
             if (d.shownTotal > 0) {
@@ -2133,49 +2737,113 @@ class DownloadService : Service() {
             }
         }
 
-        // ── States ───────────────────────────────────────────────────────────────
+        private fun chipLabel(pct: Int, speedBps: Long, unknown: Boolean, paused: Boolean): String = when {
+            paused -> "Paused"
+            unknown && speedBps > 0L -> compactSpeed(speedBps)
+            unknown -> "DL..."
+            else -> "$pct%"
+        }
 
-        /** Page the file came from (the picture source): the referer when there is one, else the link itself. */
+        private fun compactSpeed(bps: Long): String = when {
+            bps >= 1024L * 1024L -> String.format(java.util.Locale.US, "%.1fM", bps / (1024.0 * 1024.0))
+            bps >= 1024L -> "${bps / 1024L}K"
+            else -> "${bps}B"
+        }
+
         private fun pageOf(d: DlItem): String =
             d.referer?.takeIf { it.startsWith("http") } ?: d.url
 
-        /** Refresh the notification once a thumbnail has arrived from the network. */
         private fun thumbReady(ctx: Context) {
+            lastPostAt = 0L
             update(ctx, DownloadManager.current?.items?.toList().orEmpty())
         }
 
-        /** Both card sizes + the plain texts (accessibility / watches / fallback) on one builder. */
-        private fun withCards(
+        private fun buildDownloadNotification(
             ctx: Context,
-            b: NotificationCompat.Builder,
             pageUrl: String?,
             title: String,
             line: String,
             detail: String,
+            subText: String?,
+            chipText: String,
             progress: Int,
             indeterminate: Boolean,
+            ongoing: Boolean,
             roundIcon: Int,
-            round: PendingIntent,
-            first: NotifViews.Btn,
-            second: NotifViews.Btn?
-        ): NotificationCompat.Builder {
+            primaryLabel: String,
+            primaryPi: PendingIntent,
+            secondaryLabel: String?,
+            secondaryIcon: Int,
+            secondaryPi: PendingIntent?
+        ): Notification {
+            ensureChannels(ctx)
             val card = NotifArt.card(ctx, pageUrl) { thumbReady(ctx) }
-            return b.setContentTitle(title)
+
+            if (NotifIsland.supportsAndroid16LiveUpdates) {
+                val combinedLine = if (detail.isNotBlank() && !detail.contains('\n')) "$line$SEP$detail" else line
+                NotifIsland.buildAndroid16LiveDownload(
+                    ctx = ctx,
+                    channelId = CHANNEL_LIVE,
+                    openIntent = openDownloadsIntent(ctx),
+                    title = title,
+                    line = combinedLine,
+                    subText = subText,
+                    chipText = chipText,
+                    thumb = card,
+                    progress = progress,
+                    indeterminate = indeterminate,
+                    ongoing = ongoing,
+                    accent = ACCENT,
+                    primaryLabel = primaryLabel,
+                    primaryIcon = roundIcon,
+                    primaryPi = primaryPi,
+                    secondaryLabel = secondaryLabel,
+                    secondaryIcon = secondaryIcon,
+                    secondaryPi = secondaryPi
+                )?.let { return it }
+            }
+
+            val b = base(ctx, CHANNEL_LIVE, ongoing)
+                .setContentTitle(title)
                 .setContentText(line)
+                .setSubText(subText)
                 .setStyle(NotificationCompat.DecoratedCustomViewStyle())
-                .setCustomContentView(NotifViews.small(ctx, card, title, line, progress, indeterminate, roundIcon, round))
-                .setCustomBigContentView(NotifViews.big(ctx, card, title, line, detail, progress, indeterminate, first, second))
+                .setCustomContentView(
+                    NotifViews.small(ctx, card, title, line, progress, indeterminate, roundIcon, primaryPi)
+                )
+                .setCustomBigContentView(
+                    NotifViews.big(
+                        ctx, card, title, line, detail, progress, indeterminate,
+                        NotifViews.Btn(primaryLabel, primaryPi),
+                        if (secondaryLabel != null && secondaryPi != null) NotifViews.Btn(secondaryLabel, secondaryPi) else null
+                    )
+                )
+            val extras = android.os.Bundle()
+            NotifIsland.applyIslandExtras(ctx, extras, title, line, chipText, progress, indeterminate, ongoing, ACCENT)
+            b.addExtras(extras)
+            return b.build()
         }
 
-        /** First moment of a brand-new download: nothing to report yet. */
         fun buildStarting(ctx: Context): Notification =
-            base(ctx)
-                .setContentTitle(AppLang.translate("Preparing download…"))
-                .setContentText(AppLang.translate("Getting things ready"))
-                .setProgress(0, 0, true)
-                .build()
+            buildDownloadNotification(
+                ctx = ctx,
+                pageUrl = null,
+                title = AppLang.translate("Preparing download…"),
+                line = AppLang.translate("Connecting to server"),
+                detail = "",
+                subText = null,
+                chipText = "DL...",
+                progress = -1,
+                indeterminate = true,
+                ongoing = true,
+                roundIcon = R.drawable.ic_notif_close,
+                primaryLabel = AppLang.translate("Cancel"),
+                primaryPi = actionIntent(ctx, ACTION_CANCEL, 302),
+                secondaryLabel = null,
+                secondaryIcon = 0,
+                secondaryPi = null
+            )
 
-        /** The notification for the current downloads, or null when nothing runs or is paused. */
         fun build(ctx: Context, items: List<DlItem>): Notification? {
             val running = items.filter { it.status == DlStatus.RUNNING }
             if (running.isNotEmpty()) return buildRunning(ctx, running)
@@ -2186,67 +2854,176 @@ class DownloadService : Service() {
 
         private fun buildRunning(ctx: Context, running: List<DlItem>): Notification {
             val pause = actionIntent(ctx, ACTION_PAUSE, 301)
-            val pauseBtn = NotifViews.Btn(AppLang.translate("Pause"), pause)
-            val b = base(ctx)
-            if (running.size == 1) {
+            val pauseLabel = AppLang.translate("Pause")
+            return if (running.size == 1) {
                 val d = running.first()
                 val pct = percent(d)
                 val quality = MediaTools.playerText(d.qualityLabel)
                 val note = d.statusNote?.takeIf { it.isNotBlank() }?.let { AppLang.translate(it) }
-                // Order matches the card in the app: Downloading · % · speed · quality
                 val line = note ?: buildString {
-                    append(AppLang.translate("Downloading")).append(SEP).append(pct).append('%')
+                    append(pct).append('%')
                     if (d.speed > 0) append(SEP).append(formatSpeed(d.speed))
                     if (quality.isNotBlank()) append(SEP).append(quality)
                 }
                 val unknown = d.shownTotal <= 0 && d.pct < 0f && d.segmentTotal <= 0
-                withCards(
-                    ctx, b, pageOf(d), d.name, line, sizeText(d), pct, unknown,
-                    R.drawable.ic_pip_pause, pause, pauseBtn,
-                    NotifViews.Btn(AppLang.translate("Cancel"), actionIntent(ctx, ACTION_CANCEL, 302))
-                ).setSubText(etaText(d.eta))
+                val eta = etaText(d.eta)
+                val detail = buildString {
+                    append(sizeText(d))
+                    if (!eta.isNullOrBlank()) append(SEP).append(eta)
+                }
+                buildDownloadNotification(
+                    ctx = ctx,
+                    pageUrl = pageOf(d),
+                    title = d.name,
+                    line = line,
+                    detail = detail,
+                    subText = eta,
+                    chipText = chipLabel(pct, d.speed, unknown, paused = false),
+                    progress = pct,
+                    indeterminate = unknown,
+                    ongoing = true,
+                    roundIcon = R.drawable.ic_pip_pause,
+                    primaryLabel = pauseLabel,
+                    primaryPi = pause,
+                    secondaryLabel = AppLang.translate("Cancel"),
+                    secondaryIcon = R.drawable.ic_notif_close,
+                    secondaryPi = actionIntent(ctx, ACTION_CANCEL, 302, d.id)
+                )
             } else {
                 val avg = (running.map { it.progress }.average() * 100).toInt().coerceIn(0, 100)
                 val speed = running.sumOf { it.speed }
                 val line = buildString {
-                    append(AppLang.translate("Downloading")).append(SEP).append(avg).append('%')
+                    append(avg).append('%')
                     if (speed > 0) append(SEP).append(formatSpeed(speed))
+                    append(SEP).append("${running.size} ").append(AppLang.translate("files"))
                 }
-                val names = running.take(3).joinToString("\n") { "${percent(it)}%  ${it.name}" } +
-                    if (running.size > 3) "\n" + AppLang.translate("+${running.size - 3} more") else ""
-                withCards(
-                    ctx, b, pageOf(running.first()), AppLang.translate("Downloading ${running.size} files"), line, names,
-                    avg, false, R.drawable.ic_pip_pause, pause, pauseBtn, null
+                val names = running.take(2).joinToString("\n") { "${percent(it)}%  ${it.name}" } +
+                    if (running.size > 2) "\n" + AppLang.translate("+${running.size - 2} more") else ""
+                buildDownloadNotification(
+                    ctx = ctx,
+                    pageUrl = pageOf(running.first()),
+                    title = AppLang.translate("Downloading ${running.size} files"),
+                    line = line,
+                    detail = names,
+                    subText = "${running.size} active",
+                    chipText = "$avg%",
+                    progress = avg,
+                    indeterminate = false,
+                    ongoing = true,
+                    roundIcon = R.drawable.ic_pip_pause,
+                    primaryLabel = AppLang.translate("Pause all"),
+                    primaryPi = pause,
+                    secondaryLabel = null,
+                    secondaryIcon = 0,
+                    secondaryPi = null
                 )
             }
-            return b.build()
         }
 
         private fun buildPaused(ctx: Context, paused: List<DlItem>): Notification {
             val resume = actionIntent(ctx, ACTION_RESUME, 303)
-            val b = base(ctx).setCategory(NotificationCompat.CATEGORY_STATUS)
-            if (paused.size == 1) {
+            return if (paused.size == 1) {
                 val d = paused.first()
                 val pct = percent(d)
-                withCards(
-                    ctx, b, pageOf(d), d.name, AppLang.translate("Paused") + SEP + "$pct%", sizeText(d), pct, false,
-                    R.drawable.ic_pip_play, resume, NotifViews.Btn(AppLang.translate("Resume"), resume),
-                    NotifViews.Btn(AppLang.translate("Cancel"), actionIntent(ctx, ACTION_CANCEL, 302))
+                buildDownloadNotification(
+                    ctx = ctx,
+                    pageUrl = pageOf(d),
+                    title = d.name,
+                    line = AppLang.translate("Paused") + SEP + "$pct%",
+                    detail = sizeText(d),
+                    subText = AppLang.translate("Paused"),
+                    chipText = "Paused",
+                    progress = pct,
+                    indeterminate = false,
+                    ongoing = false,
+                    roundIcon = R.drawable.ic_pip_play,
+                    primaryLabel = AppLang.translate("Resume"),
+                    primaryPi = resume,
+                    secondaryLabel = AppLang.translate("Cancel"),
+                    secondaryIcon = R.drawable.ic_notif_close,
+                    secondaryPi = actionIntent(ctx, ACTION_CANCEL, 302, d.id)
                 )
             } else {
-                withCards(
-                    ctx, b, pageOf(paused.first()), AppLang.translate("${paused.size} downloads paused"), AppLang.translate("Tap Resume to continue"), "",
-                    -1, false, R.drawable.ic_pip_play, resume, NotifViews.Btn(AppLang.translate("Resume all"), resume), null
+                buildDownloadNotification(
+                    ctx = ctx,
+                    pageUrl = pageOf(paused.first()),
+                    title = AppLang.translate("${paused.size} downloads paused"),
+                    line = AppLang.translate("Tap Resume to continue"),
+                    detail = "",
+                    subText = AppLang.translate("Paused"),
+                    chipText = "Paused",
+                    progress = -1,
+                    indeterminate = false,
+                    ongoing = false,
+                    roundIcon = R.drawable.ic_pip_play,
+                    primaryLabel = AppLang.translate("Resume all"),
+                    primaryPi = resume,
+                    secondaryLabel = null,
+                    secondaryIcon = 0,
+                    secondaryPi = null
                 )
             }
-            return b.build()
+        }
+
+        fun notifyFinished(ctx: Context, d: DlItem) {
+            ensureChannels(ctx)
+            val quality = MediaTools.playerText(d.qualityLabel)
+            val sub = buildString {
+                append(AppLang.translate("Download complete"))
+                if (d.file.exists() && d.file.length() > 0) append(SEP).append(formatBytes(d.file.length()))
+                if (quality.isNotBlank()) append(SEP).append(quality)
+            }
+            val thumb = NotifArt.card(ctx, pageOf(d)) {}
+            val openPi = openFileIntent(ctx, d)
+            val sharePi = shareFileIntent(ctx, d)
+            val n = base(ctx, CHANNEL_DONE, ongoing = false)
+                .setSmallIcon(R.drawable.ic_notif_check)
+                .setLargeIcon(thumb)
+                .setContentTitle(d.name)
+                .setContentText(sub)
+                .setContentIntent(openPi)
+                .setAutoCancel(true)
+                .addAction(R.drawable.ic_notif_check, AppLang.translate("Open"), openPi)
+                .addAction(R.drawable.ic_notif_share, AppLang.translate("Share"), sharePi)
+                .build()
+            runCatching {
+                ctx.getSystemService(NotificationManager::class.java).notify(doneNotifId(d.id), n)
+            }
+        }
+
+        fun notifyFailed(ctx: Context, d: DlItem) {
+            ensureChannels(ctx)
+            val retryPi = actionIntent(ctx, ACTION_RETRY, 600 + (d.id and 0xFF), d.id)
+            val reason = d.error?.take(90) ?: AppLang.translate("Download failed")
+            val n = base(ctx, CHANNEL_DONE, ongoing = false)
+                .setSmallIcon(R.drawable.ic_notif_close)
+                .setColor(0xFFFF453A.toInt())
+                .setContentTitle(d.name)
+                .setContentText(reason)
+                .setAutoCancel(true)
+                .addAction(R.drawable.ic_notif_retry, AppLang.translate("Retry"), retryPi)
+                .build()
+            runCatching {
+                ctx.getSystemService(NotificationManager::class.java).notify(doneNotifId(d.id), n)
+            }
         }
 
         fun update(ctx: Context, items: List<DlItem>) {
-            val n = build(ctx, items) ?: return
-            runCatching {
-                ctx.getSystemService(NotificationManager::class.java).notify(NOTIF_ID, n)
+            val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+            val n = build(ctx, items)
+            if (n == null) {
+                lastSig = ""
+                runCatching { nm.cancel(NOTIF_ID) }
+                return
             }
+            val running = items.filter { it.status == DlStatus.RUNNING }
+            val paused = items.filter { it.status == DlStatus.PAUSED }
+            val sig = "${running.size}|${paused.size}|${running.firstOrNull()?.let { percent(it) } ?: -1}|${running.firstOrNull()?.statusNote.orEmpty()}"
+            val now = android.os.SystemClock.uptimeMillis()
+            if (sig == lastSig && now - lastPostAt < 450L) return
+            lastSig = sig
+            lastPostAt = now
+            runCatching { nm.notify(NOTIF_ID, n) }
         }
     }
 }
