@@ -19,26 +19,10 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Configure Arm64 ABI & Release Minification
+      - name: Configure Arm64 ABI and Release Minification
         run: |
-          python3 - << 'EOF'
-          with open("app/build.gradle.kts", "r") as f:
-              text = f.read()
-
-          if "abiFilters" not in text:
-              text = text.replace("defaultConfig {", "defaultConfig {\n        ndk { abiFilters += listOf(\"arm64-v8a\") }")
-
-          if "isMinifyEnabled" in text:
-              text = text.replace("isMinifyEnabled = false", "isMinifyEnabled = true")
-          else:
-              text = text.replace("release {", "release {\n            isMinifyEnabled = true\n            isShrinkResources = true")
-
-          with open("app/build.gradle.kts", "w") as f:
-              f.write(text)
-          EOF
+          sed -i 's/defaultConfig {/defaultConfig {\n        ndk { abiFilters += listOf("arm64-v8a") }/' app/build.gradle.kts
+          sed -i 's/isMinifyEnabled = false/isMinifyEnabled = true/g' app/build.gradle.kts
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
@@ -46,21 +30,16 @@ jobs:
       - name: Build Release APK
         run: ./gradlew assembleRelease
 
-      - name: Generate Keystore & Sign Release APK
+      - name: Generate Keystore and Sign Release APK
         run: |
           APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
-          keytool -genkey -v -keystore release.jks -keyalg RSA -keysize 2048 -validity 10000 \
-            -alias aurlegacy -storepass aurlegacy123 -keypass aurlegacy123 \
-            -dname "CN=Abin, OU=Dev, O=AurBrowser, L=Kasaragod, S=Kerala, C=IN"
-          BUILD_TOOLS=$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -n 1)
-          $BUILD_TOOLS/zipalign -v -p 4 "$APK_PATH" app-release-aligned.apk
-          $BUILD_TOOLS/apksigner sign \
-            --ks release.jks --ks-key-alias aurlegacy --ks-pass pass:aurlegacy123 --key-pass pass:aurlegacy123 \
-            --out AurBrowserLegacy-arm64-release.apk app-release-aligned.apk
+          keytool -genkey -v -keystore release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias aurlegacy -storepass aurlegacy123 -keypass aurlegacy123 -dname "CN=Abin, OU=Dev, O=AurBrowser, L=Kasaragod, S=Kerala, C=IN"
+          BUILD_TOOLS=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -n 1)
+          "$BUILD_TOOLS/zipalign" -v -p 4 "$APK_PATH" app-release-aligned.apk
+          "$BUILD_TOOLS/apksigner" sign --ks release.jks --ks-key-alias aurlegacy --ks-pass pass:aurlegacy123 --key-pass pass:aurlegacy123 --out AurBrowserLegacy-arm64-release.apk app-release-aligned.apk
 
       - name: Upload Signed Release APK
         uses: actions/upload-artifact@v4
         with:
           name: AurBrowserLegacy-arm64-release
           path: AurBrowserLegacy-arm64-release.apk
-          
