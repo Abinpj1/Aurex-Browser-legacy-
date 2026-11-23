@@ -27,7 +27,7 @@ android {
     namespace = "com.aurex.browser"
     compileSdk = 35
     defaultConfig {
-        applicationId = "com.aurex.browser"
+        applicationId = "com.abinpj1.aurbrowser.legacy"
         minSdk = 24
         targetSdk = 34
         versionCode = 5
@@ -38,7 +38,7 @@ android {
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
-        manifestPlaceholders["appLabel"] = "Aurex Browser"
+        manifestPlaceholders["appLabel"] = "Aur Browser Legacy"
     }
 
     // Disabled ABI splits: produces one single universal aurex-browser.apk for GitHub Releases & Orion Store.
@@ -67,9 +67,8 @@ android {
     val buildSigning = if (hasAurexSigning) signingConfigs.getByName("aurex") else signingConfigs.getByName("debug")
     buildTypes {
         debug {
-            applicationIdSuffix = ".debug"
             signingConfig = buildSigning
-            manifestPlaceholders["appLabel"] = "aurex debug"
+            manifestPlaceholders["appLabel"] = "Aur Browser Legacy"
         }
         release {
             isMinifyEnabled = true

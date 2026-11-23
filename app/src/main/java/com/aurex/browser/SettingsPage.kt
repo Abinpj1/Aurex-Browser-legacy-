@@ -91,12 +91,12 @@ private val PAGE_TITLES = listOf(
 /** Where the back arrow of a settings page leads. */
 private fun backOf(p: Int): Int = when (p) { 10 -> 9; 12, 13 -> 11; else -> -1 }
 
-private const val AUTHOR_NAME = "AMAN"
-private const val AUTHOR_URL = "https://github.com/aman-nitb-cse"
-private const val REPO_URL = "https://github.com/aman-nitb-cse/Aurex-Browser"
+private const val AUTHOR_NAME = "Abin"
+private const val AUTHOR_URL = "https://github.com/Abinpj1"
+private const val REPO_URL = "https://github.com/Abinpj1/Aurex-Browser-legacy-"
 private const val ISSUES_URL = "https://github.com/aman-nitb-cse/Aurex-Browser/issues"
-private const val TELEGRAM_URL = "https://t.me/aurex_oss"
-private const val TELEGRAM_APP = "tg://resolve?domain=aurex_oss"
+private const val TELEGRAM_URL = "https://t.me/Lollzzy"
+private const val TELEGRAM_APP = "tg://resolve?domain=Lollzzy"
 
 /** null = normal page; a string = the settings search is on and only rows matching it are drawn. */
 private val LocalSettingsQuery = compositionLocalOf<String?> { null }
@@ -697,7 +697,7 @@ private fun SettingsRoot(s: BrowserState, open: (Int) -> Unit) {
         }
         Text(
             androidx.compose.ui.text.buildAnnotatedString {
-                append("Aurex · Built by $AUTHOR_NAME ")
+                append("Aur Browser Legacy · Made by Abin ")
                 withStyle(androidx.compose.ui.text.SpanStyle(color = cRed)) { append("\u2665") }
             },
             color = TextTertiary, fontSize = 12.sp, textAlign = TextAlign.Center,
@@ -824,7 +824,7 @@ private fun AboutSettings(s: BrowserState, onClose: () -> Unit, openCredits: () 
             act("Developer", AppleIcons.Star, cOrange, value = AUTHOR_NAME) { inApp(AUTHOR_URL) }
             act("Source code", AppleIcons.Code, cGray, value = "GitHub") { inApp(REPO_URL) }
             act("Report an issue", AppleIcons.ErrorOutline, cRed) { inApp(ISSUES_URL) }
-            act("Telegram", AppleIcons.Share, cBlue, value = "@aurex_oss") { openTelegram() }
+            act("Telegram", AppleIcons.Share, cBlue, value = "@Lollzzy") { openTelegram() }
         }
         SGroup {
             nav("Open-source credits", AppleIcons.Book, cPurple) { openCredits() }
