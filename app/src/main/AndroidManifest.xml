@@ -33,6 +33,35 @@
     <uses-feature android:name="android.hardware.location"          android:required="false" />
     <uses-feature android:name="android.hardware.location.gps"      android:required="false" />
 
+    <!-- Android 11+ package visibility for opening external apps (UPI, messaging, Play Store, maps, media, dialer) -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="http" />
+        </intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="upi" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="tez" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="gpay" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="phonepe" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="paytmmp" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="bhim" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="credpay" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="whatsapp" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="tg" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="market" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="mailto" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="sms" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="smsto" /></intent>
+        <intent><action android:name="android.intent.action.DIAL" /><data android:scheme="tel" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="geo" /></intent>
+    </queries>
+
     <application
         android:name=".AurexApp"
         android:label="${appLabel}"
@@ -41,7 +70,6 @@
         android:allowBackup="false"
         android:hardwareAccelerated="true"
         android:largeHeap="true"
-        android:extractNativeLibs="true"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.Aurex">
@@ -70,16 +98,61 @@
                 <data android:scheme="http" />
                 <data android:scheme="https" />
             </intent-filter>
+            <!-- Ensures full Default Browser eligibility across Pixel, HyperOS/MIUI, One UI, and ColorOS -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:mimeType="text/html" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="application/xhtml+xml" />
+            </intent-filter>
         </activity>
 
         <activity
             android:name=".PlayerActivity"
-            android:exported="false"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:label="Aurex Video Player"
             android:screenOrientation="behind"
             android:supportsPictureInPicture="true"
             android:resizeableActivity="true"
             android:theme="@style/Theme.Aurex.Player"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode" />
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode">
+            <!-- Open external videos (Files, Gallery, Telegram, WhatsApp, URLs) & set as Default video player -->
+            <intent-filter android:label="Aurex Video Player">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:mimeType="video/*" />
+            </intent-filter>
+            <intent-filter android:label="Aurex Video Player">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:mimeType="application/vnd.apple.mpegurl" />
+                <data android:mimeType="application/x-mpegurl" />
+                <data android:mimeType="application/dash+xml" />
+                <data android:mimeType="application/mp4" />
+                <data android:mimeType="application/x-matroska" />
+            </intent-filter>
+            <!-- Appear in Android's Video Share menu ("Play in Aurex") -->
+            <intent-filter android:label="Play in Aurex">
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="video/*" />
+            </intent-filter>
+        </activity>
 
         <!-- Fix 5: Foreground media service for background playback (WakeLock + WifiLock). -->
         <service

@@ -26,7 +26,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
@@ -37,7 +36,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -288,6 +286,7 @@ object Updater {
                     out = dst
                 }
             } catch (t: Throwable) {
+                runCatching { File(fileFor(app, info).path + ".part").delete() }
                 err = if (t is java.io.IOException) "No connection. Check your network and try again." else (t.message ?: "Download failed")
             }
             main.post { onDone(out, err) }
@@ -430,11 +429,10 @@ fun UpdatePrompt(u: UpdateState) {
                 }
                 if (u.phase == UpdateState.DOWNLOADING) {
                     Spacer(Modifier.height(14.dp))
-                    LinearProgressIndicator(
-                        progress = { u.progress },
+                    GlassProgressBar(
+                        progress = u.progress,
                         modifier = Modifier.fillMaxWidth(),
-                        color = LocalGlassStyle.current.accent,
-                        trackColor = Color(0x33808080)
+                        height = 5.dp
                     )
                 }
                 u.message?.let {

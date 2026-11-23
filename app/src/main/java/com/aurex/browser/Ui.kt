@@ -55,7 +55,6 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -181,8 +180,8 @@ fun MainScreen(s: BrowserState) {
             s.openMenuRequest = false
         }
     }
-    LaunchedEffect(editing, menu, panel, findOpen) {
-        s.toolbarLocked = editing || menu || panel != null || findOpen
+    LaunchedEffect(editing, menu, panel, findOpen, s.linkMenu) {
+        s.toolbarLocked = editing || menu || panel != null || findOpen || s.linkMenu != null
     }
     // PiP starting (Home / gesture / back / PiP button) while something covers the page (Downloads, Settings,
     // Tabs, the menu, the address bar, the find bar, a sheet): close it all, so the PiP window shows the VIDEO
@@ -195,6 +194,7 @@ fun MainScreen(s: BrowserState) {
             editing = false
             if (findOpen) { findOpen = false; findQuery = ""; s.clearFind(tab) }
             s.qualityPrompt = null
+            s.linkMenu = null
             s.screenshot = null
             keyboard?.hide()
         }
@@ -211,6 +211,7 @@ fun MainScreen(s: BrowserState) {
             s.inlinePlayer && !s.pipMode -> s.exitInlinePlayer()
             s.shotSession != null -> s.cancelShot()
             s.screenshot != null -> s.screenshot = null
+            s.linkMenu != null -> s.linkMenu = null
             s.jsDialog != null -> {
                 s.jsDialog?.result?.invoke(false, null)
                 s.jsDialog = null
@@ -243,7 +244,13 @@ fun MainScreen(s: BrowserState) {
         if (menu && s.qualityPrompt != null) s.qualityPrompt = null
     }
 
-    val anyWebWindowOpen = menu || s.qualityPrompt != null || findOpen || s.jsDialog != null || s.screenshot != null || (s.update.visible && s.update.info != null)
+    LaunchedEffect(s.linkMenu) {
+        if (s.linkMenu != null) {
+            if (menu) menu = false
+            if (editing) { editing = false; keyboard?.hide() }
+        }
+    }
+    val anyWebWindowOpen = menu || s.linkMenu != null || s.qualityPrompt != null || findOpen || s.jsDialog != null || s.screenshot != null || (s.update.visible && s.update.info != null)
     val webCopyPool = remember { arrayOfNulls<android.graphics.Bitmap>(2) }
     var webCopySlot by remember { mutableIntStateOf(0) }
 
@@ -251,15 +258,15 @@ fun MainScreen(s: BrowserState) {
     // continuously copy ONLY the unobstructed video region (strictly OUTSIDE the floating window -> 0 feedback!)
     // so the blurred Liquid Glass live-pulses & moves in real time with the playing video!
     LaunchedEffect(anyWebWindowOpen, tab.videoPlaying, tab.isHome) {
-        if (!anyWebWindowOpen || tab.isHome || !tab.videoPlaying || PerfTier.low || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+        if (!anyWebWindowOpen || tab.isHome || !tab.videoPlaying || PerfTier.low || PerfTier.thermalWarm || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             if (pageBackdrop.ambientBitmap != null) pageBackdrop.setAmbientVideoFrame(null)
             return@LaunchedEffect
         }
         val win = act?.window ?: return@LaunchedEffect
         val decor = win.decorView
-        val intervalMs = if (PerfTier.balanced) 340L else 220L
+        val intervalMs = if (PerfTier.balanced) 800L else 550L
         var inFlight = false
-        while (true) {
+        while (!PerfTier.thermalWarm) {
             val vw = decor.width
             val vh = decor.height
             if (!inFlight && vw > 64 && vh > 64) {
@@ -369,7 +376,7 @@ fun MainScreen(s: BrowserState) {
                 if (s.barTop) {
                     ScrollEdgeBlur(
                         isTop = true,
-                        active = !tab.isHome && s.shotSession == null && s.fullscreen == null && (s.barVisible || editing),
+                        active = !tab.isHome && s.shotSession == null && s.fullscreen == null && (s.barVisible || editing || s.toolbarLocked),
                         height = 44.dp,
                         strength = 0.28f,
                         modifier = Modifier.align(Alignment.TopCenter)
@@ -379,14 +386,13 @@ fun MainScreen(s: BrowserState) {
                             .align(Alignment.TopCenter)
                             .fillMaxWidth()
                             .statusBarsPadding()
-                            .imePadding()
                     ) { chrome() }
                 } else {
                     ScrollEdgeBlur(
                         isTop = false,
-                        active = !tab.isHome && s.shotSession == null && s.fullscreen == null,
+                        active = !tab.isHome && s.shotSession == null && s.fullscreen == null && (s.barVisible || editing || s.toolbarLocked),
                         height = 44.dp,
-                        strength = if (s.barVisible || editing || s.toolbarLocked) 0.26f else 0.14f,
+                        strength = 0.26f,
                         modifier = Modifier.align(Alignment.BottomCenter)
                     )
                     Box(
@@ -422,7 +428,7 @@ fun MainScreen(s: BrowserState) {
                 visible = (s.mediaFab || (s.downloadFab && s.videoDownload)) &&
                     tabShowsVideo(tab) && !tab.isHome && !s.bare &&
                     s.fullscreen == null &&
-                    s.qualityPrompt == null && !menu && (!chromeHidden || fabShown),
+                    s.qualityPrompt == null && s.linkMenu == null && !menu && (!chromeHidden || fabShown),
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .navigationBarsPadding()
@@ -533,6 +539,9 @@ fun MainScreen(s: BrowserState) {
         // Screenshot preview dialog
         s.shotSession?.let { session -> ShotHud(s, session) }
         s.screenshot?.let { shot -> ShotPreview(s, tab, shot) }
+
+        // Long-press link / image context menu
+        if (overlaysOn) s.linkMenu?.let { lm -> LinkContextMenuHost(s, tab, lm) }
 
         // JS dialogs
         s.jsDialog?.let { d -> JsDialogHost(s, d) }
@@ -682,11 +691,18 @@ private fun PageCard(
         if (page.isHome && (!isCurrent || swiping)) {
             AppBackground()
         }
+        // Keep WebHost bounds 100% constant while scrolling so WebView never resizes or shifts touch
+        // coordinates mid-gesture (pinned top bar reserves fixed top clearance; auto-hide floats smoothly).
+        val topBarInset = if (
+            s.barTop && !s.autoHide && !page.isHome && !s.bare && s.fullscreen == null && !s.inlinePlayer
+        ) toolbarFootprint(s.toolbarRows) + 10.dp else 0.dp
         WebHost(
             tab = page,
             alpha = if (page.isHome) 0f else 1f,
             liveBackdrop = liveBackdrop,
-            modifier = Modifier.statusBarsPadding()
+            modifier = Modifier
+                .statusBarsPadding()
+                .padding(top = topBarInset)
         )
         if (page.isHome && cardBgBackdrop != null) {
             androidx.compose.runtime.CompositionLocalProvider(LocalGlassBackdrop provides cardBgBackdrop) {
@@ -976,25 +992,16 @@ private fun BrowserChrome(
             else TextFieldValue("")
         )
     }
-    val view = LocalView.current
     val hidden = !s.barVisible && !s.toolbarLocked && !tab.isHome && !editing
-    val showCompactPill = hidden && s.shotSession == null && s.fullscreen == null
     val barHeight = if (s.toolbarRows == 1) ToolbarDoubleHeight else ToolbarBarHeight
 
-    // Apple iOS 26 Safari spring: full floating bar recedes into an ultra-compact frosted domain
-    // capsule while scrolling down, then fluidly expands back on scroll-up or tap.
+    // Floating toolbar slides completely out of sight while scrolling down, then springs back on scroll-up.
     val visibleAnimState = animateFloatAsState(
         if (hidden) 0f else 1f,
         spring(dampingRatio = 0.82f, stiffness = 580f),
         label = "chromeVisibility"
     )
-    val compactAnimState = animateFloatAsState(
-        if (showCompactPill) 1f else 0f,
-        spring(dampingRatio = 0.82f, stiffness = 580f),
-        label = "compactPill"
-    )
     val showFullBar by remember { derivedStateOf { visibleAnimState.value > 0.01f } }
-    val showCompact by remember { derivedStateOf { compactAnimState.value > 0.02f } }
 
     LaunchedEffect(editing, tab.id) {
         if (editing) {
@@ -1013,45 +1020,6 @@ private fun BrowserChrome(
     }
 
     Box(Modifier.fillMaxWidth(), contentAlignment = if (s.barTop) Alignment.TopCenter else Alignment.BottomCenter) {
-        if (showCompact) {
-            Row(
-                Modifier
-                    .padding(bottom = if (s.barTop) 0.dp else 4.dp, top = if (s.barTop) 4.dp else 0.dp)
-                    .graphicsLayer {
-                        val v = compactAnimState.value
-                        val c = v.coerceIn(0f, 1f)
-                        alpha = c
-                        val sc = 0.78f + 0.22f * v
-                        scaleX = sc
-                        scaleY = sc
-                        translationY = (if (s.barTop) -1f else 1f) * (1f - c) * 14.dp.toPx()
-                        transformOrigin = TransformOrigin(0.5f, if (s.barTop) 0f else 1f)
-                    }
-                    .height(32.dp)
-                    .widthIn(min = 110.dp, max = 210.dp)
-                    .liquidGlass(Capsule, 1.05f, 0f, reactive = false, blurProgress = { 1f })
-                    .clickableHaptic {
-                        s.barVisible = true
-                    }
-                    .padding(horizontal = 14.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center
-            ) {
-                if (tab.url.startsWith("https://")) {
-                    SafariGlyph(SafariGlyph.Lock, size = 11.dp, tint = GoodText)
-                    Spacer(Modifier.width(6.dp))
-                }
-                Text(
-                    hostOf(tab.url).ifBlank { prettyUrl(tab.url) },
-                    color = TextPrimary,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-        }
-
         if (showFullBar || editing) Box(
             Modifier
                 .fillMaxWidth()
@@ -1060,7 +1028,7 @@ private fun BrowserChrome(
                     val v = visibleAnimState.value
                     val c = v.coerceIn(0f, 1f)
                     alpha = c
-                    translationY = (if (s.barTop) -1f else 1f) * (1f - c) * (barHeight + 36.dp).toPx()
+                    translationY = (if (s.barTop) -1f else 1f) * (1f - c) * (barHeight + (if (s.barTop) 56.dp else 36.dp)).toPx()
                     scaleX = 0.86f + 0.14f * v
                     scaleY = 0.84f + 0.16f * v
                     transformOrigin = TransformOrigin(0.5f, if (s.barTop) 0f else 1f)
@@ -1582,7 +1550,6 @@ internal fun ToolbarActionButton(
     preview: Boolean = false,
     forceEnabled: Boolean = false
 ) {
-    val activeDownloads = s.downloads.items.count { it.status == DlStatus.RUNNING }
     val glyph = size * 0.55f
     val icon = size * 0.53f
     fun tap(action: () -> Unit): () -> Unit = if (preview) ({}) else action
@@ -1602,37 +1569,43 @@ internal fun ToolbarActionButton(
         "home" -> SafariButton(
             SafariGlyph.Home, "Home",
             onClick = tap {
+                tab.error = null
                 tab.web?.loadUrl("about:blank")
                 tab.url = ""
                 s.barVisible = true
             },
             size = size, glyphSize = glyph
         )
-        "download" -> Box(
-            Modifier.pointerInput(s) {
-                var totalY = 0f
-                detectVerticalDragGestures(
-                    onDragEnd = {
-                        if (s.swipeDownloadDelete && totalY < -30f) {
-                            Haptics.fire(null, Hx.WARN)
-                            s.deleteRecentDownload()
+        "download" -> {
+            val activeDownloads by remember(s) {
+                derivedStateOf { s.downloads.items.count { it.status == DlStatus.RUNNING } }
+            }
+            Box(
+                Modifier.pointerInput(s) {
+                    var totalY = 0f
+                    detectVerticalDragGestures(
+                        onDragEnd = {
+                            if (s.swipeDownloadDelete && totalY < -30f) {
+                                Haptics.fire(null, Hx.WARN)
+                                s.deleteRecentDownload()
+                            }
+                            totalY = 0f
+                        },
+                        onDragCancel = { totalY = 0f },
+                        onVerticalDrag = { change, amount ->
+                            change.consume()
+                            totalY += amount
                         }
-                        totalY = 0f
-                    },
-                    onDragCancel = { totalY = 0f },
-                    onVerticalDrag = { change, amount ->
-                        change.consume()
-                        totalY += amount
-                    }
+                    )
+                }
+            ) {
+                SafariButton(
+                    SafariGlyph.Download, "Downloads",
+                    onClick = tap { onPanel(Panel.Downloads) },
+                    size = size, glyphSize = glyph,
+                    badge = if (activeDownloads > 0) activeDownloads.toString() else null
                 )
             }
-        ) {
-            SafariButton(
-                SafariGlyph.Download, "Downloads",
-                onClick = tap { onPanel(Panel.Downloads) },
-                size = size, glyphSize = glyph,
-                badge = if (activeDownloads > 0) activeDownloads.toString() else null
-            )
         }
         "tabs" -> Box(
             Modifier.pointerInput(s) {
@@ -1733,7 +1706,7 @@ private fun MediaFab(s: BrowserState, tab: Tab) {
     val handsOff = isHandsOffHost(tab.url)
     val url = if (handsOff) null else s.playableMedia(tab)
     val audio = s.playableAudio(tab, url)
-    val mime = if (url != null && url.contains(".m3u8", true)) "application/x-mpegURL" else null
+    val mime = if (url != null && (url in tab.hlsUrls || isHlsUrl(url))) "application/x-mpegURL" else null
     // Two independent switches: the download button (Settings -> Downloads, needs "Video download")
     // and the play / picture-in-picture buttons (Settings -> Media).
     val allowDl = s.videoDownload && s.downloadFab
@@ -1787,15 +1760,6 @@ internal fun AddressPill(
     onEditing: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val style = LocalGlassStyle.current
-    val p by animateFloatAsState(
-        if (s.downloads.items.any { it.status == DlStatus.RUNNING })
-            s.downloads.items.firstOrNull { it.status == DlStatus.RUNNING }?.progress
-                ?: tab.progress.coerceIn(0f, 1f)
-        else tab.progress.coerceIn(0f, 1f),
-        tween(260),
-        label = "pageProgress"
-    )
     val url = tab.url
     val view = LocalView.current
     val density = LocalDensity.current.density
@@ -1966,14 +1930,26 @@ internal fun AddressPill(
                     ) { PillContent(t) }
                 }
             }
-            if (p < 0.999f) {
-                GlassProgressBar(
-                    p,
-                    Modifier.align(Alignment.BottomCenter).padding(horizontal = 14.dp, vertical = 2.dp),
-                    height = 1.5.dp
-                )
-            }
+            AddressProgressBar(
+                s = s,
+                tab = tab,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(horizontal = 14.dp, vertical = 2.dp)
+            )
         }
+    }
+}
+
+/** Isolated progress-bar slot so download / page progress ticks NEVER recompose AddressPill or PillContent. */
+@Composable
+private fun AddressProgressBar(s: BrowserState, tab: Tab, modifier: Modifier = Modifier) {
+    val raw by remember(s, tab) {
+        derivedStateOf {
+            s.downloads.items.firstOrNull { it.status == DlStatus.RUNNING }?.progress
+                ?: tab.progress.coerceIn(0f, 1f)
+        }
+    }
+    if (raw < 0.999f) {
+        GlassProgressBar(raw, modifier, height = 1.5.dp)
     }
 }
 
@@ -2272,7 +2248,7 @@ private fun FindBar(
         Modifier
             .fillMaxWidth()
             .statusBarsPadding()
-            .padding(top = if (s.barTop) 76.dp else 6.dp, start = 12.dp, end = 12.dp)
+            .padding(top = if (s.barTop) toolbarFootprint(s.toolbarRows) + 16.dp else 6.dp, start = 12.dp, end = 12.dp)
             .graphicsLayer {
                 alpha = enter.value.coerceIn(0f, 1f)
                 translationY = -16.dp.toPx() * (1f - enter.value)
@@ -2390,7 +2366,7 @@ private fun HomePage(
                 .statusBarsPadding()
                 .padding(horizontal = 18.dp)
                 .padding(
-                    top = 14.dp,
+                    top = if (s.barTop) toolbarFootprint(s.toolbarRows) + 18.dp else 14.dp,
                     bottom = when {
                         s.barTop -> 32.dp
                         s.toolbarRows == 1 -> 158.dp
@@ -2713,6 +2689,196 @@ private fun ErrorPage(message: String, onAllow: (() -> Unit)? = null, onRetry: (
                     "Blocked by mistake? You can allow this site.",
                     color = TextTertiary, fontSize = 11.sp, textAlign = TextAlign.Center
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LinkContextMenuHost(s: BrowserState, tab: Tab, lm: LinkContextMenuState) {
+    val menuView = LocalView.current
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        Haptics.fire(menuView, Hx.WINDOW_OPEN)
+        onDispose { Haptics.fire(menuView, Hx.WINDOW_CLOSE) }
+    }
+    GlassLiveWindowLease(active = true)
+    val enter = remember(lm) { Animatable(0f) }
+    LaunchedEffect(lm) { enter.animateTo(1f, spring(dampingRatio = 0.78f, stiffness = 520f)) }
+    val scrimColor = scrim(0.52f)
+    val dragState = rememberGlassWindowDragState()
+    val dismiss = { s.linkMenu = null }
+
+    val hasLink = lm.url.isNotBlank()
+    val isWebLink = lm.url.startsWith("http://", true) || lm.url.startsWith("https://", true)
+    val imageUrl = lm.imageUrl?.takeIf { it.isNotBlank() }
+    val previewUrl = if (hasLink) lm.url else imageUrl.orEmpty()
+    val headerTitle = lm.title.ifBlank { hostOf(previewUrl).ifBlank { previewUrl } }
+    val targetTab = s.tabs.firstOrNull { it.id == lm.tabId } ?: tab
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .drawBehind { drawRect(scrimColor.copy(alpha = scrimColor.alpha * enter.value.coerceIn(0f, 1f))) }
+            .clickable(remember { MutableInteractionSource() }, null) { dismiss() },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            Modifier
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 16.dp)
+                .widthIn(max = 368.dp)
+                .graphicsLayer {
+                    val p = enter.value
+                    alpha = p.coerceIn(0f, 1f)
+                    val sc = 0.91f + 0.09f * p
+                    scaleX = sc
+                    scaleY = sc
+                    translationY = 24.dp.toPx() * (1f - p)
+                }
+                .liquidWindowTransform(dragState, maxPullDp = 42.dp)
+                .liquidGlass(CardShape, 1.22f, 0.05f, reactive = false, blurProgress = { 1f })
+                .clickable(remember { MutableInteractionSource() }, null) {}
+                .padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 12.dp)
+        ) {
+            GlassGrabber(
+                Modifier.liquidWindowHandle(
+                    dragState,
+                    maxPullDp = 42.dp,
+                    dismissDir = LiquidDismissDir.DOWN,
+                    dismissThresholdDp = 60.dp,
+                    onDismiss = dismiss
+                )
+            )
+            // Header: site badge + title/host + full URL preview + close button
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SiteBadge(hostOf(previewUrl).ifBlank { "Link" }, 34.dp)
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        headerTitle,
+                        color = TextPrimary,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        previewUrl,
+                        color = TextTertiary,
+                        fontSize = 11.5.sp,
+                        lineHeight = 14.5.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(Modifier.width(6.dp))
+                GlassIconButton(
+                    AppleIcons.Close, "Close",
+                    onClick = dismiss,
+                    size = 32.dp, iconSize = 15.dp, filled = false
+                )
+            }
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp, vertical = 6.dp)
+                    .height(0.5.dp)
+                    .background(Separator)
+            )
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                if (hasLink) {
+                    MenuRow(
+                        icon = AppleIcons.ArrowForward,
+                        label = "Open link",
+                        accent = true,
+                        onClick = { dismiss(); s.openLinkInCurrentTab(targetTab, lm.url) }
+                    )
+                    if (isWebLink) {
+                        MenuRow(
+                            icon = AppleIcons.Add,
+                            label = "Open link in new tab",
+                            accent = true,
+                            onClick = { dismiss(); s.openLinkInNewTab(targetTab, lm.url) }
+                        )
+                        MenuRow(
+                            icon = AppleIcons.Tabs,
+                            label = "Open link in background tab",
+                            accent = true,
+                            onClick = { dismiss(); s.openLinkInBackgroundTab(targetTab, lm.url) }
+                        )
+                    }
+                    MenuRow(
+                        icon = AppleIcons.Copy,
+                        label = "Copy link address",
+                        accent = true,
+                        onClick = { dismiss(); s.copy(lm.url) }
+                    )
+                    MenuRow(
+                        icon = AppleIcons.Share,
+                        label = "Share link",
+                        accent = true,
+                        onClick = { dismiss(); s.share(lm.url) }
+                    )
+                    if (isWebLink) {
+                        MenuRow(
+                            icon = AppleIcons.Download,
+                            label = "Download link",
+                            accent = true,
+                            onClick = { dismiss(); s.downloadLink(targetTab, lm.url, lm.title) }
+                        )
+                    }
+                    if (imageUrl != null) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                .height(0.5.dp)
+                                .background(Separator)
+                        )
+                        MenuRow(
+                            icon = AppleIcons.Image,
+                            label = "Download image",
+                            accent = true,
+                            onClick = { dismiss(); s.downloadLink(targetTab, imageUrl) }
+                        )
+                    }
+                } else if (imageUrl != null) {
+                    MenuRow(
+                        icon = AppleIcons.Add,
+                        label = "Open image in new tab",
+                        accent = true,
+                        onClick = { dismiss(); s.openLinkInNewTab(targetTab, imageUrl) }
+                    )
+                    MenuRow(
+                        icon = AppleIcons.Copy,
+                        label = "Copy image link",
+                        accent = true,
+                        onClick = { dismiss(); s.copy(imageUrl) }
+                    )
+                    MenuRow(
+                        icon = AppleIcons.Share,
+                        label = "Share image link",
+                        accent = true,
+                        onClick = { dismiss(); s.share(imageUrl) }
+                    )
+                    MenuRow(
+                        icon = AppleIcons.Download,
+                        label = "Download image",
+                        accent = true,
+                        onClick = { dismiss(); s.downloadLink(targetTab, imageUrl) }
+                    )
+                }
             }
         }
     }

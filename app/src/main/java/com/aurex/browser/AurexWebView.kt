@@ -441,24 +441,52 @@ class AurexWebView(context: Context) : WebView(context) {
      * state, which repairs any desync (YouTube changing state without a <video> event, SPA
      * navigation swapping the player element, ...). The page only reports when something changed.
      */
+    private var bootstrapActive = true
+
+    /** Runs one immediate bootstrap check (called on attach / navigation) then backs off cleanly. */
+    fun kickBootstrap() {
+        if (!isAttachedToWindow || !bootstrapActive) return
+        removeCallbacks(bootstrapTick)
+        postDelayed(bootstrapTick, 250L)
+    }
+
+    override fun onPause() {
+        bootstrapActive = false
+        removeCallbacks(bootstrapTick)
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        bootstrapActive = true
+        kickBootstrap()
+    }
+
     private val bootstrapTick = object : Runnable {
         override fun run() {
-            if (!isAttachedToWindow) return
+            if (!isAttachedToWindow || !bootstrapActive) return
+            if (windowVisibility != View.VISIBLE && !backgroundMediaActive) {
+                postDelayed(this, 10_000L)
+                return
+            }
             refreshPageInfo()
-            if (isHandsOffHost(url)) {          // Instagram: no scripts of ours in the page
-                postDelayed(this, 1500L)
+            val curUrl = url
+            if (curUrl.isNullOrBlank() || curUrl == "about:blank" || isHandsOffHost(curUrl)) {
+                postDelayed(this, 10_000L)
                 return
             }
             evaluateJavascript(CHECK_JS) { r ->
                 if (r != "true") evaluateJavascript(BOOTSTRAP_JS, null)
-                else evaluateJavascript(SYNC_JS, null)
+                else if (isMediaPlaying || backgroundMediaActive) evaluateJavascript(SYNC_JS, null)
             }
             if (sniffEnabled) {
                 evaluateJavascript(CHECK_SNIFF_JS) { r ->
                     if (r != "true" && sniffEnabled) evaluateJavascript(SNIFF_JS, null)
                 }
             }
-            postDelayed(this, 1500L)
+            // Adaptive cadence: 3.5s while media is actively playing, 9s on idle reading pages (85% fewer V8 wakeups!)
+            val nextMs = if (isMediaPlaying || backgroundMediaActive) 3_500L else 9_000L
+            postDelayed(this, nextMs)
         }
     }
 
@@ -480,6 +508,16 @@ class AurexWebView(context: Context) : WebView(context) {
     override fun onDetachedFromWindow() {
         removeCallbacks(bootstrapTick)
         super.onDetachedFromWindow()
+    }
+
+    override fun destroy() {
+        removeCallbacks(bootstrapTick)
+        onBackdropDirty = null
+        onStreamDetected = null
+        onMediaStateChanged = null
+        seenKeys.clear()
+        synchronized(detected) { detected.clear() }
+        super.destroy()
     }
 
     /**
@@ -892,6 +930,7 @@ class AurexWebView(context: Context) : WebView(context) {
 
         override fun onPageFinished(view: WebView?, url: String?) {
             noteNavigation(url)
+            kickBootstrap()
             d.onPageFinished(view, url)
         }
 

@@ -50,7 +50,13 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 
-import androidx.compose.material3.Icon
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -872,6 +878,64 @@ fun GroupedRow(
 
 // ── Visual bits ──────────────────────────────────────────────────────────────
 
+/** Pure Compose vector Icon (zero Material3 overhead, identical size/tint behavior). */
+@Composable
+fun Icon(
+    imageVector: ImageVector,
+    contentDescription: String?,
+    modifier: Modifier = Modifier,
+    tint: Color = LocalPalette.current.textPrimary
+) {
+    val filter = if (tint == Color.Unspecified) null else ColorFilter.tint(tint)
+    Image(
+        painter = rememberVectorPainter(imageVector),
+        contentDescription = contentDescription,
+        modifier = modifier,
+        contentScale = ContentScale.Fit,
+        colorFilter = filter
+    )
+}
+
+/** Lightweight 120 FPS pure-Canvas loading spinner (replaces Material3 CircularProgressIndicator). */
+@Composable
+fun CircularProgressIndicator(
+    modifier: Modifier = Modifier,
+    color: Color = LocalGlassStyle.current.accent,
+    strokeWidth: Dp = 2.5.dp
+) {
+    val inf = rememberInfiniteTransition(label = "aurexSpin")
+    val angle = inf.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(tween(820, easing = LinearEasing)),
+        label = "aurexSpinAngle"
+    )
+    Canvas(modifier.size(28.dp)) {
+        val sw = strokeWidth.toPx()
+        val inset = sw * 0.5f
+        val arcSize = Size((size.width - sw).coerceAtLeast(1f), (size.height - sw).coerceAtLeast(1f))
+        val tl = Offset(inset, inset)
+        drawArc(
+            color = color.copy(alpha = 0.18f),
+            startAngle = 0f,
+            sweepAngle = 360f,
+            useCenter = false,
+            topLeft = tl,
+            size = arcSize,
+            style = Stroke(width = sw, cap = StrokeCap.Round)
+        )
+        drawArc(
+            color = color,
+            startAngle = angle.value,
+            sweepAngle = 250f,
+            useCenter = false,
+            topLeft = tl,
+            size = arcSize,
+            style = Stroke(width = sw, cap = StrokeCap.Round)
+        )
+    }
+}
+
 @Composable
 fun GlassProgressBar(
     progress: Float,
@@ -1346,19 +1410,46 @@ private fun decodedUrl(url: String): String =
  * path alone missed every one of them.
  */
 private val MEDIA_EXT_RE =
-    Regex("""\.(m3u8|mpd|mp4|webm|mkv|m4v|mov|ts|mp3|m4a|aac|ogg|oga|opus|flac|wav)(\?|#|$)""")
+    Regex("""\.(m3u8|mpd|mp4|webm|mkv|m4v|mov|mp3|m4a|aac|ogg|oga|opus|flac|wav)(\?|#|$)""")
 private val MEDIA_MIME_RE = Regex("""[?&](mime|type)=(video|audio)/""")
 private val MEDIA_FMT_RE = Regex("""[?&](format|type)=(m3u8|mpd|mp4|webm|mpegurl)""")
+private val SEG_EXT_RE = Regex("""\.(ts|m4s|cmfv|cmfa)(\?|#|$)""", RegexOption.IGNORE_CASE)
+private val SEG_PATH_RE = Regex("""/(seg|segment|chunk|frag|slice)[-_]?\d+""", RegexOption.IGNORE_CASE)
+
+/** True when [url] is an individual HLS/DASH media segment (.ts / .m4s / seg-001) rather than a full video or playlist. */
+fun isSegmentUrl(url: String): Boolean {
+    if (url.isBlank()) return false
+    val lower = url.lowercase()
+    val path = lower.substringBefore('#').substringBefore('?')
+    if (path.endsWith(".m3u8") || path.endsWith(".mpd")) return false
+    if (SEG_EXT_RE.containsMatchIn(lower)) return true
+    if (SEG_PATH_RE.containsMatchIn(path) && !lower.contains("m3u8") && !lower.contains("playlist") && !lower.contains("master")) return true
+    return false
+}
+
+/** True when [url] or [mime] points to an HLS playlist (including CDN paths like /cdn-m3u8 or ?format=m3u8). */
+fun isHlsUrl(url: String, mime: String? = null): Boolean {
+    if (mime?.contains("mpegurl", true) == true) return true
+    if (url.isBlank() || isSegmentUrl(url)) return false
+    val lower = url.lowercase()
+    val path = lower.substringBefore('#').substringBefore('?')
+    if (path.endsWith(".m3u8") || lower.contains(".m3u8?") || lower.contains(".m3u8&") || lower.contains(".m3u8#")) return true
+    if (lower.contains("mpegurl") || lower.contains("format=m3u8") || lower.contains("type=m3u8")) return true
+    if (path.endsWith("/m3u8") || path.endsWith("-m3u8") || path.endsWith("_m3u8")) return true
+    return false
+}
 
 fun isMediaUrl(url: String): Boolean {
     if (url.isBlank()) return false
     val lower = url.lowercase()
     if (lower.startsWith("blob:") || lower.startsWith("data:")) return false
+    if (isSegmentUrl(lower)) return false
     if (MEDIA_EXT_RE.containsMatchIn(lower)) return true
+    if (isHlsUrl(lower)) return true
     if (lower.contains("googlevideo.com/videoplayback") ||
         lower.contains("manifest.googlevideo.com") ||
         lower.contains("googlevideo.com/api/manifest")) return true
-    if (lower.contains("m3u8") || lower.contains("format=mpd")) return true
+    if (lower.contains("format=mpd")) return true
     // Instagram / Facebook CDN — fbcdn.net and cdninstagram.com deliver .mp4 files
     // with long signed-URL paths that contain no extension hint in the last path segment.
     if ((lower.contains(".fbcdn.net") || lower.contains("cdninstagram.com")) &&
@@ -1372,13 +1463,12 @@ fun isMediaUrl(url: String): Boolean {
 private val AUDIO_EXT_RE = Regex("""\.(mp3|m4a|aac|ogg|oga|opus|flac|wav)(\?|#|$)""")
 private val AUDIO_MIME_RE = Regex("""[?&]mime=audio/""")
 private val ITAG_RE = Regex("""[?&]itag=\d+""")
-private val TS_EXT_RE = Regex("""\.ts(\?|#|$)""")
 
 fun mediaKind(url: String): String {
     val lower = decodedUrl(url)
     val path = url.lowercase()
     return when {
-        lower.contains(".m3u8") || lower.contains("mpegurl") -> "HLS"
+        isHlsUrl(lower) -> "HLS"
         lower.contains(".mpd") || lower.contains("dash+xml") -> "DASH"
         AUDIO_EXT_RE.containsMatchIn(path) -> "AUDIO"
         AUDIO_MIME_RE.containsMatchIn(lower) -> "AUDIO"
@@ -1386,15 +1476,17 @@ fun mediaKind(url: String): String {
     }
 }
 
-/** Larger score = better candidate for the built-in player. */
+/** Larger score = better candidate for the built-in player & downloader. */
 fun mediaScore(url: String): Int {
     val lower = url.lowercase()
     if (lower.startsWith("blob:") || lower.startsWith("data:")) return -1000
+    if (isSegmentUrl(lower)) return -500
     if (lower.contains("thumb") || lower.contains("poster") || lower.contains("sprite") ||
-        lower.contains("storyboard") || lower.contains("preview")) return -300
+        lower.contains("storyboard") || lower.contains("preview") || lower.contains("trailer") ||
+        lower.contains("teaser") || lower.contains("preroll")) return -300
     val decoded = decodedUrl(url)
     var score = when {
-        lower.contains(".m3u8") || lower.contains("mpegurl") -> 130
+        isHlsUrl(lower) -> 135
         lower.contains(".mpd") -> 125
         lower.contains(".mp4") || lower.contains(".m4v") || lower.contains(".mov") -> 115
         lower.contains(".webm") -> 110
@@ -1402,11 +1494,11 @@ fun mediaScore(url: String): Int {
         lower.contains("videoplayback") -> 100
         else -> 70
     }
+    if (lower.contains("master") || lower.contains("playlist") || lower.contains("index.m3u8")) score += 10
     if (decoded.contains("mime=video/")) score += 14
     if (decoded.contains("mime=audio/")) score -= 26
     if (ITAG_RE.containsMatchIn(decoded)) score += 6
     if (lower.contains("&range=") || lower.contains("?range=")) score -= 20
-    if (TS_EXT_RE.containsMatchIn(lower)) score -= 45
     if (mediaKind(url) == "AUDIO") score -= 18
     return score
 }

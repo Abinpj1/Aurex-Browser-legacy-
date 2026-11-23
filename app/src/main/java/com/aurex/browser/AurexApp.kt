@@ -28,13 +28,13 @@ class AurexApp : Application() {
             runCatching { DownloadService.update(this, DownloadManager.current?.items?.toList().orEmpty()) }
             runCatching { BrowserMediaService.live?.refresh() }
         }
-        // A killed download can leave a plaintext cookie file behind: never keep one.
-        runCatching { cacheDir.listFiles { f -> f.name.startsWith("ytdlp_cookies_") }?.forEach { it.delete() } }
         VideoDl.load(this)
         downloads = DownloadManager(this)
-        // Keep the Download folder in line with the "Files visibility" setting (default: visible).
-        MediaVisibility.sync(this)
-        MediaVisibility.catchUpAsync(this)   // saves files in Downloads (once for old ones) and finishes a copy that was cut short (Android 10+)
+        // Offload cold-start disk house-keeping (stale cookie cleanup + .nomedia sync) off the UI thread.
+        Thread({
+            runCatching { cacheDir.listFiles { f -> f.name.startsWith("ytdlp_cookies_") }?.forEach { it.delete() } }
+            runCatching { MediaVisibility.sync(this) }
+        }, "aurex-boot-io").apply { isDaemon = true; start() }
         // Tier-aware cold-start warmup:
         //  - LOW-end phones: skip eager warmup completely (yt-dlp unpacks on-demand when a video is downloaded).
         //  - BALANCED: defer 4s so startup & first page render stay silky smooth.

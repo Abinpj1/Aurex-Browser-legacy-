@@ -405,10 +405,11 @@ class GlassBackdrop(val parent: GlassBackdrop? = null) {
     }
 
     private fun ensureLiveWebLoop() {
+        // Avoid continuous software WebView.draw() polling (major CPU/thermal drain on webpages):
+        // a single crisp snapshot on window open + settle captures real page content with 0% idle heat.
         val w = attachedWeb ?: return
-        if (liveWindows > 0 && !liveWebLoopPosted && !PerfTier.low && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            liveWebLoopPosted = true
-            w.postOnAnimation(liveWebLoopRunnable)
+        if (liveWindows > 0 && !PerfTier.low && !PerfTier.thermalWarm && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (webBitmap == null) scheduleWebSnapshot(force = true)
         }
     }
 
@@ -438,10 +439,10 @@ class GlassBackdrop(val parent: GlassBackdrop? = null) {
 
     fun scheduleWebSnapshot(force: Boolean = false, settleOnly: Boolean = false) {
         val w = attachedWeb ?: return
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || PerfTier.low || isRecordingNow) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || PerfTier.low || PerfTier.thermalWarm || isRecordingNow) return
         if (activeConsumers <= 0 && !force) return
 
-        val settleMs = if (PerfTier.balanced) 200L else 150L
+        val settleMs = if (PerfTier.balanced) 280L else 210L
         w.removeCallbacks(webSettleRunnable)
         w.postDelayed(webSettleRunnable, settleMs)
 
@@ -450,9 +451,9 @@ class GlassBackdrop(val parent: GlassBackdrop? = null) {
         val now = SystemClock.uptimeMillis()
         val elapsed = now - lastWebSnapMs
         val throttleMs = when {
-            liveWindows > 0 -> if (PerfTier.balanced) 360L else 260L
-            PerfTier.balanced -> 300L
-            else -> 200L
+            liveWindows > 0 -> if (PerfTier.balanced) 650L else 480L
+            PerfTier.balanced -> 560L
+            else -> 400L
         }
         if (!force && elapsed < throttleMs) {
             webSnapPosted = true
@@ -465,15 +466,15 @@ class GlassBackdrop(val parent: GlassBackdrop? = null) {
 
     private fun captureWebNow() {
         val w = attachedWeb ?: return
-        if (PerfTier.low || isRecordingNow || !w.isAttachedToWindow || w.visibility != View.VISIBLE) return
+        if (PerfTier.low || PerfTier.thermalWarm || isRecordingNow || !w.isAttachedToWindow || w.visibility != View.VISIBLE) return
         val vw = w.width
         val vh = w.height
         if (vw < 16 || vh < 16) return
 
         // Fast 1/5.5-res blurred backdrop (~3x faster Chromium CPU draw, visually identical after 8.5..15dp blur!)
-        val scale = if (PerfTier.balanced) 0.15f else 0.18f
-        val maxW = if (PerfTier.balanced) 160 else 200
-        val maxH = if (PerfTier.balanced) 340 else 420
+        val scale = if (PerfTier.balanced) 0.135f else 0.16f
+        val maxW = if (PerfTier.balanced) 148 else 184
+        val maxH = if (PerfTier.balanced) 310 else 384
         val bw = (vw * scale).roundToInt().coerceIn(64, maxW)
         val bh = (vh * scale).roundToInt().coerceIn(64, maxH)
 
@@ -1249,8 +1250,10 @@ fun ScrollEdgeBlur(
         modifier
             .fillMaxWidth()
             .height(height)
-            .graphicsLayer { alpha = intensityState.value.coerceIn(0f, 1f) }
-            .background(brush)
+            .drawWithContent {
+                val a = intensityState.value.coerceIn(0f, 1f)
+                if (a > 0.005f) drawRect(brush = brush, alpha = a)
+            }
     )
 }
 
@@ -1738,14 +1741,20 @@ object GlassTilt {
         val sensor = m.getDefaultSensor(Sensor.TYPE_GRAVITY) ?: m.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) ?: return
         var fx = x
         var fy = y
+        var lastEmitMs = 0L
         val l = object : SensorEventListener {
             override fun onSensorChanged(e: SensorEvent) {
+                val now = SystemClock.uptimeMillis()
+                if (now - lastEmitMs < 45L) return
                 val g = 9.81f
                 val tx = (e.values[0] / g).coerceIn(-1f, 1f)
                 val ty = (e.values[2] / g - 0.45f).coerceIn(-1f, 1f)
-                fx += (tx - fx) * 0.18f
-                fy += (ty - fy) * 0.18f
-                if (abs(fx - x) > 0.015f || abs(fy - y) > 0.015f) { x = fx; y = fy }
+                fx += (tx - fx) * 0.22f
+                fy += (ty - fy) * 0.22f
+                if (abs(fx - x) > 0.028f || abs(fy - y) > 0.028f) {
+                    lastEmitMs = now
+                    x = fx; y = fy
+                }
             }
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
         }

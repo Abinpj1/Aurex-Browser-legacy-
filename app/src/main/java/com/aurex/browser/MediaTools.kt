@@ -375,12 +375,13 @@ object Remux {
             var lastATs = -1L
             while (vAlive || aAlive) {
                 // always write the stream that is further behind, so the file is interleaved
+                val ae = aEx
                 val takeVideo = when {
-                    !aAlive -> true
+                    !aAlive || ae == null -> true
                     !vAlive -> false
-                    else -> vEx.sampleTime <= aEx!!.sampleTime
+                    else -> vEx.sampleTime <= ae.sampleTime
                 }
-                val ex = if (takeVideo) vEx else aEx!!
+                val ex = if (takeVideo || ae == null) vEx else ae
                 buf.clear()
                 val size = ex.readSampleData(buf, 0)
                 if (size < 0) {
@@ -389,10 +390,10 @@ object Remux {
                 }
                 var ts = ex.sampleTime.coerceAtLeast(0L)
                 if (takeVideo) {
-                    if (ts < lastVTs) ts = lastVTs + 1L
+                    if (ts <= lastVTs) ts = lastVTs + 1L
                     lastVTs = ts
                 } else {
-                    if (ts < lastATs) ts = lastATs + 1L
+                    if (ts <= lastATs) ts = lastATs + 1L
                     lastATs = ts
                 }
                 info.set(0, size, ts, ex.sampleFlags and MediaCodec.BUFFER_FLAG_KEY_FRAME)

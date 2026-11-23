@@ -5,7 +5,8 @@ import android.content.res.Resources
 import android.os.Handler
 import android.os.LocaleList
 import android.os.Looper
-import androidx.compose.material3.LocalTextStyle
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.getValue
@@ -725,10 +726,11 @@ object AppLang {
     }
 }
 
+val LocalTextStyle = compositionLocalOf { TextStyle.Default }
+
 /**
- * Drop-in replacement for Material's Text: the app's own strings are shown in the chosen language,
- * everything else (page titles, file names, typed text) is shown exactly as it is.
- * Files of this package use it automatically (they must not import androidx.compose.material3.Text).
+ * Pure Foundation Text with automatic on-device translation (zero Material3 overhead).
+ * The app's own strings are shown in the chosen language; user content stays untouched.
  */
 @Composable
 fun Text(
@@ -751,12 +753,33 @@ fun Text(
     style: TextStyle = LocalTextStyle.current
 ) {
     val shown = if (AppLang.ui == "en") text else { AppLang.version; AppLang.translate(text) }
-    androidx.compose.material3.Text(
-        text = shown, modifier = modifier, color = color, fontSize = fontSize, fontStyle = fontStyle,
-        fontWeight = fontWeight, fontFamily = fontFamily, letterSpacing = letterSpacing,
-        textDecoration = textDecoration, textAlign = textAlign, lineHeight = lineHeight,
-        overflow = overflow, softWrap = softWrap, maxLines = maxLines, minLines = minLines,
-        onTextLayout = onTextLayout ?: {}, style = style
+    val resolvedColor = when {
+        color != Color.Unspecified -> color
+        style.color != Color.Unspecified -> style.color
+        else -> LocalPalette.current.textPrimary
+    }
+    val merged = style.merge(
+        TextStyle(
+            color = resolvedColor,
+            fontSize = fontSize,
+            fontWeight = fontWeight,
+            fontStyle = fontStyle,
+            fontFamily = fontFamily,
+            letterSpacing = letterSpacing,
+            textDecoration = textDecoration,
+            textAlign = textAlign ?: TextAlign.Unspecified,
+            lineHeight = lineHeight
+        )
+    )
+    BasicText(
+        text = shown,
+        modifier = modifier,
+        style = merged,
+        onTextLayout = onTextLayout,
+        overflow = overflow,
+        softWrap = softWrap,
+        maxLines = maxLines,
+        minLines = minLines
     )
 }
 
@@ -780,11 +803,32 @@ fun Text(
     onTextLayout: ((TextLayoutResult) -> Unit)? = null,
     style: TextStyle = LocalTextStyle.current
 ) {
-    androidx.compose.material3.Text(
-        text = text, modifier = modifier, color = color, fontSize = fontSize, fontStyle = fontStyle,
-        fontWeight = fontWeight, fontFamily = fontFamily, letterSpacing = letterSpacing,
-        textDecoration = textDecoration, textAlign = textAlign, lineHeight = lineHeight,
-        overflow = overflow, softWrap = softWrap, maxLines = maxLines, minLines = minLines,
-        inlineContent = emptyMap(), onTextLayout = onTextLayout ?: {}, style = style
+    val resolvedColor = when {
+        color != Color.Unspecified -> color
+        style.color != Color.Unspecified -> style.color
+        else -> LocalPalette.current.textPrimary
+    }
+    val merged = style.merge(
+        TextStyle(
+            color = resolvedColor,
+            fontSize = fontSize,
+            fontWeight = fontWeight,
+            fontStyle = fontStyle,
+            fontFamily = fontFamily,
+            letterSpacing = letterSpacing,
+            textDecoration = textDecoration,
+            textAlign = textAlign ?: TextAlign.Unspecified,
+            lineHeight = lineHeight
+        )
+    )
+    BasicText(
+        text = text,
+        modifier = modifier,
+        style = merged,
+        onTextLayout = onTextLayout,
+        overflow = overflow,
+        softWrap = softWrap,
+        maxLines = maxLines,
+        minLines = minLines
     )
 }

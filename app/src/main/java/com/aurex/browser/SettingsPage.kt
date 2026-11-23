@@ -34,7 +34,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -255,8 +254,8 @@ private fun SRow(
         Modifier
             .fillMaxWidth()
             .then(if (onClick != null) Modifier.clickableHaptic(onClick = onClick) else Modifier)
-            .heightIn(min = 42.dp)
-            .padding(horizontal = 14.dp, vertical = 5.dp),
+            .heightIn(min = 46.dp)
+            .padding(horizontal = 16.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (icon != null) {
@@ -291,8 +290,8 @@ private fun SSwitch(title: String, checked: Boolean, onChange: (Boolean) -> Unit
         Modifier
             .fillMaxWidth()
             .clickableHaptic(kind = if (checked) Hx.TOGGLE_OFF else Hx.TOGGLE_ON) { onChange(!checked) }
-            .heightIn(min = 42.dp)
-            .padding(horizontal = 14.dp, vertical = 5.dp),
+            .heightIn(min = 46.dp)
+            .padding(horizontal = 16.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(Modifier.weight(1f)) {
@@ -661,8 +660,7 @@ private fun SettingsRoot(s: BrowserState, open: (Int) -> Unit) {
     val engineName = ENGINES[s.engine.coerceIn(0, ENGINES.lastIndex)].name
     val swipesOn = listOf(
         s.swipeLinkTabSwitch, s.swipeTabClose, s.swipeDownloadDelete,
-        s.swipeTabCardClose, s.swipeEdgeBack, s.swipeLibraryActions,
-        s.swipeDlRightDelete, s.swipeDlLeftShare, s.holdTabsNewTab, s.holdMenuSettings
+        s.holdTabsNewTab, s.holdMenuSettings, s.swipeDlRightDelete
     ).count { it }
 
     SettingsScroll {
@@ -718,10 +716,7 @@ private fun autoLabel(choice: String, name: String): String =
 @Composable
 private fun LanguageSettings(s: BrowserState, open: (Int) -> Unit) {
     SettingsScroll {
-        SGroup(
-            footer = "App language on Auto follows your device language. Website language on Auto follows the app language. " +
-                "Pick a language to set either one on its own."
-        ) {
+        SGroup {
             nav("App language", AppleIcons.Language, cBlue,
                 autoLabel(AppLang.uiChoice, AppLang.nameOfUi())) { open(12) }
             nav("Website language", AppleIcons.Language, cTeal,
@@ -732,14 +727,10 @@ private fun LanguageSettings(s: BrowserState, open: (Int) -> Unit) {
 
 @Composable
 private fun AppLanguageSettings() {
-    val deviceSub = if (AppLang.deviceSupported()) "Device language: ${AppLang.deviceName()}"
-        else "Your device language (${AppLang.deviceName()}) isn't available yet, English is used"
+    val deviceSub = if (AppLang.deviceSupported()) AppLang.deviceName()
+        else "English (${AppLang.deviceName()} unavailable)"
     SettingsScroll {
-        SGroup(
-            footer = "Tap a language to use it. One that is not on this phone yet downloads first (about 30 MB, once) and " +
-                "switches when it is ready. The download button only downloads. Afterwards it works offline. " +
-                "Web pages, file names and anything you type are never changed."
-        ) {
+        SGroup(footer = "Downloads ~30 MB once per language for offline use.") {
             row(INSET, "Auto Device language") {
                 AppLangRow(AppLang.AUTO, "Auto", deviceSub)
             }
@@ -754,16 +745,12 @@ private fun AppLanguageSettings() {
 
 @Composable
 private fun WebLanguageSettings(s: BrowserState) {
-    // Tapping the language that is already chosen does nothing (no second toast).
     fun pick(code: String) { if (AppLang.web != code) { AppLang.updateWeb(code); s.applyWebLanguage() } }
     SettingsScroll {
-        SGroup(
-            footer = "Sites that offer several languages show this one. Reload a page to see it. A site's own language " +
-                "switch always wins. Download is optional: it saves the app's language pack (about 30 MB) for offline use."
-        ) {
+        SGroup(footer = "Reload a page to apply.") {
             row(INSET, "Auto App language") {
                 WebLangRow(
-                    AppLang.AUTO, "Auto", "Same as the app language: ${AppLang.nameOfWebAuto()}",
+                    AppLang.AUTO, "Auto", AppLang.nameOfWebAuto(),
                     AppLang.web == AppLang.AUTO
                 ) { pick(AppLang.AUTO) }
             }
@@ -814,10 +801,7 @@ private fun AboutSettings(s: BrowserState, onClose: () -> Unit, openCredits: () 
                 }
             }
         }
-        SGroup(
-            header = "Updates",
-            footer = "Updates come from the GitHub releases of the project. Checking contacts api.github.com only."
-        ) {
+        SGroup(header = "Updates") {
             val u = s.update
             act(
                 "Check for updates", AppleIcons.Refresh, cGreen,
@@ -836,18 +820,13 @@ private fun AboutSettings(s: BrowserState, onClose: () -> Unit, openCredits: () 
             }
             sw("Check automatically", u.auto) { u.toggleAuto(it) }
         }
-        SGroup(header = "Developer") {
+        SGroup(header = "Open source") {
             act("Developer", AppleIcons.Star, cOrange, value = AUTHOR_NAME) { inApp(AUTHOR_URL) }
-        }
-        SGroup(
-            header = "Open source",
-            footer = "Aurex is open source. Bug reports, ideas and pull requests are welcome."
-        ) {
             act("Source code", AppleIcons.Code, cGray, value = "GitHub") { inApp(REPO_URL) }
             act("Report an issue", AppleIcons.ErrorOutline, cRed) { inApp(ISSUES_URL) }
-            act("Telegram community", AppleIcons.Share, cBlue, value = "@aurex_oss") { openTelegram() }
+            act("Telegram", AppleIcons.Share, cBlue, value = "@aurex_oss") { openTelegram() }
         }
-        SGroup(footer = "Aurex stands on the shoulders of these open-source projects.") {
+        SGroup {
             nav("Open-source credits", AppleIcons.Book, cPurple) { openCredits() }
         }
     }
@@ -959,7 +938,7 @@ private fun AppearanceSettings(s: BrowserState) {
             sw("Favorites", s.showHomeSites) { s.showHomeSites = it; s.save() }
             sw("Recent sites", s.showRecent) { s.showRecent = it; s.save() }
         }
-        SGroup(footer = "Live status-bar Dynamic Island pill for active downloads and media playback.") {
+        SGroup {
             sw("Dynamic Island", s.dynamicIsland) { on ->
                 s.dynamicIsland = on
                 NotifIsland.enabled = on
@@ -1025,7 +1004,7 @@ private fun ToolbarSettings(s: BrowserState) {
         SettingsScroll {
             SGroup(
                 header = "Preview",
-                footer = "Drag a control onto the bar, or tap one to add it. The menu stays fixed."
+                footer = "Drag or tap a control to customize."
             ) {
                 row {
                     Column(Modifier.fillMaxWidth().padding(14.dp)) {
@@ -1091,6 +1070,9 @@ private fun ToolbarSettings(s: BrowserState) {
             }
 
             SGroup(header = "Behavior") {
+                seg("Toolbar position", listOf("Bottom", "Top"), if (s.barTop) 1 else 0) {
+                    s.barTop = (it == 1); s.barVisible = true; s.save()
+                }
                 sw("Auto-hide on scroll", s.autoHide) {
                     s.autoHide = it; s.barVisible = true; s.save()
                 }
@@ -1244,26 +1226,19 @@ private fun DownloadSettings(s: BrowserState) {
     var mediaVisible by remember { mutableStateOf(MediaVisibility.isOn(ctx)) }
 
     SettingsScroll {
-        SGroup(
-            footer = if (on) "Finds videos on the pages you open and saves them with the built-in engine."
-            else "Off: the video engine is not loaded, pages are not scanned for videos and no download " +
-                "buttons appear, so it uses no memory. Normal file downloads still work."
-        ) {
-            sw("Video download", on, if (on) "On" else "Off · saves memory") { s.setVideoDownload(it) }
-        }
-        if (on) {
-            SGroup(footer = "Parallel ranges and HLS are handled automatically.") {
-                sw("Always best quality", s.alwaysBestQuality, "Skip the quality sheet") {
+        SGroup {
+            sw("Video download", on) { s.setVideoDownload(it) }
+            if (on) {
+                sw("Always best quality", s.alwaysBestQuality) {
                     s.alwaysBestQuality = it; s.save()
                 }
             }
-            SGroup(
-                header = "Video engine",
-                footer = "Sites change often; an up-to-date engine keeps downloads working."
-            ) {
+        }
+        if (on) {
+            SGroup(header = "Video engine") {
                 info("Version", YtDlpEngine.engineVersion.ifBlank { "…" })
                 info("Last checked", checkedText)
-                sw("Auto-update", auto, "Every 6 hours in the background") {
+                sw("Auto-update", auto) {
                     auto = it; YtDlpEngine.setAutoUpdate(ctx, it)
                 }
                 if (YtDlpEngine.engineProblem.isNotBlank()) info("Problem", YtDlpEngine.engineProblem)
@@ -1290,15 +1265,12 @@ private fun DownloadSettings(s: BrowserState) {
                 }
             }
         }
-        SGroup(
-            footer = if (mediaVisible) "All downloaded files (PDF, APK, videos, music, images and more) are saved in your phone's Downloads folder, so File Manager and Gallery can show them (a copy is kept in Downloads/AurexBrowser)."
-            else "Hidden from File Manager and Gallery. Files stay private in the Downloads list here."
-        ) {
-            sw("Files visibility", mediaVisible, if (mediaVisible) "Visible in Downloads" else "Hidden") {
+        SGroup(footer = if (mediaVisible) "Visible in Downloads/AurexBrowser." else "Hidden from Gallery & File Manager.") {
+            sw("Files visibility", mediaVisible) {
                 mediaVisible = it; MediaVisibility.set(ctx, it)
             }
         }
-        SGroup(footer = "Files are saved in the app's Download folder.") {
+        SGroup {
             act("Clear finished", AppleIcons.DeleteSweep, cGray) { s.downloads.clearFinished() }
             act("Pause all", AppleIcons.Pause, cOrange) { s.downloads.pauseAll() }
         }
@@ -1317,14 +1289,17 @@ private fun PrivacySettings(s: BrowserState, onClearData: () -> Unit) {
     }
     SettingsScroll {
         SGroup(header = "Blocking") {
-            sw("Adblock", s.adblock, "Ads, trackers and YouTube ads") {
+            sw("Adblock", s.adblock) {
                 s.adblock = it; s.applySettings(); s.save()
             }
-            sw("Popup & redirect blocker", s.popupBlock, "Logins and payments keep working") {
+            sw("Popup & redirect blocker", s.popupBlock) {
                 s.popupBlock = it; s.applySettings(); s.save()
             }
+            sw("Block 3rd-party cookies", !s.thirdPartyCookies) {
+                s.thirdPartyCookies = !it; s.applySettings(); s.save()
+            }
             if (siteHost.isNotEmpty()) {
-                sw("Trust " + siteHost, s.isSiteTrusted(siteHost), "Allow popups on this site") {
+                sw("Trust " + siteHost, s.isSiteTrusted(siteHost)) {
                     s.setSiteTrusted(siteHost, it)
                 }
             }
@@ -1332,25 +1307,12 @@ private fun PrivacySettings(s: BrowserState, onClearData: () -> Unit) {
                 act("Clear trusted sites", value = "${s.trustedSites.size}") { s.clearTrustedSites() }
             }
         }
-        SGroup(header = "Connection") {
-            sw("Block 3rd-party cookies", !s.thirdPartyCookies, "Some logins may break") {
-                s.thirdPartyCookies = !it; s.applySettings(); s.save()
-            }
-        }
         SGroup(
-            header = "Private tabs",
-            footer = "Switching to a private tab asks for your phone lock (fingerprint, face, PIN, pattern or password). " +
-                "Needs a screen lock on the phone; turning this off asks too."
+            header = "Security",
+            footer = "Protected by phone lock · ${s.adultBlocked} adult blocked"
         ) {
-            sw("Lock private tabs", s.incognitoLock, "Ask for the phone lock") { s.toggleIncognitoLock(it) }
-        }
-        SGroup(
-            header = "Adult content",
-            footer = "${s.adultBlocked} blocked · turning off asks for your phone lock"
-        ) {
-            sw("Block adult content", s.blockAdult, "Adult sites, searches, leak and illegal adult sites, SafeSearch") {
-                s.setAdultFilter(it)
-            }
+            sw("Lock private tabs", s.incognitoLock) { s.toggleIncognitoLock(it) }
+            sw("Block adult content", s.blockAdult) { s.setAdultFilter(it) }
             if (s.adultAllowed.isNotEmpty()) {
                 act("Clear allowed sites", value = "${s.adultAllowed.size}") { s.clearAdultAllowed() }
             }
@@ -1358,7 +1320,7 @@ private fun PrivacySettings(s: BrowserState, onClearData: () -> Unit) {
                 AdultFilter.loadBigList(true); s.notify("Updating the adult-site list")
             }
         }
-        SGroup(header = "Filters", footer = "Lists update every 2 days.") {
+        SGroup(header = "Filters") {
             info("Threats blocked", "${s.blocked}")
             info("Popups & redirects", "${s.popupsBlocked + s.redirectsBlocked}")
             info("Filter rules", "${s.blocker.ruleCount}")
@@ -1377,44 +1339,28 @@ private fun PrivacySettings(s: BrowserState, onClearData: () -> Unit) {
 @Composable
 private fun SwipeSettings(s: BrowserState) {
     SettingsScroll {
-        SGroup(footer = "Shortcuts on the toolbar buttons.") {
-            sw("Swipe the address bar", s.swipeLinkTabSwitch, "Left or right switches tabs") {
+        SGroup(header = "Toolbar") {
+            sw("Swipe address bar", s.swipeLinkTabSwitch, "Switch tabs") {
                 s.swipeLinkTabSwitch = it; s.save()
             }
-            sw("Swipe up on Tabs", s.swipeTabClose, "Closes the current tab") {
+            sw("Swipe up on Tabs", s.swipeTabClose, "Close tab") {
                 s.swipeTabClose = it; s.save()
             }
-            sw("Swipe up on Downloads", s.swipeDownloadDelete, "Deletes the latest download") {
+            sw("Swipe up on Downloads", s.swipeDownloadDelete, "Delete latest") {
                 s.swipeDownloadDelete = it; s.save()
             }
         }
-        SGroup(header = "Press and hold", footer = "Press and hold a toolbar button.") {
-            sw("Hold Tabs for a new tab", s.holdTabsNewTab, "Opens a new tab with the keyboard ready to type") {
+        SGroup(header = "Press & hold") {
+            sw("Hold Tabs for new tab", s.holdTabsNewTab) {
                 s.holdTabsNewTab = it; s.save()
             }
-            sw("Hold the menu for Settings", s.holdMenuSettings, "The three-dot button opens Settings") {
+            sw("Hold menu for Settings", s.holdMenuSettings) {
                 s.holdMenuSettings = it; s.save()
             }
         }
-        SGroup(header = "Tabs & panels", footer = "Fluid swipe gestures inside Tabs, Settings, and side panels.") {
-            sw("Swipe tab card to close", s.swipeTabCardClose, "Swipe left or right on any tab in Tabs") {
-                s.swipeTabCardClose = it; s.save()
-            }
-            sw("Swipe from left edge", s.swipeEdgeBack, "Closes panels and goes back in Settings") {
-                s.swipeEdgeBack = it; s.save()
-            }
-        }
-        SGroup(header = "Bookmarks & history", footer = "Swipe right to remove, or swipe left to share any link.") {
-            sw("Swipe to delete & share", s.swipeLibraryActions, "Works in Bookmarks and History lists") {
-                s.swipeLibraryActions = it; s.save()
-            }
-        }
-        SGroup(header = "Downloads list", footer = "Swipe a download in the Downloads list. Delete also removes the file, with no confirmation.") {
-            sw("Swipe right to delete", s.swipeDlRightDelete, "Deletes the download and its file") {
+        SGroup(header = "Downloads", footer = "Permanently removes the file with no confirmation.") {
+            sw("Swipe right to delete", s.swipeDlRightDelete) {
                 s.swipeDlRightDelete = it; s.save()
-            }
-            sw("Swipe left to share", s.swipeDlLeftShare, "Shares the finished file") {
-                s.swipeDlLeftShare = it; s.save()
             }
         }
     }
@@ -1594,17 +1540,17 @@ private fun MenuSettings(s: BrowserState) {
 @Composable
 private fun MediaSettings(s: BrowserState) {
     SettingsScroll {
-        SGroup(footer = "Picture-in-picture starts when you leave the app during playback.") {
-            sw("Floating media button", s.mediaFab, "Play and picture-in-picture over a video") {
+        SGroup {
+            sw("Floating media button", s.mediaFab) {
                 s.mediaFab = it; s.save()
             }
-            sw("Background playback", s.backgroundPlay, "Keep playing when you leave") {
+            sw("Background playback", s.backgroundPlay) {
                 s.backgroundPlay = it; s.save()
             }
             sw("Auto picture-in-picture", s.autoPip) {
                 s.autoPip = it; s.save()
             }
-            sw("Autoplay", s.autoplay, "Videos start without a tap") {
+            sw("Autoplay", s.autoplay) {
                 s.autoplay = it; s.applySettings(); s.save()
             }
         }
@@ -1617,7 +1563,7 @@ private fun MediaSettings(s: BrowserState) {
 private fun SearchSettings(s: BrowserState) {
     val style = LocalGlassStyle.current
     SettingsScroll {
-        SGroup(footer = "Used from the address bar and start page.") {
+        SGroup {
             ENGINES.forEachIndexed { i, eng ->
                 row(58.dp, eng.name + " search engine") {
                     Row(
@@ -1682,18 +1628,26 @@ private fun GeneralSettings(s: BrowserState, onReset: () -> Unit) {
     val version = appVersion()
     val ctx = androidx.compose.ui.platform.LocalContext.current
     var logBusy by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { s.refreshDefaults() }
     SettingsScroll {
+        SGroup {
+            act(
+                "Default browser",
+                AppleIcons.Home,
+                cBlue,
+                value = if (s.isDefaultBrowser) "Default" else "Set default"
+            ) { s.requestDefaultBrowser() }
+        }
         SGroup(header = "Browsing") {
-            sw("Data saver", s.blockImages, "Block images to save data") {
+            sw("Open links in apps", s.openInApps) {
+                s.openInApps = it; s.save()
+            }
+            sw("Data saver", s.blockImages, "Block images") {
                 s.blockImages = it; s.applySettings(); s.save()
             }
             sw("Desktop site", s.desktop) { s.toggleDesktop() }
         }
-        SGroup(
-            header = "Support",
-            footer = "Copies device info, the state of the video engine and recent errors (no cookies, no page " +
-                "addresses beyond the site and path). Paste it into a bug report."
-        ) {
+        SGroup(header = "Support") {
             act("Copy log", AppleIcons.Copy, cBlue, value = if (logBusy) "Collecting…" else null) {
                 if (!logBusy) {
                     logBusy = true

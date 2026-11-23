@@ -217,13 +217,11 @@ class MainActivity : ComponentActivity() {
                     // Auto PiP arms itself once the video has played stably for AUTO_PIP_STABLE_MS
                     // (ads / previews never qualify), so the system flag is refreshed right after.
                     if (vPlaying && !inlineOn) {
-                        // The arming moment (stable >= 3 s) is time based and no state change happens
-                        // exactly then, so one single delayed refresh could miss it (-> no PiP on the first
-                        // Home / swipe). Re-check every 500 ms while the video plays; the key check inside
-                        // updatePipParams makes this free when nothing changed.
                         delay(AUTO_PIP_STABLE_MS + 150L)
-                        while (true) {
+                        repeat(6) {
                             updatePipParams()
+                            val curTab = state.tabs.getOrNull(state.current)
+                            if (curTab == null || autoPipReady(curTab)) return@LaunchedEffect
                             delay(500L)
                         }
                     }
@@ -244,7 +242,14 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        webUrlOf(intent)?.let { state.newTab(it) }
+        webUrlOf(intent)?.let { url ->
+            if (::state.isInitialized) {
+                state.openPanelRequest = null
+                state.closePanelsTick++
+                val onlyHome = state.tabs.size == 1 && state.tabs[0].isHome && !state.tabs[0].incognito
+                if (onlyHome) state.load(state.tabs[0], url) else state.newTab(url)
+            }
+        }
         applyDebugIntent(intent)
         handleNotifTap(intent)
     }
@@ -390,19 +395,23 @@ class MainActivity : ComponentActivity() {
         runCatching { setPictureInPictureParams(buildPipParams()) }
     }
 
-    /** Best-effort 120 fps high performance mode across supported devices. */
+    /**
+     * Thermal-friendly Adaptive Refresh Rate:
+     * On Android 11+ (API 30+), letting SurfaceFlinger / LTPO manage refresh rate automatically gives
+     * silky 120 FPS during touch/scroll/animations while dropping to 60/30/10 Hz on static pages & video
+     * (hard-locking preferredDisplayModeId disabled LTPO and caused continuous display/GPU heat!).
+     */
     private fun requestHighRefreshRate() {
+        if (Build.VERSION.SDK_INT >= 30) return
         runCatching {
             @Suppress("DEPRECATION")
-            val d = if (Build.VERSION.SDK_INT >= 30) display else windowManager.defaultDisplay
-            if (d == null) return
-            val cur  = d.mode
+            val d = windowManager.defaultDisplay ?: return
+            val cur = d.mode
             val best = d.supportedModes
-                .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+                .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight && it.refreshRate <= 120.5f }
                 .maxByOrNull { it.refreshRate } ?: return
             val attrs = window.attributes
-            attrs.preferredDisplayModeId = best.modeId
-            attrs.preferredRefreshRate   = best.refreshRate
+            attrs.preferredRefreshRate = best.refreshRate
             window.attributes = attrs
         }
     }
@@ -451,7 +460,7 @@ class MainActivity : ComponentActivity() {
             aurexWeb()?.armBackgroundTransition()
             if (!state.inlinePlayer) state.pipCommand("enter()")
             window?.decorView?.postDelayed({
-                if (!isInPictureInPictureMode) {
+                if (!isDestroyed && !isInPictureInPictureMode) {
                     state.pipEntering = false
                     if (!state.inlinePlayer) state.pipCommand("exit()")
                 }
@@ -627,6 +636,7 @@ class MainActivity : ComponentActivity() {
             BrowserState.markLive(state)
             state.pipMode = isInPictureInPictureMode
             state.syncTabActivity()
+            state.refreshDefaults()
         }
     }
 
@@ -641,8 +651,15 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         if (::state.isInitialized) state.onPause() // saves session & prefs only
         super.onPause()
-        // Note: webView.onPause() and webView.pauseTimers() are intentionally
-        // omitted here. The AurexWebView subclass keeps the renderer alive via
-        // onWindowVisibilityChanged / onWindowFocusChanged overrides instead.
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // When leaving Aurex with no PiP / background media active, pause idle WebViews so background
+        // webpages never burn CPU/battery or heat the phone while minimized or screen-off.
+        if (::state.isInitialized) {
+            val inPip = Build.VERSION.SDK_INT >= 26 && isInPictureInPictureMode
+            state.onAppBackgrounded(keepMedia = inPip || audioMode)
+        }
     }
 }

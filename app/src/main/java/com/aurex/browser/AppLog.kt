@@ -200,7 +200,7 @@ object AppLog {
     }
 
     fun copy(ctx: Context, text: String): Boolean = try {
-        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return false
         // the clipboard travels through Binder (about 1 MB): keep the newest part
         cm.setPrimaryClip(ClipData.newPlainText("Aurex log", text.takeLast(400_000)))
         true

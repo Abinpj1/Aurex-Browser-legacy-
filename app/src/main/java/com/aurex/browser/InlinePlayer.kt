@@ -152,10 +152,11 @@ fun InlinePlayerHost(s: BrowserState) {
             if (page == listFor) return@resolve          // same video as the lists already shown
             listFor = page
             hlsQ = emptyList(); engineH = emptyList(); engineUrls = emptyMap()
-            if (!isYtPage && media != null && mediaKind(media) == "HLS") {
+            if (!isYtPage && media != null && (media in t.hlsUrls || mediaKind(media) == "HLS")) {
+                val hlsRef = t.mediaRef[media] ?: page
                 Thread {
                     val v = runCatching {
-                        s.downloads.listHlsVariants(media, ua, page, null)
+                        s.downloads.listHlsVariants(media, ua, hlsRef, null)
                     }.getOrDefault(emptyList())
                     act?.runOnUiThread { if (v.size > 1 && listFor == page) hlsQ = v }
                 }.start()

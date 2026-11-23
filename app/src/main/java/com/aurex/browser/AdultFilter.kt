@@ -95,11 +95,14 @@ object AdultFilter {
     /** Loads the bundled domains (a few KB, instant). Safe to call more than once. */
     fun init(ctx: Context) {
         if (appCtx != null) return
-        appCtx = ctx.applicationContext
-        runCatching {
-            ctx.assets.open("adult_domains.txt").bufferedReader().useLines { lines -> lines.forEach { add(it) } }
+        val app = ctx.applicationContext
+        appCtx = app
+        thread(name = "adult-bundled", isDaemon = true) {
+            runCatching {
+                app.assets.open("adult_domains.txt").bufferedReader().useLines { lines -> lines.forEach { add(it) } }
+            }
+            verdicts.evictAll()
         }
-        verdicts.evictAll()
     }
 
     /**

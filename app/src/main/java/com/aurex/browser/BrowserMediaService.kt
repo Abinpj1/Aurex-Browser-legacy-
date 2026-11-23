@@ -281,26 +281,27 @@ class BrowserMediaService : Service() {
     // ── Locks ────────────────────────────────────────────────────────────────
 
     private fun acquireLocks() {
-        // CPU wake lock – keeps decoding and audio threads alive when screen is off.
         if (wakeLock == null) {
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_TAG).also {
-                it.setReferenceCounted(false)
-                it.acquire(WAKE_LOCK_TIMEOUT_MS)
+            runCatching {
+                val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return@runCatching
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_TAG).also {
+                    it.setReferenceCounted(false)
+                    it.acquire(WAKE_LOCK_TIMEOUT_MS)
+                }
             }
         }
 
-        // Wi-Fi lock – prevents the radio from entering power-save mode and stalling
-        // the HLS / DASH adaptive-bitrate stream mid-playback.
         if (wifiLock == null) {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            @Suppress("DEPRECATION")
-            val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            } else {
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            runCatching {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return@runCatching
+                @Suppress("DEPRECATION")
+                val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wm.createWifiLock(lockMode, WIFI_TAG).also { it.acquire() }
             }
-            wifiLock = wm.createWifiLock(lockMode, WIFI_TAG).also { it.acquire() }
         }
     }
 

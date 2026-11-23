@@ -340,8 +340,12 @@ class PopupGuard {
     }
 
     private val SAFE_APP_SCHEMES = setOf(
-        "upi", "tez", "gpay", "phonepe", "paytmmp", "bhim", "credpay",
-        "whatsapp", "tg", "mailto", "tel", "sms", "geo"
+        "upi", "tez", "gpay", "phonepe", "paytmmp", "paytm", "bhim", "credpay", "amazonpay",
+        "whatsapp", "tg", "telegram", "mailto", "tel", "sms", "smsto", "mms", "geo", "google.navigation",
+        "market", "vnd.youtube", "youtube", "spotify", "discord", "zoomus", "zoommtg", "slack",
+        "instagram", "fb", "twitter", "reddit", "linkedin", "snapchat", "swiggy", "zomato",
+        "flipkart", "amzn", "myntra", "ola", "uber", "rapido", "truecaller", "digilocker",
+        "irctc", "jiocinema", "hotstar", "netflix", "primevideo", "magnet"
     )
 
     private val TRUST_WORDS = listOf("pay", "bank", "secure", "login", "auth", "sso", "oauth", "account", "3ds", "gateway", "checkout")

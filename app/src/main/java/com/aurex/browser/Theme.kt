@@ -35,10 +35,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Typography
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.ReadOnlyComposable
@@ -65,7 +61,6 @@ import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
@@ -230,20 +225,28 @@ object PerfTier {
     var tier: Int = if (Build.VERSION.SDK_INT < 29) TIER_LOW else TIER_BALANCED
         private set
 
+    /** True when Android reports THERMAL_STATUS_MODERATE+ (reactive Compose state for instant GPU/shader cooldown). */
+    var thermalWarm by mutableStateOf(false)
+        private set
+
+    @Volatile
+    private var thermalRegistered: Boolean = false
+
     val low: Boolean get() = tier == TIER_LOW
     val balanced: Boolean get() = tier == TIER_BALANCED
     val high: Boolean get() = tier == TIER_HIGH
-    val useAgsl: Boolean get() = tier == TIER_HIGH && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+    val useAgsl: Boolean get() = tier == TIER_HIGH && !thermalWarm && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
 
     /**
-     * Always automatic hardware calibration:
+     * Automatic hardware + live OS thermal calibration:
      *  - TIER_LOW: 2-4 GB RAM devices, Android <= 9, <= 4 cores, or Android Go (`isLowRamDevice`)
      *  - TIER_BALANCED: 6 GB mid-range or Android 10-12 devices
-     *  - TIER_HIGH: 8-16 GB Android 13+ devices (full 4-tap AGSL Liquid Glass)
+     *  - TIER_HIGH: 8-16 GB Android 13+ devices (full AGSL Liquid Glass while thermally cool)
      */
     fun init(ctx: android.content.Context) {
+        val app = ctx.applicationContext
         runCatching {
-            val am = ctx.getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            val am = app.getSystemService(android.content.Context.ACTIVITY_SERVICE) as? android.app.ActivityManager ?: return@runCatching
             val info = android.app.ActivityManager.MemoryInfo()
             am.getMemoryInfo(info)
             val ramGb = info.totalMem / (1024f * 1024f * 1024f)
@@ -252,6 +255,18 @@ object PerfTier {
                 am.isLowRamDevice || Build.VERSION.SDK_INT < 29 || ramGb < 3.85f || cores <= 4 -> TIER_LOW
                 Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || ramGb < 5.8f || cores <= 6 -> TIER_BALANCED
                 else -> TIER_HIGH
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !thermalRegistered) {
+            thermalRegistered = true
+            runCatching {
+                val pm = app.getSystemService(android.content.Context.POWER_SERVICE) as? android.os.PowerManager ?: return@runCatching
+                val main = android.os.Handler(android.os.Looper.getMainLooper())
+                thermalWarm = pm.currentThermalStatus >= android.os.PowerManager.THERMAL_STATUS_MODERATE
+                pm.addThermalStatusListener { status ->
+                    val warm = status >= android.os.PowerManager.THERMAL_STATUS_MODERATE
+                    main.post { thermalWarm = warm }
+                }
             }
         }
     }
@@ -294,62 +309,16 @@ fun AurexTheme(
     val palette = if (dark) DarkPalette else LightPalette
     // Apple system blue is fixed: no wallpaper / website / user-picked accent.
     val ink = if (dark) Color(0xFF0A84FF) else Color(0xFF007AFF)
-    val scheme = remember(dark) { if (dark) {
-        darkColorScheme(
-            primary = ink,
-            onPrimary = Color.White,
-            secondary = ink,
-            background = palette.bg,
-            onBackground = palette.textPrimary,
-            surface = palette.glass,
-            onSurface = palette.textPrimary,
-            surfaceVariant = palette.surfaceVariant,
-            onSurfaceVariant = palette.textSecondary,
-            outline = Color.White.copy(alpha = 0.18f),
-            error = palette.bad
-        )
-    } else {
-        lightColorScheme(
-            primary = ink,
-            onPrimary = Color.White,
-            secondary = ink,
-            background = palette.bg,
-            onBackground = palette.textPrimary,
-            surface = palette.glass,
-            onSurface = palette.textPrimary,
-            surfaceVariant = palette.surfaceVariant,
-            onSurfaceVariant = palette.textSecondary,
-            outline = Color.Black.copy(alpha = 0.14f),
-            error = palette.bad
-        )
-    } }
-    // Built once: re-creating this on every recomposition re-themed every text in the app.
-    val type = remember {
-        // SF-style text scale (Large Title 34 / Title 28-22-20 / Headline 17 / Body 17 / Subhead 15 / Footnote 13 / Caption 12-11)
-        Typography(
-            displayLarge = TextStyle(fontSize = 34.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.4.sp),
-            headlineLarge = TextStyle(fontSize = 34.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.4.sp),
-            headlineMedium = TextStyle(fontSize = 28.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.36.sp),
-            headlineSmall = TextStyle(fontSize = 22.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.35.sp),
-            titleLarge = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.38.sp),
-            titleMedium = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.41).sp),
-            titleSmall = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.24).sp),
-            bodyLarge = TextStyle(fontSize = 17.sp, letterSpacing = (-0.41).sp),
-            bodyMedium = TextStyle(fontSize = 15.sp, letterSpacing = (-0.24).sp),
-            bodySmall = TextStyle(fontSize = 13.sp, letterSpacing = (-0.08).sp),
-            labelLarge = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.Medium, letterSpacing = (-0.24).sp),
-            labelMedium = TextStyle(fontSize = 12.sp),
-            labelSmall = TextStyle(fontSize = 11.sp, letterSpacing = 0.07.sp)
-        )
+    val baseTextStyle = remember(dark) {
+        TextStyle(color = palette.textPrimary, fontSize = 15.sp, letterSpacing = (-0.24).sp)
     }
     CompositionLocalProvider(
         LocalGlassStyle provides GlassStyle(ink, glass, haptics, glow, dark),
-        LocalPalette provides palette
+        LocalPalette provides palette,
+        LocalTextStyle provides baseTextStyle
     ) {
-        MaterialTheme(colorScheme = scheme, typography = type) {
-            ApplySystemBars(dark)
-            content()
-        }
+        ApplySystemBars(dark)
+        content()
     }
 }
 
@@ -554,7 +523,7 @@ fun Modifier.liquidGlass(
     val dark = p.dark
     val highFidelity = Build.VERSION.SDK_INT >= 29 && !PerfTier.low
     val hasLiveBackdrop = optical && LocalGlassBackdrop.current != null &&
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !PerfTier.low
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !PerfTier.low && !PerfTier.thermalWarm
     val lv = level.coerceIn(0.4f, 1.5f)
 
     // Single unified Apple iOS 27 Liquid Glass formula across EVERY button, orb, toolbar, menu & sheet:
@@ -579,7 +548,6 @@ fun Modifier.liquidGlass(
     val enableTouch = LocalWindowInteractive.current && highFidelity && (reactive || hasLiveBackdrop)
     val touch = if (enableTouch) remember { GlassTouch() } else null
     val scope = if (touch != null) rememberCoroutineScope() else null
-    if (enableTouch) GlassTiltLease(enabled = s.glow)
     val root: Modifier = when {
         reactive && touch != null && scope != null -> this.glassPressTilt(touch, scope)
         hasLiveBackdrop && touch != null && scope != null -> this.glassPressObserve(touch, scope)

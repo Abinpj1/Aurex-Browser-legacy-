@@ -44,6 +44,10 @@ object MediaVisibility {
 
     /** One copy at a time: big videos must not compete for disk and the order stays predictable. */
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "aurex-media-export").apply { isDaemon = true } }
+    /** Maps private file absolutePath -> exact MediaStore Uri published in Downloads/AurexBrowser. */
+    private val publishedUris = java.util.concurrent.ConcurrentHashMap<String, Uri>()
+    /** Paths explicitly deleted by the user so an in-flight publish() aborts instead of recreating the file. */
+    private val deletedPaths = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     private fun prefs(ctx: Context) = ctx.getSharedPreferences("liquid", Context.MODE_PRIVATE)
 
@@ -83,23 +87,46 @@ object MediaVisibility {
     }
 
     /** Called when a download has finished: when visible, save it in the public Downloads folder straight away. */
-    fun onFinished(ctx: Context, file: File) {
+    fun onFinished(ctx: Context, file: File, onPublished: ((String) -> Unit)? = null) {
         runCatching {
             val app = ctx.applicationContext
+            deletedPaths.remove(file.absolutePath)
             if (isOn(app)) {
-                worker.execute { runCatching { publish(app, file) } }
+                worker.execute {
+                    val uri = runCatching { publish(app, file) }.getOrNull()
+                    if (uri != null && !deletedPaths.containsKey(file.absolutePath)) {
+                        runCatching { onPublished?.invoke(uri.toString()) }
+                    }
+                }
             } else {
-                // Hidden: make sure the marker is there (the folder may have been created after start-up).
                 sync(app)
             }
         }
     }
 
-    /** Called after a finished download was deleted in Aurex: its public copy goes too. */
-    fun onDeleted(ctx: Context, file: File) {
-        if (Build.VERSION.SDK_INT < 29) return
+    /**
+     * Permanently deletes every public/local-storage copy of [file] (exact MediaStore [publicUri],
+     * cached [publishedUris], MediaStore Downloads/Files/Video/Audio/Images rows, and direct Downloads/AurexBrowser file).
+     */
+    fun onDeleted(ctx: Context, file: File, publicUri: String? = null) {
         val app = ctx.applicationContext
-        worker.execute { runCatching { unpublish(app, file) } }
+        val absPath = file.absolutePath
+        val name = file.name
+        deletedPaths[absPath] = System.currentTimeMillis()
+        worker.execute {
+            runCatching {
+                if (Build.VERSION.SDK_INT >= 29) {
+                    unpublish(app, file, publicUri)
+                } else {
+                    runCatching {
+                        @Suppress("DEPRECATION")
+                        val pub = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "$FOLDER/$name")
+                        if (pub.exists()) pub.delete()
+                    }
+                    runCatching { MediaScannerConnection.scanFile(app, arrayOf(absPath), null, null) }
+                }
+            }
+        }
     }
 
     /**
@@ -194,11 +221,12 @@ object MediaVisibility {
     /** The public copy of [name] (its row and size) when Aurex already put one in [t]. Rows of other apps are never seen. */
     @RequiresApi(29)
     private fun findCopy(ctx: Context, t: Target, name: String): Pair<Uri, Long>? {
+        val relNoSlash = t.relativePath.trimEnd('/')
         ctx.contentResolver.query(
             t.collection,
             arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.SIZE),
-            "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND ${MediaStore.MediaColumns.RELATIVE_PATH}=?",
-            arrayOf(name, t.relativePath),
+            "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND (${MediaStore.MediaColumns.RELATIVE_PATH}=? OR ${MediaStore.MediaColumns.RELATIVE_PATH}=?)",
+            arrayOf(name, t.relativePath, relNoSlash),
             null
         )?.use { c ->
             if (c.moveToFirst()) return Pair(ContentUris.withAppendedId(t.collection, c.getLong(0)), c.getLong(1))
@@ -206,52 +234,108 @@ object MediaVisibility {
         return null
     }
 
-    /** Puts a finished file into the public Downloads folder. Android 9 and older: asks the media scan instead. */
-    private fun publish(ctx: Context, file: File) {
-        if (!file.isFile || file.length() <= 0L || isPartial(file)) return
+    /** Puts a finished file into the public Downloads folder and returns its public MediaStore Uri (API 29+). */
+    private fun publish(ctx: Context, file: File): Uri? {
+        val absPath = file.absolutePath
+        if (deletedPaths.containsKey(absPath) || !file.isFile || file.length() <= 0L || isPartial(file)) return null
         if (Build.VERSION.SDK_INT < 29) {
             MediaScannerConnection.scanFile(ctx, arrayOf(file.path), null, null)
-            return
+            return null
         }
         val t = targetFor(file)
         val resolver = ctx.contentResolver
         val size = file.length()
         findCopy(ctx, t, file.name)?.let { (uri, copySize) ->
-            if (copySize == size) {                // already there
+            if (copySize == size) {
+                publishedUris[absPath] = uri
                 runCatching { removeLegacyCopy(ctx, file) }
-                return
+                return uri
             }
-            runCatching { resolver.delete(uri, null, null) }   // an older or cut-short copy: replace it
+            runCatching { resolver.delete(uri, null, null) }
         }
         val free = runCatching { StatFs((ctx.getExternalFilesDir(null) ?: file).path).availableBytes }.getOrDefault(Long.MAX_VALUE)
         if (free < size + FREE_SPACE_MARGIN) {
             AppLog.warn("MediaVisibility", "not enough free space to save ${file.name} in Downloads")
-            return
+            return null
         }
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
             put(MediaStore.MediaColumns.MIME_TYPE, t.mime)
             put(MediaStore.MediaColumns.RELATIVE_PATH, t.relativePath)
-            put(MediaStore.MediaColumns.IS_PENDING, 1)      // hidden from other apps until the copy is complete
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
-        val uri = resolver.insert(t.collection, values) ?: return
-        try {
+        val uri = resolver.insert(t.collection, values) ?: return null
+        return try {
             val out = resolver.openOutputStream(uri, "w") ?: throw IOException("no output stream")
-            out.use { o -> file.inputStream().use { it.copyTo(o, COPY_BUFFER) } }
+            out.use { o ->
+                file.inputStream().use { input ->
+                    val buf = ByteArray(COPY_BUFFER)
+                    while (true) {
+                        if (deletedPaths.containsKey(absPath)) throw IOException("deleted while publishing")
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        o.write(buf, 0, n)
+                    }
+                }
+            }
+            if (deletedPaths.containsKey(absPath)) {
+                runCatching { resolver.delete(uri, null, null) }
+                return null
+            }
             resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            publishedUris[absPath] = uri
             runCatching { removeLegacyCopy(ctx, file) }
+            uri
         } catch (e: Throwable) {
             runCatching { resolver.delete(uri, null, null) }
-            AppLog.warn("MediaVisibility", "Downloads copy of ${file.name} failed: ${e.message}")
+            if (!deletedPaths.containsKey(absPath)) {
+                AppLog.warn("MediaVisibility", "Downloads copy of ${file.name} failed: ${e.message}")
+            }
+            null
         }
     }
 
     @RequiresApi(29)
-    private fun unpublish(ctx: Context, file: File) {
-        findCopy(ctx, targetFor(file), file.name)?.let { (uri, _) ->
-            runCatching { ctx.contentResolver.delete(uri, null, null) }
+    private fun deleteAllMatching(ctx: Context, collection: Uri, name: String, relPath: String) {
+        val resolver = ctx.contentResolver
+        val relNoSlash = relPath.trimEnd('/')
+        val sel = "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND (${MediaStore.MediaColumns.RELATIVE_PATH}=? OR ${MediaStore.MediaColumns.RELATIVE_PATH}=?)"
+        val args = arrayOf(name, relPath, relNoSlash)
+        val ids = ArrayList<Long>()
+        runCatching {
+            resolver.query(collection, arrayOf(MediaStore.MediaColumns._ID), sel, args, null)?.use { c ->
+                while (c.moveToNext()) ids.add(c.getLong(0))
+            }
         }
+        for (id in ids) {
+            runCatching { resolver.delete(ContentUris.withAppendedId(collection, id), null, null) }
+        }
+        runCatching { resolver.delete(collection, sel, args) }
+    }
+
+    @RequiresApi(29)
+    private fun unpublish(ctx: Context, file: File, publicUri: String? = null) {
+        val resolver = ctx.contentResolver
+        publishedUris.remove(file.absolutePath)?.let { cached ->
+            runCatching { resolver.delete(cached, null, null) }
+        }
+        if (!publicUri.isNullOrBlank()) {
+            runCatching { resolver.delete(Uri.parse(publicUri), null, null) }
+        }
+        val name = file.name
+        deleteAllMatching(ctx, MediaStore.Downloads.EXTERNAL_CONTENT_URI, name, DOWNLOADS_PATH)
+        deleteAllMatching(ctx, MediaStore.Files.getContentUri("external"), name, DOWNLOADS_PATH)
         runCatching { removeLegacyCopy(ctx, file) }
+        val legacy = legacyTargetFor(file)
+        if (legacy != null) deleteAllMatching(ctx, legacy.collection, name, legacy.relativePath)
+        runCatching {
+            @Suppress("DEPRECATION")
+            val pub = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "$FOLDER/$name")
+            if (pub.exists()) {
+                pub.delete()
+                runCatching { MediaScannerConnection.scanFile(ctx, arrayOf(pub.absolutePath), null, null) }
+            }
+        }
     }
 
     /** Removes every copy Aurex made (only Aurex's own rows can be touched, other apps' files are never affected). */
@@ -265,9 +349,13 @@ object MediaVisibility {
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI to Environment.DIRECTORY_PICTURES
         )
         for ((collection, top) in folders) {
+            val rel = "$top/$FOLDER/"
+            val relNoSlash = "$top/$FOLDER"
             runCatching {
                 ctx.contentResolver.delete(
-                    collection, "${MediaStore.MediaColumns.RELATIVE_PATH}=?", arrayOf("$top/$FOLDER/")
+                    collection,
+                    "${MediaStore.MediaColumns.RELATIVE_PATH}=? OR ${MediaStore.MediaColumns.RELATIVE_PATH}=?",
+                    arrayOf(rel, relNoSlash)
                 )
             }
         }

@@ -79,6 +79,8 @@ class DlItem(
     var mime: String?,
     var file: File
 ) {
+    /** MediaStore Uri of the public Downloads/AurexBrowser copy (for permanent deletion). */
+    @Volatile var publicUri: String? = null
     /** Address of the embed player that loaded the link: sent as Referer in place of the page (hotlink protection). */
     var frameReferer: String? = null
     /** Universal (yt-dlp) downloads: what to fetch and the unique marker in the output name. */
@@ -161,7 +163,9 @@ class DlItem(
 
 class DownloadManager(private val ctx: Context) {
     val items = mutableStateListOf<DlItem>()
-    private var nextId = 0
+    private val nextId = AtomicInteger(1)
+    @Volatile private var metaLoaded = false
+    @Volatile private var pendingPersist = false
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val meta = File(ctx.filesDir, "downloads.tsv")
     private val dlPool = ConnectionPool(
@@ -197,61 +201,80 @@ class DownloadManager(private val ctx: Context) {
 
     init {
         current = this
-        runCatching {
-            if (meta.exists()) {
-                val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: ctx.filesDir
-                meta.readLines().forEach { line ->
-                    val p = line.split('\t')
-                    if (p.size >= 2 && p[0].isNotBlank()) {
-                        val f = File(dir, p[1])
-                        val st = p.getOrNull(3) ?: "DONE"
-                        val knd = runCatching { DlKind.valueOf(p.getOrNull(4) ?: "FILE") }.getOrDefault(DlKind.FILE)
-                        val savedTotal = p.getOrNull(5)?.toLongOrNull() ?: -1L
-                        val savedDone = p.getOrNull(6)?.toLongOrNull() ?: 0L
-                        val savedRef = p.getOrNull(7)?.takeIf { it.isNotBlank() }
-                        val hasPartial = f.exists() || File(dir, ".${f.name}.parts").exists() || File(dir, ".${f.name}.ckpt").exists()
-                        if (st == "DONE" && f.exists()) {
-                            items.add(
-                                DlItem(
-                                    id = nextId++,
-                                    url = p[0],
-                                    ua = DEFAULT_UA,
-                                    cookie = null,
-                                    referer = savedRef,
-                                    mime = p.getOrNull(2)?.takeIf { it.isNotBlank() },
-                                    file = f
-                                ).apply {
-                                    total = f.length()
-                                    done = total
-                                    status = DlStatus.DONE
-                                    partsUsed = 1
-                                    probed = true
-                                    partProgress.add(1f)
-                                }
-                            )
-                        } else if (st == "PAUSED" && hasPartial && knd != DlKind.YTDLP) {
-                            items.add(
-                                DlItem(
-                                    id = nextId++,
-                                    url = p[0],
-                                    ua = DEFAULT_UA,
-                                    cookie = siteCookie(p[0]),
-                                    referer = savedRef,
-                                    mime = p.getOrNull(2)?.takeIf { it.isNotBlank() },
-                                    file = f
-                                ).apply {
-                                    kind = knd
-                                    total = savedTotal
-                                    done = savedDone.coerceAtLeast(0L)
-                                    status = DlStatus.PAUSED
-                                    probed = false
-                                }
-                            )
+        // Load saved download history off the main thread so Application.onCreate() stays 0ms disk I/O!
+        scope.launch(Dispatchers.IO) {
+            val loaded = ArrayList<DlItem>()
+            runCatching {
+                if (meta.exists()) {
+                    val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: ctx.filesDir
+                    meta.readLines().forEach { line ->
+                        val p = line.split('\t')
+                        if (p.size >= 2 && p[0].isNotBlank()) {
+                            val f = File(dir, p[1])
+                            val st = p.getOrNull(3) ?: "DONE"
+                            val knd = runCatching { DlKind.valueOf(p.getOrNull(4) ?: "FILE") }.getOrDefault(DlKind.FILE)
+                            val savedTotal = p.getOrNull(5)?.toLongOrNull() ?: -1L
+                            val savedDone = p.getOrNull(6)?.toLongOrNull() ?: 0L
+                            val savedRef = p.getOrNull(7)?.takeIf { it.isNotBlank() }
+                            val hasPartial = f.exists() || File(dir, ".${f.name}.parts").exists() || File(dir, ".${f.name}.ckpt").exists()
+                            if (st == "DONE" && f.exists()) {
+                                loaded.add(
+                                    DlItem(
+                                        id = nextId.getAndIncrement(),
+                                        url = p[0],
+                                        ua = DEFAULT_UA,
+                                        cookie = null,
+                                        referer = savedRef,
+                                        mime = p.getOrNull(2)?.takeIf { it.isNotBlank() },
+                                        file = f
+                                    ).apply {
+                                        total = f.length()
+                                        done = total
+                                        status = DlStatus.DONE
+                                        partsUsed = 1
+                                        probed = true
+                                        publicUri = p.getOrNull(8)?.takeIf { it.isNotBlank() }
+                                        partProgress.add(1f)
+                                    }
+                                )
+                            } else if (st == "PAUSED" && hasPartial && knd != DlKind.YTDLP) {
+                                loaded.add(
+                                    DlItem(
+                                        id = nextId.getAndIncrement(),
+                                        url = p[0],
+                                        ua = DEFAULT_UA,
+                                        cookie = siteCookie(p[0]),
+                                        referer = savedRef,
+                                        mime = p.getOrNull(2)?.takeIf { it.isNotBlank() },
+                                        file = f
+                                    ).apply {
+                                        kind = knd
+                                        total = savedTotal
+                                        done = savedDone.coerceAtLeast(0L)
+                                        status = DlStatus.PAUSED
+                                        probed = false
+                                    }
+                                )
+                            }
                         }
                     }
                 }
-                items.toList().forEach { labelInBackground(it) }
             }
+            withContext(Dispatchers.Main.immediate) {
+                if (loaded.isNotEmpty()) {
+                    val existing = items.map { it.file.absolutePath }.toHashSet()
+                    loaded.forEach { d -> if (d.file.absolutePath !in existing) items.add(d) }
+                }
+                metaLoaded = true
+                if (pendingPersist) {
+                    pendingPersist = false
+                    persist()
+                }
+            }
+            if (loaded.isNotEmpty()) {
+                loaded.forEach { labelInBackground(it) }
+            }
+            MediaVisibility.catchUpAsync(ctx)
         }
     }
 
@@ -265,8 +288,12 @@ class DownloadManager(private val ctx: Context) {
     }
 
     private fun persist() {
+        if (!metaLoaded) {
+            pendingPersist = true
+            return
+        }
         runCatching {
-            val keep = items.filter {
+            val keep = items.toList().filter {
                 (it.status == DlStatus.DONE && it.file.exists()) ||
                     ((it.status == DlStatus.PAUSED || it.status == DlStatus.RUNNING) && it.kind != DlKind.YTDLP)
             }
@@ -281,7 +308,8 @@ class DownloadManager(private val ctx: Context) {
                         it.kind.name,
                         it.total.toString(),
                         it.done.toString(),
-                        it.referer ?: ""
+                        it.referer ?: "",
+                        it.publicUri ?: ""
                     ).joinToString("\t")
                 }
             )
@@ -343,7 +371,8 @@ class DownloadManager(private val ctx: Context) {
         cookieOverride: String? = null,
         title: String? = null,
         qualityLabel: String? = null,
-        frameReferer: String? = null
+        frameReferer: String? = null,
+        targetHeight: Int = 0
     ) {
         val agent = ua?.takeIf { it.isNotBlank() } ?: DEFAULT_UA
 
@@ -368,23 +397,28 @@ class DownloadManager(private val ctx: Context) {
 
         val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)?.apply { mkdirs() }
             ?: ctx.filesDir
-        val isHls = url.contains(".m3u8", true) || mime?.contains("mpegurl", true) == true
+        val isHls = isHlsUrl(url, mime)
         var guessed = runCatching { URLUtil.guessFileName(url, contentDisposition, mime) }
             .getOrDefault("download_${System.currentTimeMillis()}.bin")
         if (guessed.isBlank() || guessed == "downloadfile.bin") {
             guessed = "download_${System.currentTimeMillis()}.bin"
         }
-        guessed = betterName(guessed, title, serverNamed = contentDisposition?.contains("filename", true) == true)
-        guessed = fixBinName(guessed, mime, url)
+        val srvNamed = contentDisposition?.contains("filename", true) == true
         if (isHls) {
-            guessed = guessed.substringBefore('?')
-                .removeSuffix(".m3u8").ifBlank { "stream_${System.currentTimeMillis()}" } + ".ts"
+            val clean = cleanTitle(title)
+            val base = if (!srvNamed && clean.isNotBlank()) clean
+            else guessed.substringBefore('?').substringBeforeLast('.', guessed).removeSuffix(".m3u8")
+                .ifBlank { "stream_${System.currentTimeMillis()}" }
+            guessed = "$base.ts"
+        } else {
+            guessed = betterName(guessed, title, serverNamed = srvNamed)
+            guessed = fixBinName(guessed, mime, url)
         }
         val f = uniqueFile(dir, guessed)
         val cookie = cookieOverride?.takeIf { it.isNotBlank() }
             ?: siteCookie(url)
         val item = DlItem(
-            id = nextId++,
+            id = nextId.getAndIncrement(),
             url = url,
             ua = agent,
             cookie = cookie,
@@ -396,6 +430,7 @@ class DownloadManager(private val ctx: Context) {
                 kind = DlKind.HLS
                 probed = true
             }
+            if (targetHeight > 0) this.ytHeight = targetHeight
             this.qualityLabel = qualityLabel?.takeIf { it.isNotBlank() }
                 ?: guessLabelFromUrl(url)
             pageTitle = cleanTitle(title).ifBlank { null }
@@ -561,7 +596,15 @@ class DownloadManager(private val ctx: Context) {
                     header("Cookie", c)
                     tag(CookieHome::class.java, CookieHome.of(url))
                 }
-                if (!referer.isNullOrBlank()) header("Referer", referer)
+                if (!referer.isNullOrBlank()) {
+                    header("Referer", referer)
+                    runCatching {
+                        val u = URI(referer)
+                        if (!u.scheme.isNullOrBlank() && !u.host.isNullOrBlank()) {
+                            header("Origin", "${u.scheme}://${u.host}")
+                        }
+                    }
+                }
             }.build()
         val text = http.newCall(req).execute().use { r -> if (r.isSuccessful) r.body?.string().orEmpty() else "" }
         EXTINF_RE.findAll(text).sumOf { it.groupValues[1].toDoubleOrNull() ?: 0.0 }
@@ -582,7 +625,15 @@ class DownloadManager(private val ctx: Context) {
                         header("Cookie", c)
                         tag(CookieHome::class.java, CookieHome.of(url))
                     }
-                    if (!referer.isNullOrBlank()) header("Referer", referer)
+                    if (!referer.isNullOrBlank()) {
+                    header("Referer", referer)
+                    runCatching {
+                        val u = URI(referer)
+                        if (!u.scheme.isNullOrBlank() && !u.host.isNullOrBlank()) {
+                            header("Origin", "${u.scheme}://${u.host}")
+                        }
+                    }
+                }
                 }.build()
             val text = http.newCall(req).execute().use { r ->
                 if (!r.isSuccessful) return emptyList()
@@ -648,7 +699,7 @@ class DownloadManager(private val ctx: Context) {
         }
         val shown = cleanTitle(title).ifBlank { host }
         val item = DlItem(
-            id = nextId++,
+            id = nextId.getAndIncrement(),
             url = pageUrl,
             ua = ua?.takeIf { it.isNotBlank() } ?: DEFAULT_UA,
             cookie = cookie,
@@ -687,7 +738,7 @@ class DownloadManager(private val ctx: Context) {
         val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)?.apply { mkdirs() }
             ?: ctx.filesDir
         val item = DlItem(
-            id = nextId++,
+            id = nextId.getAndIncrement(),
             url = url,
             ua = ua,
             cookie = null,
@@ -771,65 +822,80 @@ class DownloadManager(private val ctx: Context) {
 
     fun cancel(d: DlItem) {
         if (d.kind == DlKind.YTDLP && d.status == DlStatus.RUNNING) YtDlpEngine.cancel(d.id)
-        d.job?.cancel()
-        if (d.kind == DlKind.YTDLP && d.status != DlStatus.DONE) {
-            YtDlpEngine.deleteLeftovers(d.file.parentFile, d.ytTag)
-        }
-        if (d.status != DlStatus.DONE) runCatching { d.file.delete() }
-        runCatching { File(d.file.parentFile, ".${d.file.name}.parts").deleteRecursively() }
-        runCatching { ckptFile(d.file).delete() }
-        items.remove(d)
-        persist()
-        updateNotification()
-        stopServiceIfIdle()
-    }
-
-    /**
-     * Delete button: stops the download if it is still running, takes the item off the list AND
-     * deletes the file from the device (finished file, half-downloaded file, temporary parts).
-     */
-    fun deleteWithFile(d: DlItem) {
-        Haptics.fire(null, Hx.WARN)
-        if (d.kind == DlKind.YTDLP && d.status == DlStatus.RUNNING) YtDlpEngine.cancel(d.id)
         val job = d.job
+        d.job = null
         job?.cancel()
-        items.remove(d)
+        MediaVisibility.onDeleted(ctx, d.file, d.publicUri)
         wipeFiles(d)
-        if (d.status == DlStatus.DONE) MediaVisibility.onDeleted(ctx, d.file)
+        runCatching { ctx.getSystemService(NotificationManager::class.java)?.cancel(DownloadService.doneNotifId(d.id)) }
+        items.remove(d)
         persist()
         updateNotification()
         stopServiceIfIdle()
-        // A worker that is still winding down may write one last chunk: clean up again once it stopped.
         if (job != null) {
             scope.launch {
                 runCatching { job.join() }
                 wipeFiles(d)
+                MediaVisibility.onDeleted(ctx, d.file, d.publicUri)
+            }
+        }
+    }
+
+    /**
+     * Delete button: stops the download if it is still running, takes the item off the list AND
+     * permanently deletes the file from private app storage AND public local storage.
+     */
+    fun deleteWithFile(d: DlItem) {
+        deleteMany(listOf(d))
+    }
+
+    /** Batched permanent deletion (single haptic, single metadata write, zero UI jank). */
+    fun deleteMany(targets: List<DlItem>) {
+        if (targets.isEmpty()) return
+        Haptics.fire(null, Hx.WARN)
+        val nm = runCatching { ctx.getSystemService(NotificationManager::class.java) }.getOrNull()
+        val runningJobs = ArrayList<Pair<DlItem, Job>>()
+        for (d in targets) {
+            if (d.kind == DlKind.YTDLP && d.status == DlStatus.RUNNING) YtDlpEngine.cancel(d.id)
+            val job = d.job
+            d.job = null
+            job?.cancel()
+            if (job != null) runningJobs.add(d to job)
+            // Mark deleted BEFORE removing private file so any in-flight MediaStore copy aborts cleanly!
+            MediaVisibility.onDeleted(ctx, d.file, d.publicUri)
+            wipeFiles(d)
+            runCatching { nm?.cancel(DownloadService.doneNotifId(d.id)) }
+        }
+        items.removeAll(targets.toSet())
+        persist()
+        updateNotification()
+        stopServiceIfIdle()
+        if (runningJobs.isNotEmpty()) {
+            scope.launch {
+                for ((d, job) in runningJobs) {
+                    runCatching { job.join() }
+                    wipeFiles(d)
+                    MediaVisibility.onDeleted(ctx, d.file, d.publicUri)
+                }
             }
         }
     }
 
     private fun wipeFiles(d: DlItem) {
         if (d.ytTag.isNotBlank()) YtDlpEngine.deleteLeftovers(d.file.parentFile, d.ytTag)
-        runCatching { d.file.delete() }
+        runCatching { if (d.file.exists()) d.file.delete() }
         runCatching { File(d.file.parentFile, ".${d.file.name}.parts").deleteRecursively() }
         runCatching { ckptFile(d.file).delete() }
     }
 
     fun remove(d: DlItem) {
-        if (d.status != DlStatus.RUNNING) {
-            runCatching { if (d.status == DlStatus.DONE) d.file.delete() }
-            if (d.status == DlStatus.DONE) MediaVisibility.onDeleted(ctx, d.file)
-            items.remove(d)
-            persist()
-            updateNotification()
-            stopServiceIfIdle()
-        }
+        if (d.status != DlStatus.RUNNING) deleteWithFile(d)
     }
 
+    /** Permanently deletes all completed and failed downloads from the app list AND local device storage. */
     fun clearFinished() {
-        items.removeAll { it.status == DlStatus.DONE || it.status == DlStatus.FAILED }
-        persist()
-        updateNotification()
+        val finished = items.filter { it.status == DlStatus.DONE || it.status == DlStatus.FAILED }
+        deleteMany(finished)
     }
 
     fun pauseAll() {
@@ -954,7 +1020,10 @@ class DownloadManager(private val ctx: Context) {
                 AppLog.info("Download", "done id=${d.id} kind=${d.kind} ${AppLog.url(d.url)} (${d.total / 1024} KB)")
                 Haptics.fire(null, Hx.SUCCESS)
                 persist()
-                MediaVisibility.onFinished(ctx, d.file)
+                MediaVisibility.onFinished(ctx, d.file) { uri ->
+                    d.publicUri = uri
+                    scope.launch(Dispatchers.Main.immediate) { persist() }
+                }
                 runCatching { DownloadService.notifyFinished(ctx, d) }
                 if (d.qualityLabel.isBlank() || d.kind == DlKind.YTDLP) {
                     MediaTools.qualityOf(d.file).takeIf { it.isNotBlank() }?.let { d.qualityLabel = it }
@@ -1796,34 +1865,45 @@ class DownloadManager(private val ctx: Context) {
                 // 1 KB instead of 1 byte: enough to see what the file really is (mp4 / mkv / ts ...) before it is created
                 http.newCall(request(d, "bytes=0-1023")).execute().use { r ->
                     val type = r.header("Content-Type").orEmpty().lowercase()
-                    if (type.contains("mpegurl")) {
+                    val head = ByteArray(1024)
+                    var headN = 0
+                    if (r.isSuccessful) {
+                        runCatching {
+                            val input = r.body?.byteStream()
+                            while (input != null && headN < head.size) {
+                                val k = input.read(head, headN, head.size - headN)
+                                if (k < 0) break
+                                headN += k
+                            }
+                        }
+                    }
+                    val headText = if (headN >= 7) String(head, 0, min(headN, 256), Charsets.UTF_8).trimStart('\uFEFF', ' ', '\t', '\r', '\n') else ""
+                    if (type.contains("mpegurl") || headText.startsWith("#EXTM3U")) {
                         d.kind = DlKind.HLS
+                        d.mime = "video/mp2t"
+                        val baseName = cleanTitle(d.pageTitle).ifBlank {
+                            d.file.name.substringBeforeLast('.', d.file.name)
+                        }
+                        if (!d.file.exists()) {
+                            d.file = uniqueFile(d.file.parentFile, "$baseName.ts")
+                        }
                         d.probed = true
                         return@use
                     }
-                    // Never leave a video as ".bin": the first bytes, the server's file name, the type and the final
-                    // (redirected) link all say what it is. This runs before the file exists, so the name is right from the start.
                     if (!d.file.exists() && !isRealExt(d.file.name.substringAfterLast('.', "").lowercase())) {
-                        var sniffed: String? = null
-                        if (r.isSuccessful) {
-                            val head = ByteArray(1024)
-                            var n = 0
-                            runCatching {
-                                val input = r.body?.byteStream()
-                                while (input != null && n < head.size) {
-                                    val k = input.read(head, n, head.size - n)
-                                    if (k < 0) break
-                                    n += k
-                                }
-                            }
-                            sniffed = sniffBytes(head, n)
-                        }
-                        val fromServer = extOfName(nameFromDisposition(r.header("Content-Disposition")))
+                        val sniffed = sniffBytes(head, headN)
+                        val dispName = nameFromDisposition(r.header("Content-Disposition"))
+                        val fromServer = extOfName(dispName)
                             ?: extForMime(type)
                             ?: extOfName(r.request.url.encodedPath.substringAfterLast('/'))
-                        // a generic "zip" signature only wins when nothing else knows better (docx / apk are zip too)
                         val e = if (sniffed != null && sniffed != "zip") sniffed else fromServer ?: sniffed
-                        if (e != null) d.file = uniqueFile(d.file.parentFile, withExt(d.file.name, e))
+                        if (e != null) {
+                            val mediaExts = setOf("mp4", "m4v", "mkv", "webm", "mov", "ts", "mp3", "m4a", "aac", "ogg", "opus", "flac", "wav")
+                            val titled = if (dispName.isNullOrBlank() && e in mediaExts && !d.pageTitle.isNullOrBlank()) {
+                                "${cleanTitle(d.pageTitle)}.$e"
+                            } else withExt(d.file.name, e)
+                            d.file = uniqueFile(d.file.parentFile, titled)
+                        }
                     }
                     val tag = r.header("ETag")?.takeIf { it.isNotBlank() } ?: r.header("Last-Modified")?.takeIf { it.isNotBlank() }
                     if (tag != null) {
@@ -1931,6 +2011,17 @@ class DownloadManager(private val ctx: Context) {
                     if (k < 0) break
                     headLen += k
                 }
+                val ssHead = if (headLen >= 7) String(head, 0, min(headLen, 256), Charsets.UTF_8).trimStart('\uFEFF', ' ', '\t', '\r', '\n') else ""
+                if (type.contains("mpegurl") || ssHead.startsWith("#EXTM3U")) {
+                    d.kind = DlKind.HLS
+                    d.mime = "video/mp2t"
+                    val baseName = cleanTitle(d.pageTitle).ifBlank {
+                        d.file.name.substringBeforeLast('.', d.file.name)
+                    }
+                    d.file = uniqueFile(d.file.parentFile, "$baseName.ts")
+                    d.probed = true
+                    return@withContext hlsDownload(d)
+                }
                 // the real name is known from the first bytes, before the file is created
                 if (!isRealExt(d.file.name.substringAfterLast('.', "").lowercase())) {
                     val e = sniffBytes(head, headLen)?.takeIf { it != "zip" }
@@ -2012,11 +2103,13 @@ class DownloadManager(private val ctx: Context) {
 
     private suspend fun hlsDownload(d: DlItem) = withContext(Dispatchers.IO) {
         var playlistUrl = d.url
-        var text = fetchText(d, playlistUrl)
+        var text = fetchText(d, playlistUrl).trimStart('\uFEFF', ' ', '\t', '\r', '\n')
 
-        // Master playlist: pick the highest-bandwidth variant AND detect separate #EXT-X-MEDIA:TYPE=AUDIO rendition!
+        // Master playlist (supports up to 2 nested hops): pick target/highest variant + separate #EXT-X-MEDIA:TYPE=AUDIO!
         var audioPlaylistUrl: String? = null
-        if (text.contains("#EXT-X-STREAM-INF")) {
+        var masterHops = 0
+        while (text.contains("#EXT-X-STREAM-INF") && masterHops < 2) {
+            masterHops++
             val lines = text.lines()
             val audioGroups = HashMap<String, String>()
             var fallbackAudioUrl: String? = null
@@ -2063,9 +2156,11 @@ class DownloadManager(private val ctx: Context) {
                 val q = MediaTools.qualityLabel(chosen.w, chosen.h)
                 if (q.isNotBlank()) d.qualityLabel = q
             }
-            audioPlaylistUrl = bestAudioGroup?.let { audioGroups[it] } ?: if (bestAudioGroup != null) fallbackAudioUrl else null
+            if (audioPlaylistUrl == null) {
+                audioPlaylistUrl = bestAudioGroup?.let { audioGroups[it] } ?: if (bestAudioGroup != null) fallbackAudioUrl else null
+            }
             playlistUrl = bestUrl ?: throw IllegalStateException("No HLS variant found")
-            text = fetchText(d, playlistUrl)
+            text = fetchText(d, playlistUrl).trimStart('\uFEFF', ' ', '\t', '\r', '\n')
         }
 
         // Media playlist: segments, init map, byte ranges, per-segment keys.
@@ -2127,7 +2222,8 @@ class DownloadManager(private val ctx: Context) {
         }
         if (segments.isEmpty()) throw IllegalStateException("No media segments found in playlist")
         val isVod = text.contains("#EXT-X-ENDLIST") || text.contains("PLAYLIST-TYPE:VOD", true)
-        if (!isVod && segments.size < 16) {
+        val totalDurSec = EXTINF_RE.findAll(text).sumOf { it.groupValues[1].toDoubleOrNull() ?: 0.0 }
+        if (!isVod && segments.size < 12 && totalDurSec < 45.0) {
             throw IllegalStateException("Live streams can't be saved as a file while broadcasting")
         }
 
@@ -2145,7 +2241,8 @@ class DownloadManager(private val ctx: Context) {
         }
 
         val keyCache = ConcurrentHashMap<String, ByteArray>()
-        val hlsCap = when (PerfTier.tier) { PerfTier.TIER_LOW -> 4; PerfTier.TIER_BALANCED -> 8; else -> HLS_WORKERS }
+        val rateLimitUntil = AtomicLong(0L)
+        val hlsCap = when (PerfTier.tier) { PerfTier.TIER_LOW -> 4; PerfTier.TIER_BALANCED -> 8; else -> min(HLS_WORKERS, 10) }
         val n = min(hlsCap, segments.size).coerceAtLeast(1)
         d.partsUsed = n
         d.kind = DlKind.HLS
@@ -2191,7 +2288,8 @@ class DownloadManager(private val ctx: Context) {
                         currentCoroutineContext().ensureActive()
                         val part = File(tempDir, "%05d.part".format(index))
                         if (!part.exists() || part.length() == 0L) {
-                            val bytes = fetchSegment(d, segments[index], keyCache)
+                            val rawBytes = fetchSegment(d, segments[index], keyCache, rateLimitUntil)
+                            val bytes = if (initUrl == null) stripDisguisedTsPrefix(rawBytes) else rawBytes
                             val tmp = File(tempDir, "%05d.tmp".format(index))
                             tmp.writeBytes(bytes)
                             if (!tmp.renameTo(part)) {
@@ -2272,7 +2370,8 @@ class DownloadManager(private val ctx: Context) {
                                 currentCoroutineContext().ensureActive()
                                 val p = File(aDir, "%05d.part".format(idx))
                                 if (!p.exists() || p.length() == 0L) {
-                                    val b = fetchSegment(d, aSegs[idx], keyCache)
+                                    val bRaw = fetchSegment(d, aSegs[idx], keyCache, rateLimitUntil)
+                                    val b = if (aInitUrl == null) stripDisguisedTsPrefix(bRaw) else bRaw
                                     p.writeBytes(b)
                                     bytesDone.addAndGet(b.size.toLong())
                                     d.done = bytesDone.get()
@@ -2304,10 +2403,20 @@ class DownloadManager(private val ctx: Context) {
         }
         if (audioFile != null) {
             d.statusNote = "Merging audio & video…"
+            val mp4Target = if (d.file.extension.equals("ts", true)) {
+                uniqueFile(d.file.parentFile, d.file.name.removeSuffix(".ts") + ".mp4")
+            } else d.file
             val muxOk = runCatching {
-                Remux.mux(rawVideoFile, audioFile, d.file, webm = false)
+                Remux.mux(rawVideoFile, audioFile, mp4Target, webm = false)
             }.isSuccess
-            if (!muxOk) {
+            if (muxOk && mp4Target.exists() && mp4Target.length() > 2_048L) {
+                if (mp4Target != d.file) {
+                    runCatching { d.file.delete() }
+                    d.file = mp4Target
+                }
+                d.mime = "video/mp4"
+            } else {
+                if (mp4Target != d.file) runCatching { mp4Target.delete() }
                 rawVideoFile.copyTo(d.file, overwrite = true)
             }
             d.statusNote = null
@@ -2346,22 +2455,61 @@ class DownloadManager(private val ctx: Context) {
         }
     }
 
-    /** Fetches one segment (up to 5 attempts, non-blocking coroutine backoff) and decrypts AES-128 if present. */
-    private suspend fun fetchSegment(d: DlItem, seg: HlsSeg, keyCache: ConcurrentHashMap<String, ByteArray>): ByteArray {
+    /**
+     * Streaming CDNs (anime / movie embeds) frequently disguise MPEG-TS segments by prepending a fake
+     * PNG, GIF, BMP, or random header before the first 0x47 MPEG-TS sync byte. Stripping that junk prefix
+     * guarantees clean MediaMuxer MP4 remuxing and smooth seeking across every player.
+     */
+    private fun stripDisguisedTsPrefix(raw: ByteArray): ByteArray {
+        if (raw.size < 376) return raw
+        if ((raw[0].toInt() and 0xFF) == 0x47 && (raw[188].toInt() and 0xFF) == 0x47) return raw
+        val limit = min(raw.size - 376, 2048)
+        for (i in 1..limit) {
+            if ((raw[i].toInt() and 0xFF) == 0x47 &&
+                (raw[i + 188].toInt() and 0xFF) == 0x47 &&
+                (i + 376 >= raw.size || (raw[i + 376].toInt() and 0xFF) == 0x47)
+            ) {
+                return raw.copyOfRange(i, raw.size)
+            }
+        }
+        return raw
+    }
+
+    /** Fetches one segment (up to 7 attempts with shared 429/503 cooldown + HTML error rejection) and decrypts AES-128. */
+    private suspend fun fetchSegment(
+        d: DlItem,
+        seg: HlsSeg,
+        keyCache: ConcurrentHashMap<String, ByteArray>,
+        rateLimitUntil: AtomicLong? = null
+    ): ByteArray {
         var raw: ByteArray
         var attempt = 0
         while (true) {
             currentCoroutineContext().ensureActive()
+            val waitMs = (rateLimitUntil?.get() ?: 0L) - System.currentTimeMillis()
+            if (waitMs > 0L) delay(min(waitMs, 4_000L) + ((seg.seq * 31L) % 250L))
             try {
                 raw = fetchBytes(d, seg.url, seg.range)
+                if (raw.isEmpty()) throw IllegalStateException("Empty segment")
+                if (seg.keyUri == null && raw.size < 65_536) {
+                    val head = String(raw, 0, min(raw.size, 64), Charsets.ISO_8859_1).trimStart().lowercase()
+                    if (head.startsWith("<!doctype") || head.startsWith("<html") || head.startsWith("{\"error")) {
+                        throw IllegalStateException("Server returned error page for segment")
+                    }
+                }
                 break
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 attempt++
-                if (attempt > 5) throw e
-                val backoff = min(3_000L, 280L * (1L shl (attempt - 1).coerceAtMost(4)))
-                delay(backoff + ((seg.seq * 41L) % 160L))
+                val isRateLimit = e.message?.contains("429") == true || e.message?.contains("503") == true
+                if (isRateLimit) {
+                    rateLimitUntil?.set(System.currentTimeMillis() + 1_600L)
+                }
+                if (attempt > (if (isRateLimit) 7 else 5)) throw e
+                val baseMs = if (isRateLimit) 950L else 280L
+                val backoff = min(if (isRateLimit) 6_000L else 3_000L, baseMs * (1L shl (attempt - 1).coerceAtMost(4)))
+                delay(backoff + ((seg.seq * 47L) % 240L))
             }
         }
         val keyUri = seg.keyUri ?: return raw
@@ -2480,15 +2628,32 @@ class DownloadManager(private val ctx: Context) {
             "chunklist", "media", "download", "downloadfile", "file", "main", "hls"
         )
 
+        private fun resolvedMime(d: DlItem): String {
+            val ext = d.file.extension.lowercase()
+            if (ext == "apk") return "application/vnd.android.package-archive"
+            val cur = d.mime?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+            if (cur.isNotEmpty() && cur != "application/octet-stream" && cur != "binary/octet-stream") return cur
+            val fromMap = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+            if (!fromMap.isNullOrBlank()) return fromMap
+            return URLConnection.guessContentTypeFromName(d.file.name) ?: "application/octet-stream"
+        }
+
         fun open(ctx: Context, d: DlItem) {
+            if (!d.file.exists()) return
             runCatching {
-                val mime = d.mime ?: URLConnection.guessContentTypeFromName(d.name)
-                ?: "application/octet-stream"
+                val mime = resolvedMime(d)
                 val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", d.file)
                 val intent = Intent(Intent.ACTION_VIEW)
                     .setDataAndType(uri, mime)
-                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                ctx.startActivity(Intent.createChooser(intent, "Open ${d.name}"))
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (mime == "application/vnd.android.package-archive") {
+                    ctx.startActivity(intent)
+                } else {
+                    ctx.startActivity(
+                        Intent.createChooser(intent, "Open ${d.name}")
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
             }.onFailure { share(ctx, d) }
         }
 
@@ -2499,7 +2664,7 @@ class DownloadManager(private val ctx: Context) {
             if (files.size == 1) { share(ctx, files[0]); return }
             runCatching {
                 val uris = ArrayList<Uri>(files.map { FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", it.file) })
-                val mimes = files.map { it.mime ?: URLConnection.guessContentTypeFromName(it.name) ?: "application/octet-stream" }
+                val mimes = files.map { resolvedMime(it) }
                 val type = when {
                     mimes.distinct().size == 1 -> mimes[0]
                     mimes.all { it.startsWith("video/") } -> "video/*"
@@ -2514,20 +2679,27 @@ class DownloadManager(private val ctx: Context) {
                 val clip = android.content.ClipData.newRawUri("", uris[0])
                 for (i in 1 until uris.size) clip.addItem(android.content.ClipData.Item(uris[i]))
                 intent.clipData = clip
-                ctx.startActivity(Intent.createChooser(intent, "Share ${files.size} files"))
+                ctx.startActivity(
+                    Intent.createChooser(intent, "Share ${files.size} files")
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
             }
         }
 
         fun share(ctx: Context, d: DlItem) {
+            if (!d.file.exists()) return
             runCatching {
-                val mime = d.mime ?: URLConnection.guessContentTypeFromName(d.name)
-                ?: "application/octet-stream"
+                val mime = resolvedMime(d)
                 val uri: Uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", d.file)
                 val intent = Intent(Intent.ACTION_SEND)
                     .setType(mime)
                     .putExtra(Intent.EXTRA_STREAM, uri)
                     .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                ctx.startActivity(Intent.createChooser(intent, "Share ${d.name}"))
+                intent.clipData = android.content.ClipData.newRawUri("", uri)
+                ctx.startActivity(
+                    Intent.createChooser(intent, "Share ${d.name}")
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
             }
         }
     }
@@ -2589,10 +2761,17 @@ class DownloadService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val n = build(this, DownloadManager.current?.items?.toList().orEmpty()) ?: buildStarting(this)
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            startForeground(NOTIF_ID, n)
+        val promoted = runCatching {
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            } else {
+                startForeground(NOTIF_ID, n)
+            }
+            true
+        }.getOrDefault(false)
+        if (!promoted) {
+            runCatching { getSystemService(NotificationManager::class.java)?.notify(NOTIF_ID, n) }
+            stopSelf()
         }
         return START_NOT_STICKY
     }
@@ -2617,7 +2796,15 @@ class DownloadService : Service() {
 
         fun start(ctx: Context) {
             val i = Intent(ctx, DownloadService::class.java)
-            if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
+            }.onFailure {
+                runCatching {
+                    ensureChannels(ctx)
+                    val n = build(ctx, DownloadManager.current?.items?.toList().orEmpty()) ?: buildStarting(ctx)
+                    ctx.getSystemService(NotificationManager::class.java)?.notify(NOTIF_ID, n)
+                }
+            }
         }
 
         fun ensureChannels(ctx: Context) {

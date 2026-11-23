@@ -47,7 +47,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Icon
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -363,6 +362,7 @@ private fun LibraryPanel(s: BrowserState, panel: Panel, onClose: () -> Unit) {
     // Hold a download to start selecting; tap more to add / remove; share or delete them together.
     var selected by remember { mutableStateOf(emptySet<Int>()) }
     var confirmBulkDelete by remember { mutableStateOf(false) }
+    var confirmClearFinished by remember { mutableStateOf(false) }
     // Hold + drag over the cards selects a range; the list scrolls by itself near the top / bottom edge.
     val dlListState = androidx.compose.foundation.lazy.rememberLazyListState()
     val dragSel = remember { DragSelect() }
@@ -646,7 +646,9 @@ private fun LibraryPanel(s: BrowserState, panel: Panel, onClose: () -> Unit) {
                         if (panel == Panel.History) "Clear history" else "Clear finished",
                         onClick = {
                             if (panel == Panel.History) confirmClear = true
-                            else s.downloads.clearFinished()
+                            else if (s.downloads.items.any { it.status == DlStatus.DONE || it.status == DlStatus.FAILED }) {
+                                confirmClearFinished = true
+                            }
                         },
                         size = bs, iconSize = 20.dp, filled = false
                     )
@@ -714,6 +716,17 @@ private fun LibraryPanel(s: BrowserState, panel: Panel, onClose: () -> Unit) {
         )
     }
 
+    if (confirmClearFinished) {
+        GlassConfirmDialog(
+            "Delete all finished downloads?",
+            "All completed and failed files will be permanently deleted from local storage.",
+            "Delete all",
+            destructive = true,
+            onConfirm = { confirmClearFinished = false; s.downloads.clearFinished() },
+            onDismiss = { confirmClearFinished = false }
+        )
+    }
+
     if (confirmBulkDelete) {
         GlassConfirmDialog(
             "Delete ${selItems.size} ${if (selItems.size == 1) "download" else "downloads"}?",
@@ -724,7 +737,7 @@ private fun LibraryPanel(s: BrowserState, panel: Panel, onClose: () -> Unit) {
                 confirmBulkDelete = false
                 val toDelete = selItems.toList()
                 selected = emptySet()
-                toDelete.forEach { s.downloads.deleteWithFile(it) }
+                s.downloads.deleteMany(toDelete)
             },
             onDismiss = { confirmBulkDelete = false }
         )

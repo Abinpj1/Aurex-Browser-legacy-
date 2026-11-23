@@ -97,6 +97,19 @@ class Tab(val id: Int, val incognito: Boolean) {
     var loadedDesktop: Boolean? = null
     /** Which dark-website state this tab's current page was loaded in (null = Start Page / not yet loaded). */
     var loadedDarkWeb: Boolean? = null
+    /** Confirmed HLS playlists detected via `#EXTM3U` response inspection (even when disguised without `.m3u8`). */
+    val hlsUrls = mutableSetOf<String>()
+    /** Confirmed multi-variant `#EXT-X-STREAM-INF` master playlists (always outrank single chunks & trailers). */
+    val hlsMasterUrls = mutableSetOf<String>()
+    /** Total `#EXTINF` duration (seconds) parsed from media playlists (>0 = known length; distinguishes full episodes from 15s trailers). */
+    val hlsDuration = HashMap<String, Int>()
+    /** Monotonic detection sequence so the latest played episode wins on SPA streaming sites. */
+    val hlsOrder = HashMap<String, Int>()
+    var hlsSeq: Int = 0
+    /** Uptime-ms of the last real finger touch on this WebView (keeps legitimate 302/JS app launches working). */
+    var lastUserTouchAt: Long = 0L
+    /** IO-thread-safe flag so shouldInterceptRequest never reads Compose SnapshotStateList off main thread. */
+    @Volatile var hasGoogleVideo: Boolean = false
     /** True while reloading after a Desktop/Mobile mode flip so HTTP cache is bypassed once and restored on finish. */
     var freshReloadOnce: Boolean = false
     /** Last playing video's intrinsic size and on-page bounds (0..1 fractions). */
@@ -148,6 +161,13 @@ data class JsDialogState(
     /** Hide the typed text (PIN prompts). */
     val secret: Boolean = false,
     val result: (Boolean, String?) -> Unit
+)
+
+data class LinkContextMenuState(
+    val tabId: Int,
+    val url: String,
+    val title: String = "",
+    val imageUrl: String? = null
 )
 
 /** Everything that can appear as a menu row or be pinned to the menu's quick area. */
@@ -273,7 +293,7 @@ if(window.__aurexMedia)return;window.__aurexMedia=1;
 var seen={};
 function isMedia(u){
  if(!u||u.indexOf('blob:')===0||u.indexOf('data:')===0)return false;
- if(/\.(m3u8|mpd|mp4|webm|mkv|m4v|mov|ts|mp3|m4a|aac|ogg|oga|opus|flac|wav)(\?|#|$)/i.test(u))return true;
+ if(/\.(m3u8|mpd|mp4|webm|mkv|m4v|mov|mp3|m4a|aac|ogg|oga|opus|flac|wav)(\?|#|$)/i.test(u))return true;
  if(/googlevideo\.com\/(videoplayback|api\/manifest)|manifest\.googlevideo\.com/i.test(u))return true;
  if(/[?&](mime|type|format)=(video|audio|m3u8|mpd|mp4|webm|mpegurl)/i.test(u))return true;
  // Instagram CDN patterns (fbcdn / cdninstagram)
@@ -458,7 +478,7 @@ function scan(){
  },true);
 });
 document.addEventListener('yt-navigate-finish',function(){setTimeout(scanPlayerResponse,400);},{passive:true});
-scanPlayerResponse();scanInstagram();scan();setTimeout(scanPlayerResponse,2500);setInterval(scan,4000);
+scanPlayerResponse();scanInstagram();scan();setTimeout(scanPlayerResponse,2500);setInterval(function(){if(!document.hidden)scan();},7000);
 })()"""
 
 /**
@@ -538,18 +558,123 @@ private const val HANDS_OFF_FRAME_JS = """(function(){
  */
 private const val SRC_JS = """(function(){
 if(window.__aurexSrc)return;window.__aurexSrc=1;
-var seen={};
+var seen={},hlsSeen={};
 function abs(u){try{return new URL(u,document.baseURI).href;}catch(e){return String(u);}}
 function frameUrl(){var h=location.href||'';return h.indexOf('http')===0?h:(document.referrer||'');}
+function isSeg(u){
+ var p=String(u||'').toLowerCase().split('#')[0].split('?')[0];
+ return /\.(ts|m4s|cmfv|cmfa)${'$'}/.test(p);
+}
 function send(u){
  try{
   if(!u)return;u=abs(u);
-  if(u.indexOf('http')!==0||seen[u])return;
+  if(u.indexOf('http')!==0||isSeg(u)||seen[u])return;
   seen[u]=1;
   var M=window.AurexMedia;
   if(M&&M.src)M.src(u,frameUrl());
  }catch(e){}
 }
+function sendHls(u,master,dur){
+ try{
+  if(!u)return;u=abs(u);
+  if(u.indexOf('http')!==0)return;
+  var d=Math.max(0,Math.round(dur||0));
+  var k=u+'|'+(master?'1':'0')+'|'+(d>0?1:0);
+  if(hlsSeen[k])return;
+  hlsSeen[k]=1;
+  var M=window.AurexMedia;
+  if(M&&M.hls)M.hls(u,frameUrl(),!!master,d);
+  else if(M&&M.src)M.src(u,frameUrl());
+ }catch(e){}
+}
+function hlsDur(txt){
+ var sum=0,re=/#EXTINF:([0-9.]+)/g,m;
+ while((m=re.exec(txt))!==null){var v=parseFloat(m[1]);if(isFinite(v)&&v>0)sum+=v;}
+ return Math.round(sum);
+}
+function inspectText(u,txt){
+ if(!txt||txt.length<7)return;
+ var head=txt.slice(0,512).replace(/^[\uFEFF\s]+/,'');
+ if(head.indexOf('#EXTM3U')===0){
+  var master=txt.indexOf('#EXT-X-STREAM-INF')>=0;
+  var dur=master?0:hlsDur(txt);
+  sendHls(u,master,dur);
+ }else if(head.indexOf('<MPD')>=0&&txt.indexOf('</MPD>')>=0){
+  send(u);
+ }
+}
+function decodeBuf(ab){
+ try{
+  if(!ab||!ab.byteLength||ab.byteLength>800000)return '';
+  var u8=new Uint8Array(ab);
+  if(u8.length<7)return '';
+  if(typeof TextDecoder!=='undefined')return new TextDecoder('utf-8').decode(u8);
+  var lim=Math.min(u8.length,65536),s='';
+  for(var i=0;i<lim;i++)s+=String.fromCharCode(u8[i]);
+  return s;
+ }catch(e){return '';}
+}
+try{
+ if(window.fetch&&!window.fetch.__axHls){
+  var oF=window.fetch;
+  var wF=function(inp,init){
+   var p=oF.apply(this,arguments);
+   try{
+    if(p&&p.then){
+     var reqU=typeof inp==='string'?inp:(inp&&inp.url?inp.url:'');
+     p.then(function(r){
+      try{
+       if(!r||!r.ok)return;
+       var fu=r.url||reqU;
+       if(!fu||fu.indexOf('http')!==0)return;
+       var ct=String((r.headers&&r.headers.get&&r.headers.get('content-type'))||'').toLowerCase();
+       var cl=parseInt((r.headers&&r.headers.get&&r.headers.get('content-length'))||'0',10)||0;
+       if(ct.indexOf('mpegurl')>=0){
+        r.clone().text().then(function(t){inspectText(fu,t);}).catch(function(){sendHls(fu,false,0);});
+        return;
+       }
+       if(cl>600000)return;
+       if(ct&&(ct.indexOf('video/')===0||ct.indexOf('audio/')===0||ct.indexOf('font/')===0||ct.indexOf('javascript')>=0||ct.indexOf('css')>=0||ct.indexOf('html')>=0||ct.indexOf('json')>=0))return;
+       if(ct.indexOf('image/')===0&&fu.toLowerCase().indexOf('m3u8')<0&&fu.toLowerCase().indexOf('playlist')<0)return;
+       r.clone().text().then(function(t){inspectText(fu,t);}).catch(function(){});
+      }catch(e){}
+     }).catch(function(){});
+    }
+   }catch(e){}
+   return p;
+  };
+  wF.__axHls=1;
+  window.fetch=wF;
+ }
+ if(window.XMLHttpRequest&&XMLHttpRequest.prototype&&!XMLHttpRequest.prototype.open.__axHls){
+  var oOpen=XMLHttpRequest.prototype.open,oSend=XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open=function(m,u){
+   try{this.__axU=u?abs(String(u)):'';}catch(e){}
+   return oOpen.apply(this,arguments);
+  };
+  XMLHttpRequest.prototype.open.__axHls=1;
+  XMLHttpRequest.prototype.send=function(){
+   try{
+    var x=this;
+    x.addEventListener('load',function(){
+     try{
+      if(x.status<200||x.status>=300)return;
+      var u=x.responseURL||x.__axU||'';
+      if(!u)return;
+      if(!x.responseType||x.responseType==='text'){
+       var t=x.responseText;
+       if(t&&t.length<=800000)inspectText(u,t);
+      }else if(x.responseType==='arraybuffer'&&x.response&&x.response.byteLength<=800000){
+       var t2=decodeBuf(x.response);
+       if(t2)inspectText(u,t2);
+      }
+     }catch(e){}
+    });
+   }catch(e){}
+   return oSend.apply(this,arguments);
+  };
+ }
+}catch(e){}
 function scan(v){
  try{
   send(v.currentSrc);send(v.getAttribute('src'));
@@ -1155,7 +1280,7 @@ function seek(d){
   if(ev==='pause'||ev==='ended'||ev==='emptied')setTimeout(report,160);else report();
  },true);
 });
-setInterval(function(){if(!pipOn)report();},2500);
+setInterval(function(){if(!pipOn&&!document.hidden&&(last||document.getElementsByTagName('video').length>0))report();},4000);
 /* a frame that holds the video feeds its progress to the top frame (in-app player seek bar) */
 setInterval(function(){if(!isTop&&pipOn&&!frameMode){try{window.parent.postMessage({lq:1,t:'info',v:info()},'*');}catch(e){}}},500);
 /* ---- Built-in player <-> page sync -------------------------------------------------------------
@@ -1557,10 +1682,10 @@ addCapture(document,'mozvisibilitychange');
 addCapture(window,'blur');
 addCapture(window,'pagehide');
 
-/* 4. Anti-idle: keep YouTube's last-activity timestamp fresh. */
-setInterval(function(){try{window._lact=Date.now();}catch(e){}},4000);
+/* 4. Anti-idle: keep YouTube's last-activity timestamp fresh (15s cadence -> negligible CPU). */
+setInterval(function(){try{window._lact=Date.now();}catch(e){}},15000);
 
-/* 5. MutationObserver video bridge → AurexMediaBridge.onVideoStateChange. */
+/* 5. Debounced video-only MutationObserver → AurexMediaBridge.onVideoStateChange. */
 function reportVideoState(video){
   try{
     if(!window.AurexMediaBridge)return;
@@ -1581,13 +1706,27 @@ function attachVideoListeners(video){
 }
 
 function scanVideos(){
-  try{document.querySelectorAll('video').forEach(attachVideoListeners);}catch(e){}
+  try{var vs=document.getElementsByTagName('video');for(var i=0;i<vs.length;i++)attachVideoListeners(vs[i]);}catch(e){}
 }
 
+var vidScanT=0;
+function schedScanVideos(){
+  if(vidScanT)return;
+  vidScanT=setTimeout(function(){vidScanT=0;scanVideos();},450);
+}
 scanVideos();
 try{
-  new MutationObserver(function(){scanVideos();})
-    .observe(document.documentElement,{childList:true,subtree:true});
+  new MutationObserver(function(ms){
+    for(var i=0;i<ms.length;i++){
+      var a=ms[i].addedNodes;
+      for(var j=0;a&&j<a.length;j++){
+        var n=a[j];
+        if(n&&n.nodeType===1&&(n.tagName==='VIDEO'||(n.getElementsByTagName&&n.getElementsByTagName('video').length))){
+          schedScanVideos();return;
+        }
+      }
+    }
+  }).observe(document.documentElement,{childList:true,subtree:true});
 }catch(e){}
 
 })()"""
@@ -1650,6 +1789,7 @@ class BrowserState(private val act: Activity) {
         blocker.onEngineReady = null
         shotSession?.cancel()
         screenshot = null
+        linkMenu = null
         earlyHandles.values.forEach { runCatching { it.remove() } }
         earlyHandles.clear()
         tabs.forEach { t ->
@@ -1694,8 +1834,10 @@ class BrowserState(private val act: Activity) {
     var haptics by mutableStateOf(prefs.getBoolean("haptics", true))
     var dynamicIsland by mutableStateOf(prefs.getBoolean("dynamicIsland", true).also { NotifIsland.enabled = it })
     var glow by mutableStateOf(prefs.getBoolean("glow", true))
-    // Toolbar position option removed: the bar is always at the bottom.
-    var barTop by mutableStateOf(false)
+    /** Toolbar position: false = Bottom (default), true = Top. */
+    var barTop by mutableStateOf(prefs.getBoolean("barTop", false))
+    /** Allow opening supported app links (UPI, WhatsApp, Telegram, Play Store, Maps, Zoom, etc.) in external apps. */
+    var openInApps by mutableStateOf(prefs.getBoolean("openInApps", true))
     var autoHide by mutableStateOf(prefs.getBoolean("autoHide", true))
     var barVisible by mutableStateOf(true)
     var toolbarLocked by mutableStateOf(false)
@@ -1846,6 +1988,8 @@ class BrowserState(private val act: Activity) {
     var screenshot by mutableStateOf<ScreenshotData?>(null)
     var snack by mutableStateOf<Snack?>(null)
     var jsDialog by mutableStateOf<JsDialogState?>(null)
+    var linkMenu by mutableStateOf<LinkContextMenuState?>(null)
+    var isDefaultBrowser by mutableStateOf(false)
 
     val bookmarks = mutableStateListOf<Bookmark>()
     val history = mutableStateListOf<HistoryEntry>()
@@ -1862,6 +2006,11 @@ class BrowserState(private val act: Activity) {
         val cb = pendingFileCallback
         pendingFileCallback = null
         cb?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(res.resultCode, res.data))
+    }
+
+    private val defaultRoleLauncher = comp?.registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        refreshDefaults()
+        if (isDefaultBrowser) notify("Aurex is now your default browser")
     }
 
     private val permissionLauncher = comp?.registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
@@ -1881,6 +2030,7 @@ class BrowserState(private val act: Activity) {
 
     init {
         markLive(this)
+        refreshDefaults()
         loadLibrary()
         loadMenu()
         val saved = prefs.getString("session", "").orEmpty().lines().filter { it.isNotBlank() }
@@ -2023,20 +2173,45 @@ class BrowserState(private val act: Activity) {
 
     // ── Persistence ──────────────────────────────────────────────────────────
     private fun loadLibrary() {
-        prefs.getString("bookmarks", "").orEmpty().lines().forEach { line ->
-            if (line.contains('\t')) {
-                val p = line.split('\t', limit = 2)
-                if (p[0].isNotBlank()) bookmarks.add(Bookmark(p[0], Uri.decode(p.getOrElse(1) { p[0] }), 0))
-            }
+        val rawBm = prefs.getString("bookmarks", "").orEmpty()
+        val rawHist = prefs.getString("history", "").orEmpty()
+        if (rawBm.isEmpty() && rawHist.isEmpty()) {
+            libraryLoaded = true
+            return
         }
-        prefs.getString("history", "").orEmpty().lines().forEach { line ->
-            val p = line.split('\t', limit = 3)
-            if (p.size == 3 && p[1].isNotBlank()) {
-                history.add(HistoryEntry(p[1], Uri.decode(p[2]), p[0].toLongOrNull() ?: 0L))
+        Thread({
+            val parsedBm = ArrayList<Bookmark>()
+            rawBm.lines().forEach { line ->
+                if (line.contains('\t')) {
+                    val p = line.split('\t', limit = 2)
+                    if (p[0].isNotBlank()) parsedBm.add(Bookmark(p[0], Uri.decode(p.getOrElse(1) { p[0] }), 0))
+                }
             }
-        }
+            val parsedHist = ArrayList<HistoryEntry>()
+            rawHist.lines().forEach { line ->
+                val p = line.split('\t', limit = 3)
+                if (p.size == 3 && p[1].isNotBlank()) {
+                    parsedHist.add(HistoryEntry(p[1], Uri.decode(p[2]), p[0].toLongOrNull() ?: 0L))
+                }
+            }
+            act.runOnUiThread {
+                if (live !== this) return@runOnUiThread
+                if (parsedBm.isNotEmpty()) {
+                    val existing = bookmarks.map { it.url }.toHashSet()
+                    parsedBm.forEach { if (it.url !in existing) bookmarks.add(it) }
+                }
+                if (parsedHist.isNotEmpty() && !historyClearedEarly) {
+                    val existing = history.map { it.url }.toHashSet()
+                    parsedHist.forEach { if (it.url !in existing && history.size < 400) history.add(it) }
+                }
+                libraryLoaded = true
+                if (bookmarksDirty || historyDirty) save()
+            }
+        }, "aurex-library-load").apply { isDaemon = true; start() }
     }
 
+    private var libraryLoaded = false
+    private var historyClearedEarly = false
     private var bookmarksDirty = false
     private var historyDirty = false
 
@@ -2058,7 +2233,7 @@ class BrowserState(private val act: Activity) {
             .remove("dynamicAccent")
             .putFloat("glass", glass)
             .putBoolean("haptics", haptics).putBoolean("dynamicIsland", dynamicIsland).putBoolean("glow", glow)
-            .putBoolean("barTop", barTop).putBoolean("autoHide", autoHide)
+            .putBoolean("barTop", barTop).putBoolean("autoHide", autoHide).putBoolean("openInApps", openInApps)
             .putInt("themeMode", themeMode).putInt("darkWeb", darkWeb)
             .putInt("textZoom", textZoom).putBoolean("backgroundPlay", backgroundPlay)
             .putBoolean("autoPip", autoPip).putBoolean("mediaFab", mediaFab)
@@ -2081,11 +2256,11 @@ class BrowserState(private val act: Activity) {
             .putBoolean("swipeLibraryActions", swipeLibraryActions)
             .putBoolean("swipeEdgeBack", swipeEdgeBack)
             .putBoolean("holdTabsNew", holdTabsNewTab).putBoolean("holdMenuSettings", holdMenuSettings)
-        if (bookmarksDirty) {
+        if (bookmarksDirty && libraryLoaded) {
             bookmarksDirty = false
             ed.putString("bookmarks", bookmarks.joinToString("\n") { it.url + "\t" + Uri.encode(it.title) })
         }
-        if (historyDirty) {
+        if (historyDirty && (libraryLoaded || historyClearedEarly)) {
             historyDirty = false
             ed.putString("history", history.joinToString("\n") { "${it.time}\t${it.url}\t${Uri.encode(it.title)}" })
         }
@@ -2093,16 +2268,12 @@ class BrowserState(private val act: Activity) {
     }
 
     fun deleteRecentDownload() {
-        val recent = downloads.items.lastOrNull()
+        val recent = downloads.items.firstOrNull()
         if (recent == null) {
             notify("No recent downloads to delete")
             return
         }
-        downloads.cancel(recent)
-        runCatching {
-            if (recent.file.exists()) recent.file.delete()
-        }
-        downloads.items.remove(recent)
+        downloads.deleteWithFile(recent)
         notify("Recent download & local file deleted")
     }
 
@@ -2401,6 +2572,25 @@ class BrowserState(private val act: Activity) {
         }
     }
 
+    /** Called from MainActivity.onStop(): pauses all non-media WebViews so backgrounded tabs never heat the phone. */
+    fun onAppBackgrounded(keepMedia: Boolean) {
+        tabs.forEach { t ->
+            val w = t.web ?: return@forEach
+            val activeMedia = keepMedia && (
+                t.videoPlaying || (t === mediaTab && backgroundPlay) ||
+                (w as? AurexWebView)?.backgroundMediaActive == true
+            )
+            if (!activeMedia) {
+                runCatching {
+                    w.onPause()
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        w.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_WAIVED, true)
+                    }
+                }
+            }
+        }
+    }
+
     /**
      * LRU Tab Hibernation: frees idle background WebViews past the device's RAM tier budget
      * (LOW: 3 live, BALANCED: 6 live, HIGH: 12 live) while keeping title, URL, and favicon intact.
@@ -2491,8 +2681,8 @@ class BrowserState(private val act: Activity) {
                 t.title = hostOf(url)
             } else load(t, url)
         }
-        barVisible = true
         if (select) {
+            barVisible = true
             syncTabActivity()
             hibernateIdleTabs(forceAggressive = false)
         }
@@ -2537,15 +2727,28 @@ class BrowserState(private val act: Activity) {
         return sb.toString()
     }
 
+    private fun destroyTabWeb(t: Tab) {
+        val w = t.web ?: return
+        t.web = null
+        runCatching {
+            (w as? AurexWebView)?.onBackdropDirty = null
+            (w.parent as? ViewGroup)?.removeView(w)
+            w.stopLoading()
+            w.onPause()
+            w.destroy()
+        }
+    }
+
     fun closeTab(index: Int) {
         if (index !in tabs.indices) return
         val t = tabs[index]
         val wasCurrent = index == current
-        earlyHandles.remove(t.id)
+        if (linkMenu?.tabId == t.id) linkMenu = null
+        earlyHandles.remove(t.id)?.let { runCatching { it.remove() } }
         topHosts.remove(t.id)
         guard.forget(t.id)
         shotSession?.let { if (it.owns(t.web)) it.cancel() }
-        runCatching { t.web?.stopLoading(); t.web?.destroy() }
+        destroyTabWeb(t)
         tabs.removeAt(index)
         if (tabs.isEmpty()) {
             current = 0
@@ -2564,9 +2767,16 @@ class BrowserState(private val act: Activity) {
     }
 
     fun closeAllTabs() {
+        shotSession?.cancel()
+        linkMenu = null
+        qualityPrompt = null
+        if (fullscreen != null) exitFullscreen()
+        earlyHandles.values.forEach { runCatching { it.remove() } }
         earlyHandles.clear()
-        tabs.forEach {
-            runCatching { it.web?.stopLoading(); it.web?.destroy() }
+        topHosts.clear()
+        tabs.forEach { t ->
+            guard.forget(t.id)
+            destroyTabWeb(t)
         }
         tabs.clear()
         current = 0
@@ -2578,6 +2788,7 @@ class BrowserState(private val act: Activity) {
     fun selectTab(tab: Tab) {
         val i = tabs.indexOf(tab)
         if (i >= 0) {
+            linkMenu = null
             current = i
             barVisible = true
             onActiveTabChanged()
@@ -3128,6 +3339,7 @@ class BrowserState(private val act: Activity) {
                             .setType(mime)
                             .putExtra(Intent.EXTRA_STREAM, uri)
                             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        intent.clipData = ClipData.newRawUri("", uri)
                         act.startActivity(Intent.createChooser(intent, "Share Screenshot"))
                     }.onFailure { notify("Unable to share screenshot") }
                 }
@@ -3191,7 +3403,7 @@ class BrowserState(private val act: Activity) {
     }
 
     fun clearHistory() {
-        history.clear(); historyDirty = true; save(); notify("History cleared")
+        historyClearedEarly = true; history.clear(); historyDirty = true; save(); notify("History cleared")
     }
 
     // ── Cookies: the Meta login survives "clear" ──────────────────────────────
@@ -3261,7 +3473,7 @@ class BrowserState(private val act: Activity) {
     }
 
     fun clearBrowsingData() {
-        history.clear(); historyDirty = true
+        historyClearedEarly = true; history.clear(); historyDirty = true
         removeCookiesKeepingMeta()
         WebStorage.getInstance().deleteAllData()
         tabs.forEach {
@@ -3298,7 +3510,7 @@ class BrowserState(private val act: Activity) {
             YtDlpEngine.release()
             tabs.forEach { t ->
                 (t.web as? AurexWebView)?.sniffEnabled = false
-                t.media.clear(); t.videoSrcs.clear(); t.mediaRef.clear()
+                t.hasGoogleVideo = false; t.media.clear(); t.videoSrcs.clear(); t.mediaRef.clear(); t.hlsUrls.clear(); t.hlsMasterUrls.clear(); t.hlsDuration.clear(); t.hlsOrder.clear()
             }
             if (!quiet) {
                 notify(
@@ -3314,7 +3526,7 @@ class BrowserState(private val act: Activity) {
         dnt = true; thirdPartyCookies = false
         accent = 0xFF0A84FF.toInt(); dynamicAccent = false
         glass = 0.86f; haptics = true; dynamicIsland = true; NotifIsland.enabled = true; glow = true
-        barTop = false; autoHide = true; textZoom = 100
+        barTop = false; autoHide = true; openInApps = true; textZoom = 100
         themeMode = ThemeModes.AUTO; darkWeb = DarkWebModes.AUTO; darkOffHosts = emptySet()
         backgroundPlay = true; autoPip = true; mediaFab = true; downloadFab = true
         setVideoDownload(true, quiet = true)
@@ -3322,6 +3534,7 @@ class BrowserState(private val act: Activity) {
         autoplay = true; smoothVideo = true; showHomeSites = true; showRecent = true
         toolbarRows = 0; toolbarItems = DEFAULT_TOOLBAR_ITEMS.split(','); toolbarLeft = 0; toolbarTop = -1
         mediaPlayerEnabled = true
+        alwaysBestQuality = false; swipeTabClose = true; swipeDownloadDelete = true; swipeLinkTabSwitch = true
         swipeDlRightDelete = true; swipeDlLeftShare = true; swipeTabCardClose = true; swipeLibraryActions = true; swipeEdgeBack = true
         holdTabsNewTab = true; holdMenuSettings = true
         resetMenu()
@@ -3329,6 +3542,76 @@ class BrowserState(private val act: Activity) {
         save(); applySettings()
         tabs.forEach { t -> if (wasDesktop && !t.isHome) reloadForDesktopChange(t) else t.web?.reload() }
         notify("Settings reset")
+    }
+
+    // ── Default browser ──────────────────────────────────────────────────────
+
+    /** Refreshes whether Aurex is currently the system default browser. */
+    fun refreshDefaults() {
+        isDefaultBrowser = checkDefaultBrowser()
+    }
+
+    private fun checkDefaultBrowser(): Boolean = runCatching {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val rm = act.getSystemService(android.app.role.RoleManager::class.java)
+            if (rm != null && rm.isRoleAvailable(android.app.role.RoleManager.ROLE_BROWSER)) {
+                return@runCatching rm.isRoleHeld(android.app.role.RoleManager.ROLE_BROWSER)
+            }
+        }
+        val probe = Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com"))
+            .addCategory(Intent.CATEGORY_BROWSABLE)
+        val ri = act.packageManager.resolveActivity(probe, PackageManager.MATCH_DEFAULT_ONLY)
+        ri?.activityInfo?.packageName == act.packageName
+    }.getOrDefault(false)
+
+    /** Opens Android's native Default Browser prompt (Android 10+ RoleManager) or Default Apps settings. */
+    fun requestDefaultBrowser() {
+        refreshDefaults()
+        if (Build.VERSION.SDK_INT >= 29 && !isDefaultBrowser) {
+            val rm = runCatching { act.getSystemService(android.app.role.RoleManager::class.java) }.getOrNull()
+            if (rm != null && rm.isRoleAvailable(android.app.role.RoleManager.ROLE_BROWSER)) {
+                val launched = runCatching {
+                    val req = rm.createRequestRoleIntent(android.app.role.RoleManager.ROLE_BROWSER)
+                    if (defaultRoleLauncher != null) defaultRoleLauncher.launch(req)
+                    else act.startActivity(req)
+                    true
+                }.getOrDefault(false)
+                if (launched) return
+            }
+        }
+        openSystemDefaultApps("Choose Aurex Browser as your default browser")
+    }
+
+    private fun openSystemDefaultApps(hint: String): Boolean {
+        val intents = ArrayList<Intent>()
+        if (Build.VERSION.SDK_INT >= 24) {
+            intents.add(Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
+        }
+        if (Build.VERSION.SDK_INT >= 31) {
+            intents.add(
+                Intent(
+                    android.provider.Settings.ACTION_APP_OPEN_BY_DEFAULT_SETTINGS,
+                    Uri.parse("package:${act.packageName}")
+                )
+            )
+        }
+        intents.add(
+            Intent(
+                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:${act.packageName}")
+            )
+        )
+        for (i in intents) {
+            val ok = runCatching {
+                act.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                true
+            }.getOrDefault(false)
+            if (ok) {
+                notify(hint)
+                return true
+            }
+        }
+        return false
     }
 
     // ── Sharing / printing / clipboard ───────────────────────────────────────
@@ -3346,9 +3629,83 @@ class BrowserState(private val act: Activity) {
 
     fun copy(url: String) {
         if (url.isBlank()) return
-        val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
         cm.setPrimaryClip(ClipData.newPlainText("URL", url))
         notify("Link copied")
+    }
+
+    /** True for link targets that belong in the long-press link context menu. */
+    private fun isContextMenuUrl(url: String): Boolean {
+        val u = url.trim()
+        if (u.isEmpty()) return false
+        val low = u.lowercase()
+        return low.startsWith("http://") || low.startsWith("https://") ||
+            low.startsWith("mailto:") || low.startsWith("tel:") || low.startsWith("sms:")
+    }
+
+    fun openLinkInCurrentTab(tab: Tab, url: String) {
+        val u = url.trim()
+        if (u.isEmpty()) return
+        val low = u.lowercase()
+        if (low.startsWith("http://") || low.startsWith("https://")) {
+            load(tab, u)
+        } else {
+            val w = tab.web
+            if (w != null) launchExternalUri(w, Uri.parse(u), u)
+            else runCatching { act.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+        }
+    }
+
+    fun openLinkInNewTab(from: Tab, url: String) {
+        val u = url.trim()
+        if (u.isEmpty()) return
+        val nt = newTab(u, incognito = from.incognito, defer = false, select = true)
+        if (nt.id != from.id) nt.openerId = from.id
+        saveSession()
+    }
+
+    fun openLinkInBackgroundTab(from: Tab, url: String) {
+        val u = url.trim()
+        if (u.isEmpty()) return
+        val before = tabs.size
+        val nt = newTab(u, incognito = from.incognito, defer = true, select = false)
+        if (tabs.size > before) {
+            nt.openerId = from.id
+            saveSession()
+            Haptics.fire(null, Hx.TICK)
+            notify("Opened in background tab")
+        }
+    }
+
+    /** Downloads a specific hyperlink or image directly from the long-press context menu. */
+    fun downloadLink(tab: Tab, url: String, title: String? = null) {
+        val u = url.trim()
+        if (u.isBlank() || (!u.startsWith("http://", true) && !u.startsWith("https://", true))) {
+            notify("This link cannot be downloaded")
+            return
+        }
+        val ua = tab.web?.settings?.userAgentString
+        val ref = tab.url.takeIf { it.startsWith("http", true) }
+        val cookie = if (tab.incognito) null else siteCookie(u)
+        val cleanName = title?.trim()?.takeIf { it.isNotBlank() }
+        val hls = isHlsUrl(u)
+        if (hls) {
+            if (!videoDownload) {
+                notify(VideoDl.OFF_HINT)
+                return
+            }
+            askHlsQuality(u, "application/vnd.apple.mpegurl", ua, ref, null, cookie, cleanName) {
+                downloads.start(u, ua, null, "application/vnd.apple.mpegurl", ref, title = cleanName)
+                notify("Download started")
+            }
+            return
+        }
+        if (videoDownload && YtDlpEngine.isItemUrl(u)) {
+            askEngineQuality(tab, u, cleanName.orEmpty(), null)
+            return
+        }
+        downloads.start(u, ua, null, null, ref, title = cleanName)
+        notify("Download started")
     }
 
     fun download(url: String, mime: String? = null) {
@@ -3357,7 +3714,7 @@ class BrowserState(private val act: Activity) {
             return
         }
         val tab = tabs.getOrNull(current)
-        val isHlsLink = mime?.contains("mpegurl", true) == true || url.contains(".m3u8", true)
+        val isHlsLink = tab?.hlsUrls?.contains(url) == true || isHlsUrl(url, mime)
         if (!videoDownload) {
             // Engine is off: a plain link is still saved as an ordinary file, streams need the switch.
             if (isHlsLink) notify(VideoDl.OFF_HINT)
@@ -3380,11 +3737,11 @@ class BrowserState(private val act: Activity) {
             val frameRef = tab?.mediaRef?.get(url)
             // Sites without a quality choice: start the video that is playing right now.
             val direct = {
-                downloads.start(url, ua, null, mime, ref, title = name, frameReferer = frameRef)
+                downloads.start(url, ua, null, if (isHlsLink) "application/vnd.apple.mpegurl" else mime, ref, title = name, frameReferer = frameRef)
                 notify("Download started")
             }
             val hlsOrDirect = {
-                if (isHlsLink) askHlsQuality(url, mime, ua, frameRef ?: ref, cookie, name, direct) else direct()
+                if (isHlsLink) askHlsQuality(url, mime, ua, ref, frameRef, cookie, name, direct) else direct()
             }
             when {
                 YtDlpEngine.isItemUrl(page) && !isHlsLink ->
@@ -3509,13 +3866,18 @@ class BrowserState(private val act: Activity) {
         }.start()
     }
 
-    /** Quality sheet for an HLS master playlist; starts at once when it only has one quality. */
+    /**
+     * Quality sheet for an HLS master playlist; starts at once when it only has one quality.
+     * Always hands the MASTER playlist URL + [targetHeight] to [downloads.start] so separate
+     * `#EXT-X-MEDIA:TYPE=AUDIO` tracks are preserved and muxed cleanly.
+     */
     private fun askHlsQuality(
-        url: String, mime: String?, ua: String?, ref: String?, cookie: String?,
+        url: String, mime: String?, ua: String?, pageRef: String?, frameRef: String?, cookie: String?,
         name: String?, direct: () -> Unit
     ) {
+        val effRef = frameRef ?: pageRef
         Thread {
-            val variants = runCatching { downloads.listHlsVariants(url, ua, ref, cookie) }.getOrDefault(emptyList())
+            val variants = runCatching { downloads.listHlsVariants(url, ua, effRef, cookie) }.getOrDefault(emptyList())
             act.runOnUiThread {
                 if (variants.size < 2) {
                     direct()
@@ -3524,8 +3886,10 @@ class BrowserState(private val act: Activity) {
                 if (alwaysBestQuality) {
                     val best = variants.first()   // sorted: highest quality first
                     downloads.start(
-                        best.url, ua, null, "application/vnd.apple.mpegurl", ref,
-                        title = name, qualityLabel = MediaTools.qualityLabel(best.width, best.height)
+                        url, ua, null, "application/vnd.apple.mpegurl", pageRef,
+                        cookieOverride = cookie, title = name,
+                        qualityLabel = MediaTools.qualityLabel(best.width, best.height),
+                        frameReferer = frameRef, targetHeight = best.height
                     )
                     notify("Download started · best quality")
                     return@runOnUiThread
@@ -3539,8 +3903,9 @@ class BrowserState(private val act: Activity) {
                 prompt.onPick = { o ->
                     qualityPrompt = null
                     downloads.start(
-                        o.hlsUrl ?: url, ua, null, "application/vnd.apple.mpegurl", ref,
-                        title = name, qualityLabel = o.label
+                        url, ua, null, "application/vnd.apple.mpegurl", pageRef,
+                        cookieOverride = cookie, title = name, qualityLabel = o.label,
+                        frameReferer = frameRef, targetHeight = o.height
                     )
                     notify("Download started · ${o.label}")
                 }
@@ -3619,33 +3984,47 @@ class BrowserState(private val act: Activity) {
         notify("Download started" + if (height > 0) " · " + MediaTools.labelForHeight(height) else "")
     }
 
+    private fun mediaRank(tab: Tab, u: String): Int {
+        var score = mediaScore(u)
+        if (u in tab.hlsMasterUrls) {
+            score += 115
+        } else if (u in tab.hlsUrls) {
+            val dur = tab.hlsDuration[u] ?: 0
+            score += when {
+                dur in 1..45 -> -180
+                dur >= 120 -> 130
+                dur > 45 -> 80
+                else -> 60
+            }
+        }
+        if (u in tab.videoSrcs) score += 15
+        return score
+    }
+
     private fun universalCandidates(tab: Tab?): List<String> {
         if (tab == null) return emptyList()
-        // YouTube / Instagram / X ... have their own extractor: the page is the source, and their
-        // sniffed stream links (googlevideo "videoplayback") are signed halves of a video that only
-        // produce junk files. Backup links are for sites WITHOUT an extractor.
         if (YtDlpEngine.isItemUrl(tab.url)) return emptyList()
         return (listOfNotNull(tab.activeMedia) + tab.media.toList())
-            .filter { it.startsWith("http", true) && (isMediaUrl(it) || it in tab.videoSrcs) && mediaScore(it) > 0 }
+            .filter { it.startsWith("http", true) && !isSegmentUrl(it) && (isMediaUrl(it) || it in tab.videoSrcs || it in tab.hlsUrls) && mediaRank(tab, it) > 0 }
             .filter { YtDlpEngine.isBackupSource(tab.url, it) }
             .distinct()
-            .sortedByDescending { mediaScore(it) }
+            .sortedByDescending { mediaRank(tab, it) }
             .take(4)
     }
 
-    /**
-     * Best direct URL for the floating media button. Direct video wins over
-     * audio, and the currently playing source wins over stale discovered links.
-     */
     fun playableMedia(tab: Tab): String? {
+        fun orderOf(u: String): Int = tab.hlsOrder[u] ?: 0
         val active = tab.activeMedia
-            ?.takeIf { it.isNotBlank() && !it.startsWith("blob:") && !it.startsWith("data:") && (isMediaUrl(it) || it in tab.videoSrcs) }
+            ?.takeIf { it.isNotBlank() && !it.startsWith("blob:") && !it.startsWith("data:") && !isSegmentUrl(it) && (isMediaUrl(it) || it in tab.videoSrcs || it in tab.hlsUrls) }
         val discovered = tab.media.asSequence()
-            .filter { !it.startsWith("blob:") && !it.startsWith("data:") && (isMediaUrl(it) || it in tab.videoSrcs) }
-            .maxByOrNull { mediaScore(it) + if (it in tab.videoSrcs) 15 else 0 }
+            .filter { !it.startsWith("blob:") && !it.startsWith("data:") && !isSegmentUrl(it) && (isMediaUrl(it) || it in tab.videoSrcs || it in tab.hlsUrls) }
+            .maxWithOrNull(compareBy<String> { mediaRank(tab, it) }.thenBy { tab.hlsDuration[it] ?: 0 }.thenBy { orderOf(it) })
+        val dRank = if (discovered != null) mediaRank(tab, discovered) else Int.MIN_VALUE
+        val aRank = if (active != null) mediaRank(tab, active) else Int.MIN_VALUE
         return when {
-            active != null && (discovered == null || mediaScore(active) >= mediaScore(discovered)) -> active
-            discovered != null && mediaScore(discovered) > 0 -> discovered
+            discovered != null && discovered in tab.hlsUrls && dRank > 0 && (active == null || dRank >= aRank) -> discovered
+            active != null && (discovered == null || aRank >= dRank) -> active
+            discovered != null && dRank > 0 -> discovered
             !active.isNullOrBlank() -> active
             else -> null
         }
@@ -3654,7 +4033,7 @@ class BrowserState(private val act: Activity) {
     /** Audio track that matches an adaptive video stream, if the page exposed one. */
     fun playableAudio(tab: Tab?, videoUrl: String?): String? {
         if (tab == null || videoUrl == null) return null
-        val videoKind = mediaKind(videoUrl)
+        val videoKind = if (videoUrl in tab.hlsUrls) "HLS" else mediaKind(videoUrl)
         // Only adaptive streams are split into separate video/audio tracks.
         // Pairing an arbitrary MP3 with a normal MP4 usually breaks playback.
         if (videoKind != "HLS" && videoKind != "DASH") return null
@@ -3799,11 +4178,12 @@ class BrowserState(private val act: Activity) {
         // A finger swipe on the page decides the toolbar on its own, whether or not the page can scroll:
         // swipe up always hides it, swipe down brings it back (so a short page can never trap a hidden bar).
         // The listener only watches (returns false), the page still gets every touch.
-        val swipeDistance = android.view.ViewConfiguration.get(act).scaledTouchSlop * 3.5f
+        val swipeDistance = android.view.ViewConfiguration.get(act).scaledTouchSlop * 4.0f
         var swipeX = 0f
         var swipeY = 0f
         var swipeDone = true
         var scrollAccum = 0
+        var scrolledInTouch = false
         setOnTouchListener { v, ev ->
             val shot = shotSession
             if (shot != null && shot.owns(v)) {
@@ -3812,20 +4192,30 @@ class BrowserState(private val act: Activity) {
             }
             when (ev.actionMasked) {
                 android.view.MotionEvent.ACTION_DOWN -> {
-                    swipeX = ev.x; swipeY = ev.y
+                    tab.lastUserTouchAt = android.os.SystemClock.uptimeMillis()
+                    swipeX = ev.rawX; swipeY = ev.rawY
                     swipeDone = false
                     scrollAccum = 0
+                    scrolledInTouch = false
+                }
+                android.view.MotionEvent.ACTION_UP,
+                android.view.MotionEvent.ACTION_CANCEL -> {
+                    tab.lastUserTouchAt = android.os.SystemClock.uptimeMillis()
+                    swipeDone = true
                 }
                 android.view.MotionEvent.ACTION_POINTER_DOWN -> swipeDone = true
                 android.view.MotionEvent.ACTION_MOVE -> if (!swipeDone) {
-                    val dx = ev.x - swipeX
-                    val dy = ev.y - swipeY
+                    val dx = ev.rawX - swipeX
+                    val dy = ev.rawY - swipeY
                     if (abs(dy) >= swipeDistance && abs(dy) > abs(dx) * 1.4f) {
                         swipeDone = true
-                        // Touch fallback ONLY when page uses internal CSS scroller (scrollY == 0)
-                        if (autoHide && !toolbarLocked && !tab.isHome && fullscreen == null && !inlinePlayer && v.scrollY == 0) {
-                            val next = dy > 0f
-                            if (barVisible != next) barVisible = next
+                        // Touch fallback ONLY when the WebView itself did not scroll (CSS inner scroller / short page / overscroll)
+                        if (!scrolledInTouch && autoHide && !toolbarLocked && !tab.isHome && fullscreen == null && !inlinePlayer) {
+                            val canNativeScroll = v.canScrollVertically(if (dy < 0f) 1 else -1)
+                            if (!canNativeScroll || (!barVisible && dy > 0f)) {
+                                val next = dy > 0f
+                                if (barVisible != next) barVisible = next
+                            }
                         }
                     }
                 }
@@ -3833,22 +4223,68 @@ class BrowserState(private val act: Activity) {
             false
         }
         setOnScrollChangeListener { _, _, y, _, oldY ->
+            scrolledInTouch = true
             if (!autoHide || toolbarLocked || tab.isHome || shotSession != null) return@setOnScrollChangeListener
             val dy = y - oldY
             if (dy > 0) {
                 if (scrollAccum < 0) scrollAccum = 0
                 scrollAccum = (scrollAccum + dy).coerceAtMost(320)
-                if (barVisible && scrollAccum > 48 && y > 140) {
+                if (barVisible && scrollAccum > 64 && y > 140) {
                     barVisible = false
                     scrollAccum = 0
                 }
             } else if (dy < 0) {
                 if (scrollAccum > 0) scrollAccum = 0
                 scrollAccum = (scrollAccum + dy).coerceAtLeast(-160)
-                if (!barVisible && (scrollAccum < -22 || y <= 16)) {
+                if (!barVisible && (scrollAccum < -28 || y <= 12)) {
                     barVisible = true
                     scrollAccum = 0
                 }
+            }
+        }
+        isLongClickable = true
+        setOnLongClickListener {
+            if (shotSession != null || fullscreen != null || tab.isHome) return@setOnLongClickListener false
+            val hit = hitTestResult
+            val type = hit.type
+            when (type) {
+                WebView.HitTestResult.SRC_ANCHOR_TYPE,
+                WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE -> {
+                    val fallbackUrl = if (type == WebView.HitTestResult.SRC_ANCHOR_TYPE) hit.extra.orEmpty() else ""
+                    val fallbackImg = if (type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
+                        hit.extra?.trim()?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+                    } else null
+                    val h = android.os.Handler(android.os.Looper.getMainLooper()) { msg ->
+                        val data = msg.data
+                        val resolvedUrl = data.getString("url").orEmpty().ifBlank { fallbackUrl }.trim()
+                        val resolvedTitle = data.getString("title").orEmpty().trim()
+                        val resolvedImg = data.getString("src")?.trim()
+                            ?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+                            ?: fallbackImg
+                        val validLink = isContextMenuUrl(resolvedUrl)
+                        if (validLink || !resolvedImg.isNullOrBlank()) {
+                            Haptics.fire(this@apply, Hx.TAP)
+                            linkMenu = LinkContextMenuState(
+                                tabId = tab.id,
+                                url = if (validLink) resolvedUrl else "",
+                                title = resolvedTitle,
+                                imageUrl = resolvedImg
+                            )
+                        }
+                        true
+                    }
+                    requestFocusNodeHref(h.obtainMessage())
+                    true
+                }
+                WebView.HitTestResult.IMAGE_TYPE -> {
+                    val img = hit.extra?.trim().orEmpty()
+                    if (img.startsWith("http://", true) || img.startsWith("https://", true)) {
+                        Haptics.fire(this@apply, Hx.TAP)
+                        linkMenu = LinkContextMenuState(tabId = tab.id, url = "", title = "", imageUrl = img)
+                        true
+                    } else false
+                }
+                else -> false
             }
         }
         setDownloadListener { url, ua, cd, mime, _ ->
@@ -3874,9 +4310,10 @@ class BrowserState(private val act: Activity) {
                 val handsOffPage = isSub && isHandsOffHost(pageHost)
                 if (isSub && (isMetaCdnHost(reqHost) || handsOffPage)) return null
                 if (reqHost.endsWith("googlevideo.com")) {
-                    if (mediaDetect && isSub &&
-                        runCatching { tab.media.none { "googlevideo.com" in it } }.getOrDefault(false)
-                    ) addMedia(tab, url)
+                    if (mediaDetect && isSub && !tab.hasGoogleVideo) {
+                        tab.hasGoogleVideo = true
+                        addMedia(tab, url)
+                    }
                     return null
                 }
                 if (isTrustedYoutubeAsset(reqHost, request.url.path.orEmpty())) return null
@@ -3972,14 +4409,34 @@ class BrowserState(private val act: Activity) {
                     act.runOnUiThread { blocked = blocked + 1; quietNotify("Blocked an ad redirect") }
                     return true
                 }
+                val recentTouch = (android.os.SystemClock.uptimeMillis() - tab.lastUserTouchAt) <= 8_000L
+                val userInitiated = request.hasGesture() || recentTouch || guard.clickMatchesSchemeOrHost(tab.id, uri.toString())
+
+                val isBlankPopupHelper = tab.hiddenPopup || (tab.url.isBlank() && tab.openerId >= 0)
+                fun closeIfBlankHelper() {
+                    if (isBlankPopupHelper) {
+                        act.window.decorView.post {
+                            val idx = tabs.indexOf(tab)
+                            if (idx >= 0 && (tab.hiddenPopup || tab.url.isBlank())) closeTab(idx)
+                        }
+                    }
+                }
+
                 if (scheme == "http" || scheme == "https" || scheme == "about") {
+                    if (openInApps && request.isForMainFrame && !metaNav && userInitiated && scheme == "https" &&
+                        shouldOpenHttpsInExternalApp(uri, view.url)
+                    ) {
+                        if (tryLaunchNonBrowserApp(uri)) {
+                            closeIfBlankHelper()
+                            return true
+                        }
+                    }
                     if (request.isForMainFrame && uri.toString() != "about:blank") {
                         pushHistory(tab, uri.toString())
                         if (scheme != "about") {
                             if (request.hasGesture()) {
                                 tab.autoRedirectUrls.remove(uri.toString())
                             } else if (!request.isRedirect) {
-                                // The page left by itself (script / meta refresh) without any tap: Back must step over it.
                                 val here = view.url.orEmpty()
                                 if (here.startsWith("http", true)) tab.autoRedirectUrls.add(here)
                             }
@@ -3987,38 +4444,34 @@ class BrowserState(private val act: Activity) {
                     }
                     return false
                 }
-                // Block script/click-hijack attempts to launch Play Store or scam apps while allowing UPI/messaging links!
-                if ((popupBlock || adblock) && !guard.isUserTrusted(guardPageHost(tab))) {
-                    val trustedApp = guard.isTrustedExternalScheme(scheme)
-                    val tapMatched = guard.clickMatchesSchemeOrHost(tab.id, uri.toString())
-                    if (!request.hasGesture() || (!trustedApp && !tapMatched && (scheme == "market" || scheme == "intent"))) {
+                if (scheme == "blob" || scheme == "data" || scheme == "javascript" || scheme == "file" || scheme == "content") {
+                    return false
+                }
+                val raw = uri.toString()
+                val pageHost = guardPageHost(tab)
+                val trustedApp = guard.isTrustedExternalScheme(scheme)
+                val directSafeUserScheme = trustedApp && userInitiated && scheme != "market" && scheme != "intent"
+                if ((popupBlock || adblock) && !guard.isUserTrusted(pageHost) && !directSafeUserScheme) {
+                    val fromAdSource = blocker.shouldBlock(raw) || guard.knownPopNetwork(pageHost)
+                    if (fromAdSource || (!userInitiated && !trustedApp)) {
                         act.runOnUiThread { blocked = blocked + 1; redirectsBlocked += 1; quietNotify("Blocked an app redirect") }
+                        closeIfBlankHelper()
                         return true
                     }
                 }
-                return try {
+                if (!openInApps && scheme != "tel" && scheme != "mailto" && scheme != "sms" && scheme != "smsto" &&
+                    scheme != "upi" && scheme != "tez" && scheme != "gpay" && scheme != "phonepe" &&
+                    scheme != "paytmmp" && scheme != "bhim" && scheme != "credpay"
+                ) {
                     if (scheme == "intent") {
-                        val raw = uri.toString()
-                        try {
-                            val i = Intent.parseUri(raw, Intent.URI_INTENT_SCHEME).apply {
-                                addCategory(Intent.CATEGORY_BROWSABLE)
-                                component = null
-                                selector = null
-                            }
-                            act.startActivity(i)
-                        } catch (e: Exception) {
-                            val fb = raw.substringAfter("S.browser_fallback_url=", "").substringBefore(';')
-                            val target = runCatching { java.net.URLDecoder.decode(fb, "UTF-8") }.getOrDefault("")
-                            if (target.startsWith("http")) view.loadUrl(target)
-                            else notify("No app can open this link")
-                        }
-                    } else {
-                        act.startActivity(Intent(Intent.ACTION_VIEW, uri))
+                        val fb = fallbackUrlOfIntent(raw)
+                        if (fb != null) { view.loadUrl(fb); return true }
                     }
-                    true
-                } catch (e: Exception) {
-                    notify("No app can open ${uri.scheme} links"); true
+                    return true
                 }
+                val launched = launchExternalUri(view, uri, raw)
+                if (launched) closeIfBlankHelper()
+                return true
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
@@ -4053,7 +4506,7 @@ class BrowserState(private val act: Activity) {
                 tab.activeMedia = null
                 tab.canBack = view.canGoBack()
                 tab.canForward = view.canGoForward()
-                tab.media.clear(); tab.videoSrcs.clear(); tab.mediaRef.clear()
+                tab.hasGoogleVideo = false; tab.media.clear(); tab.videoSrcs.clear(); tab.mediaRef.clear(); tab.hlsUrls.clear(); tab.hlsMasterUrls.clear(); tab.hlsDuration.clear(); tab.hlsOrder.clear()
                 tab.findCurrent = 0; tab.findTotal = 0
                 barVisible = true
 
@@ -4091,7 +4544,17 @@ class BrowserState(private val act: Activity) {
                         }, 600L)
                     }
                 }
-                if (url.startsWith("http", true) && tab.url != url && !isReload) { tab.url = url }
+                if (url.startsWith("http", true) && tab.url != url && !isReload) {
+                    val prevBase = tab.url.substringBefore('#')
+                    val nextBase = url.substringBefore('#')
+                    tab.url = url
+                    if (prevBase.isNotEmpty() && prevBase != nextBase) {
+                        tab.activeMedia = null
+                        tab.hasGoogleVideo = false
+                        tab.media.clear(); tab.videoSrcs.clear(); tab.mediaRef.clear()
+                        tab.hlsUrls.clear(); tab.hlsMasterUrls.clear(); tab.hlsDuration.clear(); tab.hlsOrder.clear()
+                    }
+                }
                 prefetchPage(tab, url)
             }
 
@@ -4217,9 +4680,11 @@ class BrowserState(private val act: Activity) {
                 val nt = newTab("", tab.incognito, select = false)
                 nt.hiddenPopup = true
                 nt.openerId = tab.id
+                if (isUserGesture) nt.lastUserTouchAt = now
                 nt.popupGuardUntil = now + 6000
                 nt.openerHost = pageHostOf(tab)
-                (resultMsg.obj as WebView.WebViewTransport).webView = wakeWeb(nt)
+                val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
+                transport.webView = wakeWeb(nt)
                 resultMsg.sendToTarget()
                 // A window that never loads anything is shown anyway after a moment (scripted pages that fill it later).
                 act.window.decorView.postDelayed({ revealPopup(nt) }, 2500)
@@ -4365,6 +4830,123 @@ class BrowserState(private val act: Activity) {
         }
     }
 
+    /** True for well-known HTTPS app-launcher links (Play Store, WhatsApp, Telegram, Maps, Meet, Zoom, Teams). */
+    private fun shouldOpenHttpsInExternalApp(uri: Uri, currentUrl: String?): Boolean {
+        val h = uri.host?.lowercase()?.removePrefix("www.") ?: return false
+        val path = uri.path.orEmpty().lowercase()
+        val curHost = runCatching { Uri.parse(currentUrl.orEmpty()).host?.lowercase()?.removePrefix("www.") }.getOrNull().orEmpty()
+        if (curHost == h && h != "play.google.com") return false
+        return when {
+            h == "play.google.com" && path.startsWith("/store/") -> true
+            h == "wa.me" || h == "chat.whatsapp.com" -> true
+            h == "whatsapp.com" && path.startsWith("/channel/") -> true
+            h == "api.whatsapp.com" && path.startsWith("/send") -> true
+            h == "t.me" || h == "telegram.me" || h == "telegram.dog" -> true
+            h == "maps.app.goo.gl" || h == "maps.google.com" -> true
+            h == "goo.gl" && path.startsWith("/maps") -> true
+            h == "meet.google.com" && path.length > 4 -> true
+            h == "teams.microsoft.com" && path.startsWith("/l/") -> true
+            (h == "zoom.us" || h.endsWith(".zoom.us")) && (path.startsWith("/j/") || path.startsWith("/wc/")) -> true
+            else -> false
+        }
+    }
+
+    /** Launches an HTTPS link strictly in an installed native app (Android 11+ flag, plus Android 10 & below PackageManager resolver). */
+    private fun tryLaunchNonBrowserApp(uri: Uri): Boolean {
+        if (Build.VERSION.SDK_INT >= 30) {
+            return try {
+                val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                    addCategory(Intent.CATEGORY_BROWSABLE)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REQUIRE_NON_BROWSER)
+                }
+                act.startActivity(intent)
+                true
+            } catch (_: Throwable) {
+                false
+            }
+        }
+        return try {
+            val pm = act.packageManager
+            val viewIntent = Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE)
+            val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com")).addCategory(Intent.CATEGORY_BROWSABLE)
+            val browsers = pm.queryIntentActivities(browserIntent, 0).map { it.activityInfo.packageName }.toSet()
+            val target = pm.queryIntentActivities(viewIntent, 0)
+                .firstOrNull { it.activityInfo.packageName != act.packageName && it.activityInfo.packageName !in browsers }
+                ?: return false
+            val launch = Intent(Intent.ACTION_VIEW, uri).apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                `package` = target.activityInfo.packageName
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            act.startActivity(launch)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun fallbackUrlOfIntent(raw: String, parsed: Intent? = null): String? {
+        val fromExtra = parsed?.getStringExtra("browser_fallback_url")?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+        if (fromExtra != null) return fromExtra
+        val fb = raw.substringAfter("S.browser_fallback_url=", "").substringBefore(';')
+        if (fb.isBlank()) return null
+        val decoded = runCatching { java.net.URLDecoder.decode(fb, "UTF-8") }.getOrDefault("")
+        return decoded.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+    }
+
+    /** Launches `intent://`, UPI, messaging, Play Store, dialer, mailto, and custom-scheme deep links reliably. */
+    private fun launchExternalUri(view: WebView, uri: Uri, raw: String): Boolean {
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        if (scheme == "intent") {
+            val parsed = runCatching {
+                Intent.parseUri(raw, Intent.URI_INTENT_SCHEME).apply {
+                    addCategory(Intent.CATEGORY_BROWSABLE)
+                    component = null
+                    selector = null
+                    flags = (flags and Intent.FLAG_GRANT_READ_URI_PERMISSION.inv() and Intent.FLAG_GRANT_WRITE_URI_PERMISSION.inv()) or
+                        Intent.FLAG_ACTIVITY_NEW_TASK
+                }
+            }.getOrNull()
+            if (parsed != null && parsed.`package` != act.packageName) {
+                if (runCatching { act.startActivity(parsed); true }.getOrDefault(false)) return true
+                val dataScheme = parsed.data?.scheme?.lowercase().orEmpty()
+                if (!parsed.`package`.isNullOrBlank() && dataScheme.isNotEmpty() && dataScheme != "http" && dataScheme != "https") {
+                    val generic = Intent(Intent.ACTION_VIEW, parsed.data).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    if (runCatching { act.startActivity(generic); true }.getOrDefault(false)) return true
+                }
+                val fb = fallbackUrlOfIntent(raw, parsed)
+                if (fb != null) { view.loadUrl(fb); return false }
+                val pkg = parsed.`package`
+                if (!pkg.isNullOrBlank()) {
+                    val market = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$pkg"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    if (runCatching { act.startActivity(market); true }.getOrDefault(false)) return true
+                }
+                notify("No app installed to open this link")
+                return true
+            }
+            val fb = fallbackUrlOfIntent(raw, parsed)
+            if (fb != null) { view.loadUrl(fb); return false }
+            notify("No app installed to open this link")
+            return true
+        }
+        val direct = Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (runCatching { act.startActivity(direct); true }.getOrDefault(false)) return true
+        if (scheme == "tel") {
+            val dial = Intent(Intent.ACTION_DIAL, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (runCatching { act.startActivity(dial); true }.getOrDefault(false)) return true
+        }
+        if (scheme == "market") {
+            val pkg = uri.getQueryParameter("id")
+            if (!pkg.isNullOrBlank()) {
+                view.loadUrl("https://play.google.com/store/apps/details?id=$pkg")
+                return false
+            }
+        }
+        notify("No app installed for $scheme links")
+        return true
+    }
+
     /** Cosmetic, popup and YouTube ad protection, safe to run more than once. */
     private fun injectProtection(view: WebView, url: String) {
         if (isHandsOffHost(url)) return
@@ -4419,6 +5001,10 @@ class BrowserState(private val act: Activity) {
         if (!(popupBlock || adblock)) return false
         if (tab.popupGuardUntil == 0L || android.os.SystemClock.uptimeMillis() > tab.popupGuardUntil) return false
         if (url == "about:blank") return false
+        val lowScheme = url.substringBefore(':', "").lowercase()
+        if (lowScheme.isNotEmpty() && lowScheme != "http" && lowScheme != "https" && guard.isTrustedExternalScheme(lowScheme)) {
+            return false
+        }
         if (blockAdult && AdultFilter.matches(url)) {
             act.window.decorView.post {
                 val i = tabs.indexOf(tab)
@@ -4507,13 +5093,35 @@ class BrowserState(private val act: Activity) {
         return false
     }
 
-    private fun addMedia(tab: Tab, url: String, ref: String? = null, confirmed: Boolean = false) {
+    private fun addMedia(
+        tab: Tab,
+        url: String,
+        ref: String? = null,
+        confirmed: Boolean = false,
+        isHls: Boolean = false,
+        isMasterHls: Boolean = false,
+        durationSec: Int = 0
+    ) {
         if (url.length > 2048) return
+        if (!isHls && isSegmentUrl(url)) return
         act.runOnUiThread {
             if (!mediaDetect) return@runOnUiThread
             if (confirmed) tab.videoSrcs.add(url)
+            if (isHls) {
+                tab.hlsUrls.add(url)
+                if (durationSec > 0) tab.hlsDuration[url] = maxOf(tab.hlsDuration[url] ?: 0, durationSec)
+                tab.hlsOrder[url] = ++tab.hlsSeq
+            }
+            if (isMasterHls) tab.hlsMasterUrls.add(url)
             if (!ref.isNullOrBlank() && ref.startsWith("http", true) && ref != tab.mediaRef[url]) tab.mediaRef[url] = ref
-            if (url !in tab.media && tab.media.size < 40) tab.media.add(url)
+            if (url !in tab.media) {
+                if (isHls) {
+                    if (tab.media.size >= 40) tab.media.removeAt(tab.media.lastIndex)
+                    tab.media.add(0, url)
+                } else if (tab.media.size < 40) {
+                    tab.media.add(url)
+                }
+            }
         }
     }
 
@@ -4534,8 +5142,10 @@ class BrowserState(private val act: Activity) {
         if (!range.startsWith("bytes=", true)) return false
         val accept = (h["Accept"] ?: h["accept"]).orEmpty()
         if (accept.startsWith("image/", true) || accept.startsWith("text/", true)) return false
+        val urlStr = request.url.toString()
+        if (isSegmentUrl(urlStr)) return false
         val ext = request.url.lastPathSegment?.substringAfterLast('.', "")?.lowercase().orEmpty()
-        return ext !in STATIC_EXT
+        return ext !in STATIC_EXT && ext != "ts" && ext != "m4s" && ext != "cmfv" && ext != "cmfa"
     }
 
     private fun recordHistory(url: String, title: String) {
@@ -4633,6 +5243,13 @@ class BrowserState(private val act: Activity) {
         fun src(url: String?, frame: String?) {
             if (url.isNullOrBlank() || !url.startsWith("http", true)) return
             addMedia(tab, url, frame, confirmed = true)
+        }
+
+        /** A fetch() or XHR in any frame (main page or embed <iframe>) returned a real `#EXTM3U` HLS playlist! */
+        @JavascriptInterface
+        fun hls(url: String?, frame: String?, master: Boolean, durationSec: Int) {
+            if (url.isNullOrBlank() || !url.startsWith("http", true)) return
+            addMedia(tab, url, frame, confirmed = true, isHls = true, isMasterHls = master, durationSec = durationSec)
         }
 
         @JavascriptInterface

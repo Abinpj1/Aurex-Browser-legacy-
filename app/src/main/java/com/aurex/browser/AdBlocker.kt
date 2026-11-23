@@ -63,15 +63,15 @@ class AdBlocker(private val ctx: Context) {
     private fun listFile(l: FilterList) = File(ctx.filesDir, "fl_${l.id}.txt")
 
     init {
-        runCatching {
-            ctx.assets.open("hosts.txt").bufferedReader().useLines { lines ->
-                lines.forEach { parseHostsLine(it) }
-            }
-        }
         BUILTIN.split('|').forEach { addHost(it) }
         hostCount = hosts.size
-        // The cached lists are large; parsing them here used to block app start.
+        // Parse bundled + cached filter lists off the UI thread so Frame 1 launches instantaneously.
         scope.launch {
+            runCatching {
+                ctx.assets.open("hosts.txt").bufferedReader().useLines { lines ->
+                    lines.forEach { parseHostsLine(it) }
+                }
+            }
             if (cache.exists()) {
                 runCatching {
                     cache.bufferedReader().useLines { lines -> lines.forEach { parseHostsLine(it) } }
@@ -1088,11 +1088,17 @@ API.heavy=function(){
 };
 API.skip=function(){API.cheap();if(Date.now()-heavyAt>2500)API.heavy();};
 function laterHeavy(){
-  if(heavyTimer||window.__lqPipOn)return;
-  heavyTimer=setTimeout(function(){heavyTimer=0;API.heavy();},900);
+  if(heavyTimer||window.__lqPipOn||document.hidden)return;
+  heavyTimer=setTimeout(function(){heavyTimer=0;if(!document.hidden)API.heavy();},2000);
 }
-var pt=0;API.timer=setInterval(function(){if(window.__lqPipOn&&(++pt&3))return;API.cheap();},250);
-API.timer2=setInterval(function(){if(!window.__lqPipOn&&!document.hidden)API.heavy();},4000);
+var pt=0;API.timer=setInterval(function(){
+  if(document.hidden&&!window.__lqPipOn)return;
+  var p=document.getElementById('movie_player')||document.querySelector('.html5-video-player');
+  var inAd=!!(p&&p.classList&&(p.classList.contains('ad-showing')||p.classList.contains('ad-interrupting')));
+  if(!inAd&&(++pt%3)!==0)return;
+  API.cheap();
+},350);
+API.timer2=setInterval(function(){if(!window.__lqPipOn&&!document.hidden)API.heavy();},9000);
 document.addEventListener('yt-navigate-finish',function(){setTimeout(API.skip,150);},{passive:true});
 document.addEventListener('yt-page-data-updated',function(){setTimeout(API.skip,250);},{passive:true});
 document.addEventListener('play',function(){setTimeout(API.cheap,80);},true);

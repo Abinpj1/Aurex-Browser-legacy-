@@ -1,6 +1,7 @@
 # Aggressive, safe R8 shrinking & optimization for smaller DEX and faster cold start.
 -allowaccessmodification
 -repackageclasses 'o'
+-renamesourcefileattribute SourceFile
 -optimizationpasses 5
 
 # Keep WebView JS bridges intact while allowing R8 to shrink & inline the rest of com.aurex.browser.
@@ -16,6 +17,8 @@
 -assumenosideeffects class android.util.Log {
     public static int v(...);
     public static int d(...);
+    public static int i(...);
+    public static int w(...);
 }
 -assumenosideeffects class kotlin.jvm.internal.Intrinsics {
     public static void checkParameterIsNotNull(java.lang.Object, java.lang.String);

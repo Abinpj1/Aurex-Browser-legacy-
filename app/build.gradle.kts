@@ -30,21 +30,21 @@ android {
         applicationId = "com.aurex.browser"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "2.0.0"
+        versionCode = 5
+        versionName = "2.1.0"
         // Strip ~70 unused library locales (Aurex translates all 36 app languages on-device via MLKit).
         resourceConfigurations += listOf("en")
+        // Single universal APK covering all real Android phones (64-bit arm64-v8a + 32-bit armeabi-v7a), zero x86 emulator bloat.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
         manifestPlaceholders["appLabel"] = "Aurex Browser"
     }
 
-    // Per-ABI splits cut the APK size by ~60-65% (no x86_64 emulator bloat, no dual-ABI fat APK).
-    // Builds lean arm64-v8a (modern phones + Apple Silicon emulator) and armeabi-v7a (legacy 32-bit).
+    // Disabled ABI splits: produces one single universal aurex-browser.apk for GitHub Releases & Orion Store.
     splits {
         abi {
-            isEnable = true
-            reset()
-            include("arm64-v8a", "armeabi-v7a")
-            isUniversalApk = false
+            isEnable = false
         }
     }
 
@@ -79,17 +79,12 @@ android {
         }
     }
     
-    // Rename split release APKs to aurex-browser-v[versionName]-[abi].apk
+    // Output a single fixed-name release APK: aurex-browser.apk
     applicationVariants.all {
         if (buildType.name == "release") {
             outputs.all {
                 val outputImpl = this as com.android.build.gradle.internal.api.ApkVariantOutputImpl
-                val abi = outputImpl.filters.find { it.filterType == "ABI" }?.identifier
-                outputImpl.outputFileName = if (abi.isNullOrBlank()) {
-                    "aurex-browser-v${defaultConfig.versionName}.apk"
-                } else {
-                    "aurex-browser-v${defaultConfig.versionName}-$abi.apk"
-                }
+                outputImpl.outputFileName = "aurex-browser.apk"
             }
         }
     }
@@ -110,14 +105,6 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-    kotlinOptions {
-        jvmTarget = "17"
-        freeCompilerArgs += listOf(
-            "-Xno-param-assertions",
-            "-Xno-call-assertions",
-            "-Xno-receiver-assertions"
-        )
     }
     // Omit Google Play encrypted dependency signing block from APK
     dependenciesInfo {
@@ -154,11 +141,36 @@ android {
             "play-services-*.properties",
             "firebase-*.properties",
             "transport-*.properties",
-            "okhttp3/internal/publicsuffix/NOTICE"
+            "okhttp3/internal/publicsuffix/NOTICE",
+            "META-INF/*.txt",
+            "META-INF/*.md",
+            "META-INF/proguard/*",
+            "META-INF/services/javax.*",
+            "vision-*.properties",
+            "ads-*.properties",
+            "common.properties",
+            "translate.properties",
+            "language-id*.properties",
+            "kotlin/**/*.kotlin_builtins",
+            "kotlin/**/*.kotlin_metadata"
         )
         // The engine runs bundled executables from the native lib dir, so the libs must be
         // extracted to disk instead of being mmapped from the APK.
-        jniLibs { useLegacyPackaging = true }
+        jniLibs {
+            useLegacyPackaging = true
+            excludes += setOf("**/x86/**", "**/x86_64/**")
+        }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        freeCompilerArgs.addAll(
+            "-Xno-param-assertions",
+            "-Xno-call-assertions",
+            "-Xno-receiver-assertions"
+        )
     }
 }
 
@@ -171,7 +183,6 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.animation:animation")
-    implementation("androidx.compose.material3:material3")
     implementation("androidx.media3:media3-exoplayer:1.3.1")
     implementation("androidx.media3:media3-exoplayer-hls:1.3.1")
     implementation("androidx.media3:media3-exoplayer-dash:1.3.1")

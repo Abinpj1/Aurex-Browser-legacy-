@@ -52,8 +52,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Icon
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -189,6 +187,7 @@ class PlayerActivity : ComponentActivity() {
     private var stallAt2 = 0L
     private var reResolves = 0          // fresh lookups after an expired / refused stream link (reset once playing)
     private var isLocal = false
+    private var externalContentSize = 0L
     /** True until the orientation was matched to the video (portrait video -> portrait screen, landscape -> landscape). */
     private var needOrient = true
 
@@ -212,7 +211,7 @@ class PlayerActivity : ComponentActivity() {
         runCatching {
             val r = android.media.MediaMetadataRetriever()
             try {
-                if (url.startsWith("file:", true)) r.setDataSource(this, Uri.parse(url)) else r.setDataSource(url)
+                if (url.startsWith("file:", true) || url.startsWith("content:", true)) r.setDataSource(this, Uri.parse(url)) else r.setDataSource(url)
                 val w = r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
                 val h = r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
                 val rot = r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
@@ -413,7 +412,7 @@ class PlayerActivity : ComponentActivity() {
             .putExtra(BrowserMediaService.EXTRA_PAUSED, !playing)
             .putExtra(BrowserMediaService.EXTRA_LOCAL, true)
             .putExtra(BrowserMediaService.EXTRA_TITLE, name)
-            .putExtra(BrowserMediaService.EXTRA_HOST, "Downloads")
+            .putExtra(BrowserMediaService.EXTRA_HOST, if (firstUrl.startsWith("content:", true)) "Video" else "Downloads")
             .putExtra(BrowserMediaService.EXTRA_URL, firstUrl)
             .putExtra(BrowserMediaService.EXTRA_ACCENT, 0xFF0A84FF.toInt())
         runCatching {
@@ -428,6 +427,67 @@ class PlayerActivity : ComponentActivity() {
         MediaNotif.poke()
     }
 
+    private data class ExternalMeta(val title: String, val size: Long)
+
+    private fun queryContentMeta(uri: Uri): ExternalMeta {
+        var name = ""
+        var size = 0L
+        runCatching {
+            contentResolver.query(
+                uri,
+                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME, android.provider.OpenableColumns.SIZE),
+                null, null, null
+            )?.use { c ->
+                if (c.moveToFirst()) {
+                    val ni = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    val si = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                    if (ni >= 0) name = c.getString(ni).orEmpty()
+                    if (si >= 0 && !c.isNull(si)) size = c.getLong(si)
+                }
+            }
+        }
+        val clean = name.substringAfterLast('/').substringBeforeLast('.', name).trim()
+        return ExternalMeta(clean, size)
+    }
+
+    private fun extractExternalUri(i: Intent?): Uri? {
+        if (i == null) return null
+        return when (i.action) {
+            Intent.ACTION_VIEW -> i.data ?: i.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+            Intent.ACTION_SEND -> {
+                val stream: Uri? = if (Build.VERSION.SDK_INT >= 33) {
+                    i.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    i.getParcelableExtra(Intent.EXTRA_STREAM)
+                }
+                stream ?: i.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri ?: i.data
+            }
+            else -> null
+        }
+    }
+
+    private fun externalTitleFor(i: Intent, uri: Uri, contentName: String): String {
+        if (contentName.isNotBlank()) return contentName
+        val extra = i.getStringExtra(Intent.EXTRA_TITLE)?.takeIf { it.isNotBlank() }
+            ?: i.getStringExtra(Intent.EXTRA_SUBJECT)?.takeIf { it.isNotBlank() }
+        if (extra != null) return extra.trim()
+        val seg = uri.lastPathSegment.orEmpty().substringAfterLast('/').substringBeforeLast('.')
+        if (seg.isNotBlank() && !seg.all { it.isDigit() }) return seg
+        return if (uri.scheme.equals("http", true) || uri.scheme.equals("https", true)) hostOf(uri.toString()) else "Video"
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        val ext = intent.action == Intent.ACTION_VIEW || intent.action == Intent.ACTION_SEND
+        val incoming = (if (ext) extractExternalUri(intent)?.toString() else intent.getStringExtra("url"))?.trim()
+        // Notification tap / bring-to-front carries no video URI: keep the running player intact!
+        if (incoming.isNullOrBlank() || incoming == firstUrl) return
+        savePosition()
+        setIntent(intent)
+        recreate()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // No slide / fade between the in-app player and this one, and never the light app background in between:
@@ -436,44 +496,59 @@ class PlayerActivity : ComponentActivity() {
         window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.BLACK))
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val controller = WindowCompat.getInsetsController(window, window.decorView)
         applySystemBars()
 
-        val url = intent.getStringExtra("url")
+        val isExternalAction = intent.action == Intent.ACTION_VIEW || intent.action == Intent.ACTION_SEND
+        val extUri = if (isExternalAction) extractExternalUri(intent) else null
+        val rawUrl = if (isExternalAction) extUri?.toString() else intent.getStringExtra("url")
+        val url = rawUrl?.trim()
         if (url.isNullOrBlank()) { finish(); return }
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: run { finish(); return }
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        val allowedScheme = scheme == "content" || scheme == "file" || scheme == "http" || scheme == "https" ||
+            (!isExternalAction && scheme == "blob")
+        if (!allowedScheme) { finish(); return }
+
+        val contentMeta = if (scheme == "content") queryContentMeta(uri) else ExternalMeta("", 0L)
+        externalContentSize = contentMeta.size
+
         // Quality switched from the in-page / inline player: open in the SAME orientation the screen has right now
         // (landscape stays landscape, portrait stays portrait) and do not re-match it to the video's shape afterwards.
-        val keepOrient = intent.getBooleanExtra("keepOrient", false)
+        val keepOrient = !isExternalAction && intent.getBooleanExtra("keepOrient", false)
         if (keepOrient) {
             orientFor(portrait = !intent.getBooleanExtra("landscape", false))
             needOrient = false
-        } else if (intent.getBooleanExtra("landscape", false)) {
+        } else if (!isExternalAction && intent.getBooleanExtra("landscape", false)) {
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         }
-        isLocal = intent.getBooleanExtra("local", false) || url.startsWith("file:", true)
+        isLocal = (!isExternalAction && intent.getBooleanExtra("local", false)) || scheme == "file" || scheme == "content"
         if (isLocal && !keepOrient) peekLocalOrientation(url)
         firstUrl = url
-        syncBack = intent.getBooleanExtra("sync", false)
-        syncSeek = !intent.getBooleanExtra("syncLive", false)
+        syncBack = !isExternalAction && intent.getBooleanExtra("sync", false)
+        syncSeek = !isExternalAction && !intent.getBooleanExtra("syncLive", false)
         if (syncBack && intent.getBooleanExtra("handoff", false)) startHandoff()
-        firstAudio = intent.getStringExtra("audioUrl")
+        firstAudio = if (isExternalAction) null else intent.getStringExtra("audioUrl")
             ?.takeIf { it.isNotBlank() && it != url && isMediaUrl(it) }
-        pageUrl = intent.getStringExtra("pageUrl")?.takeIf { it.isNotBlank() }
-        val title = intent.getStringExtra("title").orEmpty()
+        pageUrl = if (isExternalAction) null else intent.getStringExtra("pageUrl")?.takeIf { it.isNotBlank() }
+        val title = if (isExternalAction) {
+            externalTitleFor(intent, uri, contentMeta.title)
+        } else {
+            intent.getStringExtra("title").orEmpty().ifBlank { contentMeta.title }
+        }
         introTitle = title
         playUrlState.value = url
-        // The page video's own length (sent with a quality switch): the progress bar knows it from the first frame.
-        intent.getLongExtra("durMs", 0L).takeIf { it > 0L }?.let { knownDurationMs.longValue = it }
+        if (!isExternalAction) {
+            intent.getLongExtra("durMs", 0L).takeIf { it > 0L }?.let { knownDurationMs.longValue = it }
+        }
 
-        val uri = Uri.parse(url)
         val origin = if (!uri.scheme.isNullOrBlank() && !uri.host.isNullOrBlank())
             "${uri.scheme}://${uri.host}/" else ""
-        userAgent = intent.getStringExtra("ua")?.takeIf { it.isNotBlank() }
+        userAgent = (if (isExternalAction) null else intent.getStringExtra("ua")?.takeIf { it.isNotBlank() })
             ?: runCatching { WebSettings.getDefaultUserAgent(this) }.getOrNull()?.takeIf { it.isNotBlank() }
-        referer = (intent.getStringExtra("referer")?.takeIf { it.isNotBlank() } ?: origin).takeIf { it.isNotBlank() }
-        cookie = siteCookie(url)
+        referer = ((if (isExternalAction) null else intent.getStringExtra("referer")?.takeIf { it.isNotBlank() }) ?: origin).takeIf { it.isNotBlank() }
+        cookie = if (isLocal) null else siteCookie(url)
             ?.takeIf { it.isNotBlank() }
-            ?: intent.getStringExtra("cookie")?.takeIf { it.isNotBlank() }
+            ?: (if (isExternalAction) null else intent.getStringExtra("cookie")?.takeIf { it.isNotBlank() })
 
         // YouTube & co hand out signed, throttled, chunked CDN links. Those are what used to give
         // 403 / "container unsupported", so the page itself is resolved to proper stream links.
@@ -535,7 +610,12 @@ class PlayerActivity : ComponentActivity() {
 
         playerListener = object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (isPlaying) { netRetries = 0; reResolves = 0; endSwitching() }   // a working stream clears the retry budget
+                if (isPlaying) {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    netRetries = 0; reResolves = 0; endSwitching()
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
                 refreshPip()
                 syncNativeSession()
                 localCard(isPlaying)
@@ -719,10 +799,11 @@ class PlayerActivity : ComponentActivity() {
 
     private fun source(
         videoUrl: String, audioUrl: String?, vHeaders: Map<String, String>, aHeaders: Map<String, String>,
-        forceHls: Boolean = false
+        forceHls: Boolean = false,
+        forceMime: String? = null
     ): MediaSource {
         val vItem = MediaItem.Builder().setUri(videoUrl).apply {
-            (kindMime(videoUrl) ?: if (forceHls) MimeTypes.APPLICATION_M3U8 else null)?.let { setMimeType(it) }
+            (kindMime(videoUrl) ?: forceMime ?: if (forceHls) MimeTypes.APPLICATION_M3U8 else null)?.let { setMimeType(it) }
         }.build()
         val vSrc = DefaultMediaSourceFactory(dataFactory(vHeaders))
             .setLoadErrorHandlingPolicy(androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy(6))
@@ -773,7 +854,13 @@ class PlayerActivity : ComponentActivity() {
             else if (Uri.parse(a).host != Uri.parse(firstUrl).host) ah.remove("Cookie")
         }
         playUrlState.value = firstUrl
-        begin(source(firstUrl, firstAudio, h, ah), startMs)
+        val extType = intent?.type.orEmpty()
+        val extMime = when {
+            extType.contains("mpegurl", true) -> MimeTypes.APPLICATION_M3U8
+            extType.contains("dash+xml", true) -> MimeTypes.APPLICATION_MPD
+            else -> null
+        }
+        begin(source(firstUrl, firstAudio, h, ah, forceMime = extMime), startMs)
     }
 
     /** True while the current source is the index-less fMP4 file played through [FragIndex]. */
@@ -1365,6 +1452,7 @@ class PlayerActivity : ComponentActivity() {
     /** Params are re-sent only when something visible changed (no per-event IPC, no window flicker). */
     private var lastPipSig = ""
     private fun refreshPip() {
+        if (!::player.isInitialized || isDestroyed) return
         val sz = player.videoSize
         val sig = "${wantsPlay()}|${player.hasNextMediaItem()}|${sz.width}x${sz.height}|$autoPip"
         if (sig == lastPipSig) return
@@ -1374,6 +1462,7 @@ class PlayerActivity : ComponentActivity() {
 
     /** Where the letter-boxed video sits in the window: the system animates exactly from there into the PiP window. */
     private fun pipSourceRect(): android.graphics.Rect? {
+        if (!::player.isInitialized) return null
         val dv = window?.decorView ?: return null
         val w = dv.width; val h = dv.height
         val vs = player.videoSize
@@ -1391,6 +1480,7 @@ class PlayerActivity : ComponentActivity() {
      * old check turned every "pause" tap in the PiP window into a no-op play().
      */
     private fun togglePlayPause() {
+        if (!::player.isInitialized) return
         if (wantsPlay()) player.pause()
         else {
             if (player.playbackState == Player.STATE_ENDED) player.seekTo(0)
@@ -1428,7 +1518,7 @@ class PlayerActivity : ComponentActivity() {
         super.onPictureInPictureUiStateChanged(uiState)
         if (uiState.isTransitioningToPip) {
             pipModeState.value = true
-            window?.decorView?.postDelayed({ pipModeState.value = isInPictureInPictureMode }, 1500L)
+            window?.decorView?.postDelayed({ if (!isDestroyed) pipModeState.value = isInPictureInPictureMode }, 1500L)
         }
     }
 
@@ -1444,7 +1534,7 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (autoPip && wantsPlay() && Build.VERSION.SDK_INT >= 26 &&
+        if (::player.isInitialized && autoPip && wantsPlay() && Build.VERSION.SDK_INT >= 26 &&
             packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
         ) {
             pipRequested = runCatching { enterPictureInPictureMode(buildPipParams()) }.getOrDefault(false)
@@ -1458,7 +1548,8 @@ class PlayerActivity : ComponentActivity() {
             pipRequested = false
             // Closed with the X -> stop and leave, like every video app.
             if (!audioOnly && lifecycle.currentState == androidx.lifecycle.Lifecycle.State.CREATED) {
-                player.pause(); finish(); return
+                if (::player.isInitialized) runCatching { player.pause() }
+                finish(); return
             }
         }
         refreshPip()
@@ -1470,7 +1561,7 @@ class PlayerActivity : ComponentActivity() {
      */
     private fun resumeId(url: String, page: String?, resolvable: Boolean, local: Boolean, title: String): String = when {
         // a downloaded file: its path + size (a re-download under the same name is a different video)
-        local -> url + "|" + (runCatching { java.io.File(Uri.parse(url).path.orEmpty()).length() }.getOrNull() ?: 0L)
+        local -> url + "|" + (if (url.startsWith("content:", true)) externalContentSize else (runCatching { java.io.File(Uri.parse(url).path.orEmpty()).length() }.getOrNull() ?: 0L))
         // YouTube & co: the page address names the video
         resolvable && !page.isNullOrBlank() -> page
         // blob: links (and our "blob:aurex-page" placeholder) are the same for every video: page + title tell them apart
@@ -2408,35 +2499,26 @@ internal fun PlayerScreen(
     //  - Standalone PlayerActivity: ~5 Hz live video refraction while panel/HUD/error is open, 1 frame when bars open, 0 Hz idle!
     //  - InlinePlayer: captures clean hardware video frame whenever bars are up and panel is closed (0 feedback loop!).
     LaunchedEffect(barsVisible, panel, hudActive, dblTapSide, errActive, overlay, pipMode) {
-        if (pipMode || PerfTier.low || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return@LaunchedEffect
+        if (pipMode || PerfTier.low || PerfTier.thermalWarm || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            ownedPlayerBackdrop.setAmbientVideoFrame(null)
+            return@LaunchedEffect
+        }
         val panelOpenNow = panel != null
         val anyOverlay = panelOpenNow || hudActive || dblTapSide != 0 || errActive
         if (!overlay) {
             if (!barsVisible && !anyOverlay) return@LaunchedEffect
             requestVideoGlassFrame()
-            val liveMs = when {
-                anyOverlay -> if (PerfTier.balanced) 150L else 95L
-                else -> if (PerfTier.balanced) 200L else 120L
-            }
-            while (isActive && (barsVisible || anyOverlay)) {
+            if (!panelOpenNow && !errActive) return@LaunchedEffect
+            val liveMs = if (PerfTier.balanced) 650L else 420L
+            while (isActive && !PerfTier.thermalWarm && (panelOpenNow || errActive)) {
                 delay(liveMs)
                 requestVideoGlassFrame()
             }
         } else {
-            // InlinePlayer (fullscreen web <video>):
-            //  - When controls are HIDDEN (`!barsVisible && !anyOverlay`): cleanly capture the unobstructed full
-            //    video frame every ~450 ms (ZERO controls on screen -> 0% feedback loop!), so the instant the
-            //    user taps to show controls, every button & Play/Pause orb already blurs the exact live video!
-            //  - When controls OR a panel ARE visible: NEVER re-capture full Activity.window over the buttons
-            //    (prevents neon self-amplification!). Instead, continuously sample ONLY a clean button-free
-            //    video strip (`y = 20%..36%`, strictly between top bar and center Play button) into `ambientBitmap`.
+            // InlinePlayer: 0 Hz PixelCopy while controls are hidden (prevents GPU heating during movies!).
             if (!barsVisible && !anyOverlay) {
                 ownedPlayerBackdrop.setAmbientVideoFrame(null)
-                requestVideoGlassFrame()
-                while (isActive) {
-                    delay(if (PerfTier.balanced) 650L else 420L)
-                    requestVideoGlassFrame()
-                }
+                return@LaunchedEffect
             } else {
                 if (ownedPlayerBackdrop.customBitmap == null) requestVideoGlassFrame()
                 val win = activity?.window ?: return@LaunchedEffect
@@ -2444,9 +2526,9 @@ internal fun PlayerScreen(
                 val ambPool = arrayOfNulls<Bitmap>(2)
                 var ambSlot = 0
                 var ambInFlight = false
-                val liveMs = if (PerfTier.balanced) 240L else 150L
+                val liveMs = if (PerfTier.balanced) 750L else 520L
                 try {
-                    while (isActive) {
+                    while (isActive && !PerfTier.thermalWarm) {
                         val vw = decor.width
                         val vh = decor.height
                         if (!ambInFlight && vw > 100 && vh > 100) {

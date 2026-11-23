@@ -793,3 +793,47 @@ Audio boost off
 Normal volume
 Adult popup blocked
 Blocked an app redirect
+Toolbar position
+Open links in apps
+Launch UPI, WhatsApp, Telegram, Play Store and app links
+Delete all finished downloads?
+All completed and failed files will be permanently deleted from local storage.
+Delete all
+No app installed to open this link
+Open link
+Open link in new tab
+Open link in background tab
+Copy link address
+Download link
+Download image
+Open image in new tab
+Copy image link
+Share image link
+Opened in background tab
+Place the address bar at the bottom or top of the screen.
+Default browser
+Set default
+Default
+Aurex is now your default browser
+Choose Aurex Browser as your default browser
+Open web links directly in Aurex Browser.
+Downloads ~30 MB once per language for offline use.
+Reload a page to apply.
+Telegram
+Drag or tap a control to customize.
+Visible in Downloads/AurexBrowser.
+Hidden from Gallery & File Manager.
+Swipe address bar
+Switch tabs
+Delete latest
+Press & hold
+Hold Tabs for new tab
+Hold menu for Settings
+Navigation
+Lists
+Swipe delete permanently removes downloaded files.
+Bookmarks & history swipe
+Downloads swipe to delete
+Downloads swipe to share
+Block images
+Permanently removes the file with no confirmation.

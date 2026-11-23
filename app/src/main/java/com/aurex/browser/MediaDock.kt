@@ -34,7 +34,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 
@@ -674,7 +673,7 @@ private fun DockDownloadRow(s: BrowserState, d: DlItem, modifier: Modifier = Mod
 @Composable
 private fun DetectedRow(s: BrowserState, tab: Tab, url: String, modifier: Modifier = Modifier) {
     val ctx = LocalContext.current
-    val kind = mediaKind(url)
+    val kind = if (url in tab.hlsUrls) "HLS" else mediaKind(url)
     val audio = kind == "AUDIO"
     val tint = if (audio) MusicRed else VideoPurple
     val file = url.substringBefore('?').substringAfterLast('/').ifBlank { hostOf(url) }

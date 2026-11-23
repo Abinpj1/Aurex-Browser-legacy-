@@ -195,18 +195,19 @@ function applyLight(){
  stripDarkCss();
  if(!lmo&&document.documentElement){
   try{
+   var lmoT=0;
    lmo=new MutationObserver(function(ms){
-    if(!cfg.light)return;
+    if(!cfg.light||lmoT)return;
     var need=false;
-    for(var i=0;i<ms.length;i++){
+    for(var i=0;i<ms.length&&!need;i++){
      var a=ms[i].addedNodes;
      for(var j=0;a&&j<a.length;j++){
       var n=a[j];
-      if(n&&n.nodeType===1&&(n.tagName==='STYLE'||n.tagName==='LINK'||n.tagName==='META'))need=true;
+      if(n&&n.nodeType===1&&(n.tagName==='STYLE'||n.tagName==='LINK'||n.tagName==='META')){need=true;break;}
      }
-     if(ms[i].type==='attributes'&&ms[i].attributeName==='dark')need=true;
+     if(!need&&ms[i].type==='attributes'&&ms[i].attributeName==='dark')need=true;
     }
-    if(need)stripDarkCss();
+    if(need){lmoT=setTimeout(function(){lmoT=0;if(cfg.light)stripDarkCss();},280);}
    });
    lmo.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['dark']});
   }catch(e){}
@@ -292,12 +293,13 @@ function mark(el){if(el.nodeType!==1)return;if(el.tagName==='IMG')markImg(el);el
 function queue(n,deep){if(!n||n.nodeType!==1)return;pend.set(n,deep||pend.get(n)||false);if(!tm)tm=setTimeout(flush,100);}
 function flush(){
  tm=0;var c=0,it=pend.entries(),x;
- while(c<250&&!(x=it.next()).done){
+ if(document.hidden){if(pend.size)tm=setTimeout(flush,500);return;}
+ while(c<120&&!(x=it.next()).done){
   var n=x.value[0],deep=x.value[1];pend.delete(n);c++;
   if(!n.isConnected)continue;
-  try{mark(n);if(deep&&n.querySelectorAll){var d=n.querySelectorAll('*'),lim=Math.min(d.length,300),i;for(i=0;i<lim;i++)mark(d[i]);for(i=lim;i<d.length;i++)pend.set(d[i],false);}}catch(e){}
+  try{mark(n);if(deep&&n.querySelectorAll){var d=n.querySelectorAll('*'),lim=Math.min(d.length,180),i;for(i=0;i<lim;i++)mark(d[i]);for(i=lim;i<d.length;i++)pend.set(d[i],false);}}catch(e){}
  }
- if(pend.size)tm=setTimeout(flush,60);
+ if(pend.size)tm=setTimeout(flush,100);
 }
 function observe(){
  if(mo||!document.documentElement)return;
