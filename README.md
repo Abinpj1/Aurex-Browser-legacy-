@@ -4,28 +4,8 @@
 <img src="docs/hero.svg" alt="Aurex Browser: Fast. Private. Powerful." width="100%">
 <br>
 <br>
-<p>
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/github/v/release/aman-nitb-cse/Aurex-Browser?style=flat-square&color=0A84FF&labelColor=1C1C1E&label=Release" alt="Release"></a>&nbsp;&nbsp;
-<img src="https://img.shields.io/badge/Android-7.0%2B-30D158?style=flat-square&labelColor=1C1C1E&logo=android&logoColor=white" alt="Android 7.0+">&nbsp;&nbsp;
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/stargazers"><img src="https://badgen.net/github/stars/aman-nitb-cse/Aurex-Browser?color=FF9F0A&labelColor=1C1C1E&icon=github" alt="Stars"></a>&nbsp;&nbsp;
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases"><img src="https://img.shields.io/github/downloads/aman-nitb-cse/Aurex-Browser/total?style=flat-square&color=30D158&labelColor=1C1C1E&logo=github&logoColor=white&label=Downloads" alt="Total downloads"></a>&nbsp;&nbsp;
-<img src="https://img.shields.io/badge/License-GPL%20v3-BF5AF2?style=flat-square&labelColor=1C1C1E" alt="GPL v3">
-</p>
 <br>
 <sub>⭐ If Aurex is useful to you, please consider giving the repo a star — it really helps!</sub>
-</div>
-
-<br>
-
-<a id="install"></a>
-
-## 📥 Download & Install
-
-<div align="center">
-<p>
-<a href="https://rookieenough.github.io/Orion-Data/app/?id=aurex-browser"><img src="https://raw.githubusercontent.com/RookieEnough/Orion-Store/refs/heads/main/assets/orion-badge.png" alt="Get it on Orion Store" height="64"></a>&nbsp;&nbsp;&nbsp;
-<a href="https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/Aman-nitb-cse/Aurex-Browser"><img src="https://raw.githubusercontent.com/ImranR98/Obtainium/main/assets/graphics/badge_obtainium.png" alt="Get it on Obtainium" height="64"></a>
-</p>
 </div>
 
 <br>
@@ -207,7 +187,7 @@ GNU GPL v3.0. See [LICENSE](LICENSE). Built on [yt-dlp](https://github.com/yt-dl
 
 <div align="center">
 <br>
-Made with ❤️ by **Abin** · ⭐ Star the repo if you like Aurex
+Made with ❤️ by **Abin** · ⭐ Star the repo if you like Aur
 
 <a href="#top">↑ Back to top</a>
 
