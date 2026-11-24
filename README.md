@@ -5,10 +5,6 @@
 <br>
 <br>
 <p>
-<a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/badge/Download-Latest%20APK-0A84FF?style=for-the-badge&logo=android&logoColor=white" alt="Download latest APK"></a>&nbsp;<a href="https://t.me/aurex_oss"><img src="https://img.shields.io/badge/Telegram-Community-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram"></a>
-</p>
-<br>
-<p>
 <a href="https://github.com/aman-nitb-cse/Aurex-Browser/releases/latest"><img src="https://img.shields.io/github/v/release/aman-nitb-cse/Aurex-Browser?style=flat-square&color=0A84FF&labelColor=1C1C1E&label=Release" alt="Release"></a>&nbsp;&nbsp;
 <img src="https://img.shields.io/badge/Android-7.0%2B-30D158?style=flat-square&labelColor=1C1C1E&logo=android&logoColor=white" alt="Android 7.0+">&nbsp;&nbsp;
 <a href="https://github.com/aman-nitb-cse/Aurex-Browser/stargazers"><img src="https://badgen.net/github/stars/aman-nitb-cse/Aurex-Browser?color=FF9F0A&labelColor=1C1C1E&icon=github" alt="Stars"></a>&nbsp;&nbsp;
@@ -211,7 +207,7 @@ GNU GPL v3.0. See [LICENSE](LICENSE). Built on [yt-dlp](https://github.com/yt-dl
 
 <div align="center">
 <br>
-Made with ❤️ by **AMAN** · ⭐ Star the repo if you like Aurex
+Made with ❤️ by **Abin** · ⭐ Star the repo if you like Aurex
 
 <a href="#top">↑ Back to top</a>
 
