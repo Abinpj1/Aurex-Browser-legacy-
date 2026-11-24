@@ -36,7 +36,7 @@ android {
         resourceConfigurations += listOf("en")
         // Single universal APK covering all real Android phones (64-bit arm64-v8a + 32-bit armeabi-v7a), zero x86 emulator bloat.
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            abiFilters += listOf("arm64-v8a")
         }
         manifestPlaceholders["appLabel"] = "Aur Browser Legacy"
     }
@@ -157,7 +157,7 @@ android {
         // extracted to disk instead of being mmapped from the APK.
         jniLibs {
             useLegacyPackaging = true
-            excludes += setOf("**/x86/**", "**/x86_64/**")
+            excludes += setOf("**/x86/**", "**/x86_64/**", "**/armeabi-v7a/**")
         }
     }
 }
